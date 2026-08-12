@@ -1,0 +1,11 @@
+__pycache__
+**/__pycache__
+*.pyc
+.git
+docs/manual/images
+*.tgz
+*.tar
+*.zip
+.pytest_cache
+data.kpkg
+/test_order_state.json

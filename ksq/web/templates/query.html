@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>筛选查询 - Knowledge 库位查询</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<main class="wide">
+  <h1>筛选查询</h1>
+  <section id="loading-card"><p id="query-status">加载中...</p></section>
+  <section id="query-card" hidden>
+    <div class="actions toolbar">
+      <div class="toolbar-left">
+        <a class="btn secondary" href="/">返回</a>
+        <button id="toggle-order-config" class="secondary" type="button">下单配置</button>
+        <button id="toggle-columns" class="secondary" type="button">字段</button>
+        <button id="clear-filters" class="secondary" type="button">清除筛选</button>
+      </div>
+      <div class="toolbar-right">
+        <div id="selected-order-box" class="selected-order-box" hidden>
+          <span id="selected-order-text"></span>
+          <select id="selected-location" hidden></select>
+          <button id="btn-clear-selection" class="secondary" type="button">清除</button>
+          <button id="btn-quick-order" class="primary" type="button">下单</button>
+        </div>
+        <label class="scan-box"><span>扫码</span><input id="scan-input" type="text" autocomplete="off" placeholder="69码 / 货位"></label>
+        <button id="reload-data" class="primary" type="button">重新加载</button>
+      </div>
+    </div>
+    <p class="meta compact" id="reload-status"></p>
+
+    <div id="order-config-panel" class="column-panel" hidden>
+      <div class="column-panel-head">
+        <p class="meta">仅需填写以下信息，其余下单字段自动生成</p>
+        <div class="actions">
+          <button id="btn-get-token" class="secondary" type="button"><span id="token-status-dot"></span>获取 Token</button>
+          <button id="btn-fetch-stores" class="secondary" type="button">获取门店</button>
+          <button id="btn-save-order-config" class="primary" type="button">保存</button>
+        </div>
+      </div>
+      <div class="path-fields order-config-grid">
+        <label class="path-field"><span>服务地址</span><input id="cfg-server" placeholder="http://localhost:8000"></label>
+        <label class="path-field"><span>客户</span>
+          <select id="cfg-customer">
+            <option value="dashenlin">大参林</option>
+            <option value="yaoshibang">药师帮</option>
+          </select>
+        </label>
+        <label class="path-field"><span>Client ID</span><input id="cfg-client-id"></label>
+        <label class="path-field"><span>Client Secret</span><input id="cfg-client-secret" type="password" placeholder="已保存则留空不改"></label>
+        <label class="path-field"><span>门店</span>
+          <select id="cfg-store-select"><option value="">— 手动填写 store_id 或先获取门店 —</option></select>
+        </label>
+        <label class="path-field"><span>store_id</span><input id="cfg-store-id" placeholder="门店 ID"></label>
+      </div>
+      <p class="meta compact" id="order-config-status"></p>
+    </div>
+
+    <div id="column-panel" class="column-panel" hidden>
+      <div class="column-panel-head">
+        <div class="actions">
+          <button id="show-all-columns" class="secondary" type="button">全部</button>
+          <button id="hide-extra-columns" class="secondary" type="button">基础列</button>
+        </div>
+      </div>
+      <div id="column-picker" class="column-picker"></div>
+    </div>
+
+    <p class="meta compact" id="result-meta"></p>
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead id="result-head"></thead>
+        <tbody id="result-body"></tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <div class="pager-controls">
+        <span>每页</span>
+        <select id="page-size">
+          <option value="50">50</option>
+          <option value="100" selected>100</option>
+          <option value="200">200</option>
+          <option value="500">500</option>
+        </select>
+        <span>条</span>
+      </div>
+      <div class="pager-controls">
+        <button id="prev-page" class="secondary" type="button">上一页</button>
+        <span>第</span>
+        <input id="page-input" type="number" min="1" value="1">
+        <span>/ <span id="page-total">1</span> 页</span>
+        <button id="next-page" class="secondary" type="button">下一页</button>
+      </div>
+    </div>
+
+    <section id="order-result-panel" class="order-result-panel" hidden>
+      <h2>下单结果</h2>
+      <p class="meta compact" id="order-result-meta"></p>
+      <div class="actions">
+        <input id="last-task-id" placeholder="task_id" style="max-width:420px">
+        <button id="btn-task-detail" class="secondary" type="button">详情</button>
+        <button id="btn-task-cancel" class="secondary" type="button">取消</button>
+      </div>
+      <pre class="response-box" id="order-result-body" hidden></pre>
+    </section>
+  </section>
+</main>
+<script src="/static/dialog.js"></script>
+<script src="/static/query.js"></script>
+</body>
+</html>

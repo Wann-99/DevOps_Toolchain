@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DevOps Toolchain</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="app-body">
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <span>DevOps Toolchain</span>
+      <small class="sidebar-version">__APP_VERSION__</small>
+    </div>
+    <nav class="sidebar-nav">
+      <button type="button" class="nav-item" data-view="dashboard">仪表板</button>
+      <button type="button" class="nav-item" data-view="load">数据加载</button>
+      <button type="button" class="nav-item" data-view="query">数据查询</button>
+      <button type="button" class="nav-item" data-view="order">药品下单</button>
+      <button type="button" class="nav-item" data-view="logs">日志查询</button>
+      <button type="button" class="nav-item" data-view="settings">设置</button>
+    </nav>
+  </aside>
+  <div class="app-content">
+    <div class="app-boot" id="app-boot" role="status" aria-live="polite" aria-busy="true">
+      <div class="app-boot-spinner" aria-hidden="true"></div>
+      <p class="app-boot-text">加载中…</p>
+    </div>
+    <section id="view-dashboard" class="view" hidden>
+      <div class="dash-top">
+        <div>
+          <h1>仪表板 <span class="dash-mode-badge" id="dash-mode-badge">测试</span></h1>
+          <p class="dash-subtitle">实时跟踪取药流程</p>
+        </div>
+        <div class="dash-top-actions">
+          <label class="dash-switch" title="识别到确认/报错后自动确认">
+            <input id="dash-auto-confirm" type="checkbox">
+            <span class="dash-switch-ui" aria-hidden="true"></span>
+            <span class="dash-switch-text">自动确认</span>
+          </label>
+          <button id="dash-refresh" class="secondary" type="button">刷新</button>
+        </div>
+      </div>
+
+      <div class="dash-order card" id="dash-order" hidden>
+        <div class="dash-order-main">
+          <div class="dash-order-source" id="dash-order-source" hidden title="订单来源">
+            <span class="dash-order-source-icon" id="dash-order-source-icon" aria-hidden="true"></span>
+            <span class="dash-order-source-label" id="dash-order-source-label">来源</span>
+          </div>
+          <div class="dash-order-copy">
+            <p class="dash-order-kicker">当前工单</p>
+            <h2 class="dash-order-no" id="dash-order-no">—</h2>
+            <p class="meta compact mono" id="dash-order-task">task_id —</p>
+            <div class="dash-order-tags">
+              <span class="dash-order-tag" id="dash-order-life">进行中</span>
+              <span class="dash-order-tag is-broker" id="dash-order-broker">工单状态 —</span>
+            </div>
+          </div>
+          <div class="dash-order-progress">
+            <p class="dash-order-progress-label" id="dash-order-progress-label">0 / 0</p>
+            <div class="dash-order-bar"><span id="dash-order-bar"></span></div>
+            <p class="meta compact" id="dash-order-progress-meta">等待任务拆分</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="dash-hero" id="dash-hero" data-state="idle">
+        <div class="dash-hero-main">
+          <div class="dash-live">
+            <span class="dash-live-dot" id="dash-live-dot"></span>
+            <span id="dash-service-badge">等待连接</span>
+            <span class="dash-live-sep">·</span>
+            <span id="dash-poll-meta">—</span>
+          </div>
+          <p class="dash-hero-kicker">当前子任务</p>
+          <h2 class="dash-hero-status" id="dash-status-label">空闲</h2>
+          <p class="dash-hero-item" id="dash-current-item">尚未开始处理商品</p>
+          <p class="dash-hero-detail" id="dash-status-text" hidden></p>
+          <div class="dash-hero-actions">
+            <button id="dash-confirm-now" class="primary dash-confirm-btn" type="button" disabled>
+              确认处理
+            </button>
+          </div>
+        </div>
+        <div class="dash-hero-clock">
+          <p class="dash-clock-label">工单已用时</p>
+          <p class="dash-clock-value" id="dash-order-elapsed">—</p>
+          <p class="dash-clock-sub">当前子任务 <strong id="dash-elapsed">—</strong></p>
+        </div>
+      </div>
+
+      <ol class="dash-rail" id="dash-steps" aria-label="当前子任务状态">
+        <li data-step="started">
+          <span class="dash-rail-index">1</span>
+          <span class="dash-rail-copy">
+            <strong>开始处理</strong>
+          </span>
+        </li>
+        <li data-step="processing">
+          <span class="dash-rail-index">2</span>
+          <span class="dash-rail-copy">
+            <strong>处理中</strong>
+          </span>
+        </li>
+        <li data-step="await">
+          <span class="dash-rail-index">3</span>
+          <span class="dash-rail-copy">
+            <strong>人工确认</strong>
+          </span>
+        </li>
+        <li data-step="done">
+          <span class="dash-rail-index">4</span>
+          <span class="dash-rail-copy">
+            <strong>结束</strong>
+          </span>
+        </li>
+      </ol>
+
+      <div class="dash-tasks card">
+        <div class="dash-feed-head">
+          <h2 class="section-title">工单子任务</h2>
+          <span class="meta compact" id="dash-task-count">0 个</span>
+        </div>
+        <div class="dash-task-list" id="dash-task-list">
+          <div class="dash-feed-empty">下单后会按商品拆成多个子任务显示。</div>
+        </div>
+      </div>
+
+      <div class="dash-feed card">
+        <div class="dash-feed-head">
+          <h2 class="section-title">实时事件流</h2>
+          <span class="meta compact" id="dash-feed-count">0 条</span>
+        </div>
+        <div class="dash-feed-list" id="dash-events"></div>
+      </div>
+
+      <div id="dash-confirm-modal" class="dash-modal" hidden>
+        <div class="dash-modal-panel" role="dialog" aria-modal="true" aria-labelledby="dash-modal-title">
+          <div class="dash-modal-badge" id="dash-modal-badge">待确认</div>
+          <h2 id="dash-modal-title">需要人工确认</h2>
+          <p class="meta" id="dash-modal-body">日志检测到确认/报错请求，点击确认将继续流程。</p>
+          <pre class="dash-modal-line" id="dash-modal-line"></pre>
+          <div class="actions">
+            <button id="dash-modal-dismiss" class="secondary" type="button">稍后处理</button>
+            <button id="dash-modal-confirm" class="primary" type="button">确认</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-load" class="view" hidden>
+      <h1>数据加载</h1>
+      <div class="card">
+        <div class="tabs">
+          <button class="tab active" type="button" data-panel="path-panel" data-load-method="path">本机路径</button>
+          <button class="tab" type="button" data-panel="bundle-panel" data-load-method="bundle">包加载</button>
+          <button class="tab" type="button" data-panel="import-panel" data-load-method="import">导入</button>
+        </div>
+        <div id="path-panel" class="panel active" data-load-method="path">
+          <form id="path-form">
+            <p class="meta compact">从本机路径加载后可使用全部功能（查询、编辑、下单等）。</p>
+            <div class="path-fields">
+              <label class="path-field"><span>Knowledge 目录</span><input id="knowledge-path" value="__KNOWLEDGE__" required></label>
+              <label class="path-field"><span>库位表（sku-shelves*.csv）</span><input id="shelves-path" value="__SHELVES__" required></label>
+              <label class="path-field"><span>不可处理列表</span><input id="unavailable-path" value="__UNAVAILABLE__"></label>
+              <label class="path-field"><span>工具映射</span><input id="tool-mapping-path" value="__TOOL_MAPPING__"></label>
+              <label class="path-field"><span>闭环吸取列表</span><input id="pick-strategy-path" value="__PICK_STRATEGY__"></label>
+            </div>
+            <div class="actions"><button class="primary" type="submit">加载</button></div>
+          </form>
+          <div class="panel-status" data-role="panel-status"></div>
+          <div class="load-next" data-role="panel-next" hidden>
+            <button class="primary" type="button" data-role="goto-query">前往数据查询</button>
+          </div>
+        </div>
+        <div id="bundle-panel" class="panel" data-load-method="bundle">
+          <form id="bundle-form">
+            <p class="meta compact">
+              上传配置压缩包仅用于查看与数据查询，不会写入本机路径；编辑、下单等需改用「本机路径」加载。
+            </p>
+            <div class="upload-grid">
+              <label class="file-pick" data-file-pick>
+                <input id="bundle-zip" type="file" accept=".zip,application/zip">
+                <div class="file-icon">包</div>
+                <div class="file-copy">
+                  <p class="file-title">配置压缩包 ZIP</p>
+                  <p class="file-name" data-file-name>未选择</p>
+                </div>
+                <span class="file-action">选择</span>
+              </label>
+            </div>
+            <div class="actions"><button class="primary" type="submit">加载查看</button></div>
+          </form>
+          <div class="panel-status" data-role="panel-status"></div>
+          <div class="load-next" data-role="panel-next" hidden>
+            <button class="primary" type="button" data-role="goto-query">前往数据查询</button>
+          </div>
+        </div>
+        <div id="import-panel" class="panel" data-load-method="import">
+          <form id="import-form">
+            <p class="meta compact">
+              导入文件到当前配置路径（库位表、knowledge、工具/闭环/不可处理、order_config）。同名文件会先备份再覆盖；若已具备本机路径数据源，导入后会自动重新加载。
+            </p>
+            <div class="upload-grid">
+              <label class="file-pick" data-file-pick>
+                <input id="import-files" type="file" accept=".zip,.json,.csv,application/zip,application/json,text/csv" multiple>
+                <div class="file-icon">导</div>
+                <div class="file-copy">
+                  <p class="file-title">压缩包 / 单文件 / 多文件</p>
+                  <p class="file-name" data-file-name>未选择</p>
+                </div>
+                <span class="file-action">选择</span>
+              </label>
+            </div>
+            <div class="actions"><button class="primary" type="submit">导入</button></div>
+          </form>
+          <div class="panel-status" data-role="panel-status"></div>
+          <div class="load-next" data-role="panel-next" hidden>
+            <button class="primary" type="button" data-role="goto-query">前往数据查询</button>
+          </div>
+        </div>
+      </div>
+      <div id="missing-section" class="card" hidden>
+        <div class="actions toolbar">
+          <div class="toolbar-left"><h2 class="section-title">缺少 knowledge</h2></div>
+          <div class="toolbar-right">
+            <button id="missing-export-csv" class="secondary" type="button">导出列表 CSV</button>
+            <button id="missing-export-templates" class="secondary" type="button">导出 knowledge 模板 ZIP</button>
+          </div>
+        </div>
+        <div class="mode-row">
+          <label id="exclude-unavailable-label"><input id="exclude-unavailable" type="checkbox">排除不可处理</label>
+        </div>
+        <p class="meta" id="missing-meta"></p>
+        <div class="missing-table-wrap">
+          <table>
+            <thead><tr>
+                  <th><button type="button" class="th-sort" data-sort-key="0">69码<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="1">药品名称<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="2">库位<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                </tr></thead>
+            <tbody id="missing-table-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-query" class="view" hidden>
+      <h1>数据查询</h1>
+      <div class="card" data-catalog data-mode="query">
+        <div class="actions toolbar">
+          <div class="toolbar-left">
+            <div class="menu-wrap">
+              <button data-role="toggle-columns" class="secondary" type="button">字段过滤条件</button>
+              <div data-role="column-panel" class="menu-dropdown columns-dropdown" hidden>
+                <div class="menu-dropdown-actions">
+                  <button data-role="show-all-columns" class="secondary" type="button">全部</button>
+                  <button data-role="hide-extra-columns" class="secondary" type="button">基础列</button>
+                </div>
+                <div data-role="column-picker" class="column-picker menu-column-picker"></div>
+              </div>
+            </div>
+            <div class="menu-wrap">
+              <button data-role="toggle-download" class="secondary" type="button">下载</button>
+              <div data-role="download-panel" class="menu-dropdown download-dropdown" hidden>
+                <button data-role="btn-download-zip" class="secondary" type="button">下载整包 ZIP</button>
+                <button data-role="btn-download-knowledge-zip" class="secondary" type="button">下载 knowledge 文件夹</button>
+                <label class="menu-field"><span>配置/库位文件</span>
+                  <select data-role="export-file-select" class="export-select">
+                    <option value="sku-shelves.csv">sku-shelves.csv</option>
+                  </select>
+                </label>
+                <label class="menu-field"><span>商品 knowledge</span>
+                  <input data-role="export-knowledge-id" type="text" class="export-select" placeholder="输入商品 id" autocomplete="off">
+                </label>
+                <button data-role="btn-download-file" class="secondary" type="button">下载所选/输入文件</button>
+                <p class="meta compact">右键表格行也可下载该商品 json</p>
+              </div>
+            </div>
+            <button data-role="reload-data" class="primary" type="button">重新加载</button>
+          </div>
+          <div class="toolbar-right">
+            <label class="scan-box"><span>扫码</span><input data-role="scan-input" type="text" autocomplete="off" placeholder="69码 / 货位"></label>
+            <div class="edit-action-card">
+              <button data-role="btn-toggle-edit" class="secondary edit-toggle-btn" type="button" aria-pressed="false" title="点击后可编辑单元格">
+                <span data-role="edit-toggle-label">编辑</span>
+              </button>
+              <button data-role="btn-save-edit" class="primary save-edit-btn" type="button" disabled>
+                保存<span data-role="save-edit-badge" class="save-badge" hidden></span>
+              </button>
+            </div>
+          </div>
+        </div>
+        <p class="meta compact" data-role="status"></p>
+        <p class="meta compact" data-role="result-meta"></p>
+        <div class="table-wrap table-wrap-sticky-x" data-role="table-wrap">
+          <div class="table-scroller" data-role="table-scroller">
+            <table class="data-table">
+              <thead data-role="result-head"></thead>
+              <tbody data-role="result-body"></tbody>
+            </table>
+          </div>
+          <div class="table-hscroll" data-role="table-hscroll">
+            <div class="table-hscroll-spacer" data-role="table-hscroll-spacer"></div>
+          </div>
+        </div>
+        <div class="pager">
+          <div class="pager-controls">
+            <span>每页</span>
+            <select data-role="page-size">
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+            </select>
+            <span>条</span>
+          </div>
+          <div class="pager-controls">
+            <button data-role="prev-page" class="secondary" type="button">上一页</button>
+            <span>第</span>
+            <input data-role="page-input" type="number" min="1" value="1">
+            <span>/ <span data-role="page-total">1</span> 页</span>
+            <button data-role="next-page" class="secondary" type="button">下一页</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-order" class="view" hidden>
+      <h1>药品下单</h1>
+      <div class="card" data-catalog data-mode="order">
+        <div class="actions toolbar">
+          <div class="toolbar-left">
+            <button type="button" class="secondary" data-goto-view="settings">下单配置</button>
+            <button type="button" class="secondary" data-goto-view="test-order">测试下单</button>
+            <button data-role="reload-data" class="primary" type="button">重新加载</button>
+          </div>
+          <div class="toolbar-right">
+            <label class="scan-box"><span>扫码</span><input data-role="scan-input" type="text" autocomplete="off" placeholder="69码 / 货位"></label>
+            <div class="order-action-group">
+              <button data-role="btn-quick-order" class="primary order-submit-btn" type="button" disabled>
+                下单<span data-role="selected-count-badge" class="save-badge" hidden></span>
+              </button>
+              <div class="menu-wrap">
+                <button data-role="toggle-selected-list" class="secondary order-list-toggle" type="button" aria-label="查看待下单列表">▼</button>
+                <div data-role="selected-list-panel" class="menu-dropdown selected-list-dropdown" hidden>
+                  <div data-role="selected-list" class="selected-list"></div>
+                  <p class="meta compact selected-list-empty" data-role="selected-list-empty" hidden>暂无待下单药品</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p class="meta compact" data-role="status"></p>
+        <p class="meta compact" data-role="result-meta"></p>
+        <div class="table-wrap table-wrap-sticky-x" data-role="table-wrap">
+          <div class="table-scroller" data-role="table-scroller">
+            <table class="data-table">
+              <thead data-role="result-head"></thead>
+              <tbody data-role="result-body"></tbody>
+            </table>
+          </div>
+          <div class="table-hscroll" data-role="table-hscroll">
+            <div class="table-hscroll-spacer" data-role="table-hscroll-spacer"></div>
+          </div>
+        </div>
+        <div class="pager">
+          <div class="pager-controls">
+            <span>每页</span>
+            <select data-role="page-size">
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+            </select>
+            <span>条</span>
+          </div>
+          <div class="pager-controls">
+            <button data-role="prev-page" class="secondary" type="button">上一页</button>
+            <span>第</span>
+            <input data-role="page-input" type="number" min="1" value="1">
+            <span>/ <span data-role="page-total">1</span> 页</span>
+            <button data-role="next-page" class="secondary" type="button">下一页</button>
+          </div>
+        </div>
+        <div data-role="order-result-panel" class="order-result-panel" hidden>
+          <h2>下单结果</h2>
+          <p class="meta compact" data-role="order-result-meta"></p>
+          <p class="order-status-line" data-role="order-status-line" hidden></p>
+          <div class="actions">
+            <input data-role="last-task-id" placeholder="task_id" style="max-width:420px">
+            <button data-role="btn-task-detail" class="secondary" type="button">刷新状态</button>
+            <button data-role="btn-task-cancel" class="secondary" type="button">取消</button>
+          </div>
+          <pre class="response-box" data-role="order-result-body" hidden></pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-test-order" class="view" hidden>
+      <h1>测试下单</h1>
+      <div class="card">
+        <div class="actions toolbar">
+          <div class="toolbar-left">
+            <button type="button" class="secondary icon-back-btn" data-goto-view="order" aria-label="返回药品下单" title="返回药品下单">
+              <svg class="icon-back-chevron" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M15 5.5 L8.2 12 L15 18.5" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"></path>
+              </svg>
+            </button>
+            <button type="button" class="secondary" data-goto-view="load">首页</button>
+            <button id="test-order-toggle-config" class="secondary" type="button">配置</button>
+          </div>
+          <div class="toolbar-right">
+            <input id="test-order-import-file" type="file" accept=".csv,text/csv" hidden>
+            <button id="test-order-import" class="secondary" type="button">导入 CSV</button>
+            <button id="test-order-export" class="secondary" type="button">导出未下单</button>
+            <button id="test-order-generate" class="primary" type="button">生成</button>
+            <button id="test-order-submit" class="primary" type="button">下单</button>
+          </div>
+        </div>
+        <div id="test-order-config-panel" class="column-panel test-order-config-panel" hidden>
+          <div class="path-fields order-config-grid test-order-config">
+            <label class="path-field"><span>配置数量</span><input id="test-order-count" type="number" min="1" step="1" value="200"></label>
+            <label class="path-field"><span>随机种子（可选）</span><input id="test-order-seed" type="number" step="1" placeholder="不填则每次不同"></label>
+          </div>
+          <div class="test-order-option-list">
+            <div class="test-order-option-row">
+              <label class="test-order-option-select"><input id="test-order-flag-closed-loop" type="checkbox" checked><span>闭环吸取</span></label>
+              <label class="test-order-option-ratio"><span>目标占比</span><input id="test-order-closed-loop-ratio" type="number" min="0" max="1" step="0.1" value="0.3"></label>
+            </div>
+            <div class="test-order-option-row">
+              <label class="test-order-option-select">
+                <input id="test-order-flag-tool" type="checkbox" checked>
+                <select id="test-order-tool-select" class="test-order-tool-select">
+                  <option value="全部" selected>全部</option>
+                  <option value="double_vacuum_gripper">double_vacuum_gripper</option>
+                  <option value="four_vacuum_gripper">four_vacuum_gripper</option>
+                  <option value="gripper">gripper</option>
+                </select>
+              </label>
+              <label class="test-order-option-ratio"><span>目标占比</span><input id="test-order-tool-ratio" type="number" min="0" max="1" step="0.1" value="0.3"></label>
+            </div>
+            <div class="test-order-option-row">
+              <label class="test-order-option-select">
+                <input id="test-order-flag-packaging" type="checkbox" checked>
+                <select id="test-order-packaging-select" class="test-order-tool-select">
+                  <option value="全部" selected>全部</option>
+                </select>
+              </label>
+              <label class="test-order-option-ratio"><span>目标占比</span><input id="test-order-packaging-ratio" type="number" min="0" max="1" step="0.1" value="0.2"></label>
+            </div>
+          </div>
+          <p class="meta compact">候选规则：加载全部 SKU → 排除不可处理 → 闭环吸取按占比 → 使用工具按选项/占比 → 包装类型按选项/占比 → 剩余优先小药补齐；总数不超过配置数量。</p>
+        </div>
+        <p class="meta compact" id="test-order-summary"></p>
+        <p class="meta compact" id="test-order-status"></p>
+      </div>
+      <div class="card">
+        <div class="actions toolbar test-order-table-toolbar">
+          <div class="toolbar-left">
+            <h2 class="section-title">未下单</h2>
+            <label class="test-order-search">
+              <span>搜索</span>
+              <input id="test-order-pending-search" type="search" placeholder="全字段筛选：编码 / 库位 / 69码 / 名称..." autocomplete="off">
+            </label>
+          </div>
+          <div class="toolbar-right">
+            <button id="test-order-select-all-pending" class="secondary" type="button">全选</button>
+            <button id="test-order-clear-pending" class="secondary" type="button">清空</button>
+          </div>
+        </div>
+        <div class="table-wrap table-wrap-sticky-x test-order-table-wrap" data-sticky-table>
+          <div class="table-scroller" data-role="table-scroller">
+            <table class="data-table" data-test-order-table="pending">
+              <thead>
+                <tr>
+                  <th style="min-width:56px">选</th>
+                  <th><button type="button" class="th-sort" data-sort-key="out_item_id">商品编码<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="location_display">库位<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="sku_code">69码<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="name">药品名称<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="是否闭环抓取">是否闭环抓取<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="货架属性">货架属性<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="推荐工具">推荐工具<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="包装类型">包装类型<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                </tr>
+              </thead>
+              <tbody id="test-order-pending-body"></tbody>
+            </table>
+          </div>
+          <div class="table-hscroll" data-role="table-hscroll">
+            <div class="table-hscroll-spacer" data-role="table-hscroll-spacer"></div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="actions toolbar test-order-table-toolbar">
+          <div class="toolbar-left">
+            <h2 class="section-title">已下单</h2>
+            <label class="test-order-search">
+              <span>搜索</span>
+              <input id="test-order-ordered-search" type="search" placeholder="全字段筛选：编码 / 库位 / 69码 / 名称..." autocomplete="off">
+            </label>
+          </div>
+          <div class="toolbar-right">
+            <button id="test-order-export-ordered" class="secondary" type="button">导出已下单</button>
+            <button id="test-order-select-all-ordered" class="secondary" type="button">全选</button>
+            <button id="test-order-restore" class="secondary" type="button">恢复</button>
+            <button id="test-order-clear-ordered" class="secondary" type="button">清空</button>
+          </div>
+        </div>
+        <div class="table-wrap table-wrap-sticky-x test-order-table-wrap" data-sticky-table>
+          <div class="table-scroller" data-role="table-scroller">
+            <table class="data-table" data-test-order-table="ordered">
+              <thead>
+                <tr>
+                  <th style="min-width:56px">选</th>
+                  <th><button type="button" class="th-sort" data-sort-key="out_item_id">商品编码<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="location_display">库位<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="sku_code">69码<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="name">药品名称<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="是否闭环抓取">是否闭环抓取<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="货架属性">货架属性<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="推荐工具">推荐工具<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="包装类型">包装类型<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                </tr>
+              </thead>
+              <tbody id="test-order-ordered-body"></tbody>
+            </table>
+          </div>
+          <div class="table-hscroll" data-role="table-hscroll">
+            <div class="table-hscroll-spacer" data-role="table-hscroll-spacer"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-settings" class="view" hidden>
+      <h1>设置</h1>
+
+      <div class="card settings-fold" id="settings-fold-mode" data-fold="mode">
+        <div class="settings-fold-head">
+          <button type="button" class="settings-fold-toggle" data-fold-toggle aria-expanded="false">
+            <span class="settings-fold-chevron" aria-hidden="true"></span>
+            <span class="settings-fold-title">工作模式</span>
+          </button>
+          <label class="settings-mode-switch" title="切换测试 / 生产">
+            <span class="settings-mode-switch-left">测试</span>
+            <span class="dash-switch settings-mode-switch-control">
+              <input id="settings-mode-toggle" type="checkbox">
+              <span class="dash-switch-ui" aria-hidden="true"></span>
+            </span>
+            <span class="settings-mode-switch-right">生产</span>
+          </label>
+          <input type="hidden" id="settings-mode" value="test">
+        </div>
+        <div class="settings-fold-body" data-fold-body hidden>
+          <div class="path-fields order-config-grid">
+            <label class="path-field">
+              <span>ETM 地址（生产）</span>
+              <input id="settings-etm-url" type="text" placeholder="http://127.0.0.1:12005">
+            </label>
+            <label class="path-field">
+              <span>配置文件</span>
+              <input id="settings-order-mode-label" type="text" value="order_config.json" readonly>
+            </label>
+          </div>
+          <div class="actions toolbar settings-fold-actions">
+            <div class="toolbar-left">
+              <span class="meta compact">下单 Broker 配置</span>
+            </div>
+            <div class="toolbar-right">
+              <button id="settings-order-token" class="secondary" type="button">
+                <span id="settings-token-dot" class="token-status-dot"></span>获取 Token
+              </button>
+              <button id="settings-order-stores" class="secondary" type="button">获取门店</button>
+            </div>
+          </div>
+          <div class="path-fields order-config-grid">
+            <label class="path-field"><span>服务地址</span><input id="settings-cfg-server" placeholder="http://localhost:8000"></label>
+            <label class="path-field"><span>客户</span>
+              <select id="settings-cfg-customer">
+                <option value="dashenlin">大参林</option>
+                <option value="yaoshibang">药师帮</option>
+              </select>
+            </label>
+            <label class="path-field"><span id="settings-cfg-id-label">Client ID</span><input id="settings-cfg-client-id"></label>
+            <label class="path-field"><span id="settings-cfg-secret-label">Client Secret</span><input id="settings-cfg-client-secret" type="password" placeholder="已保存则留空不改"></label>
+            <label class="path-field"><span>门店</span>
+              <select id="settings-cfg-store-select"><option value="">— 手动填写 store_id 或先获取门店 —</option></select>
+            </label>
+            <label class="path-field"><span>store_id</span><input id="settings-cfg-store-id" placeholder="门店 ID"></label>
+          </div>
+          <div class="actions">
+            <button id="settings-save-mode" class="primary" type="button">保存</button>
+          </div>
+          <p class="meta compact" id="settings-order-status"></p>
+        </div>
+      </div>
+
+      <div class="card settings-fold" id="settings-fold-keyboard" data-fold="keyboard">
+        <div class="settings-fold-head">
+          <button type="button" class="settings-fold-toggle" data-fold-toggle aria-expanded="false">
+            <span class="settings-fold-chevron" aria-hidden="true"></span>
+            <span class="settings-fold-title">虚拟键盘配置</span>
+          </button>
+        </div>
+        <div class="settings-fold-body" data-fold-body hidden>
+          <div class="path-fields order-config-grid">
+            <label class="path-field">
+              <span>监听/注入设备</span>
+              <select id="settings-keyboard-device"></select>
+            </label>
+            <label class="path-field settings-inline-switch">
+              <span>保存时重启机器人</span>
+              <label class="dash-switch">
+                <input id="settings-keyboard-restart" type="checkbox">
+                <span class="dash-switch-ui" aria-hidden="true"></span>
+                <span class="dash-switch-text">启用</span>
+              </label>
+            </label>
+          </div>
+          <div class="actions">
+            <button id="settings-keyboard-refresh" class="secondary" type="button">刷新设备</button>
+            <button id="settings-save-runtime" class="primary" type="button">保存键盘配置</button>
+          </div>
+          <p class="meta compact" id="settings-runtime-status">打开设置后自动加载…</p>
+        </div>
+      </div>
+
+      <div class="card settings-fold" id="settings-fold-feishu" data-fold="feishu">
+        <div class="settings-fold-head">
+          <button type="button" class="settings-fold-toggle" data-fold-toggle aria-expanded="false">
+            <span class="settings-fold-chevron" aria-hidden="true"></span>
+            <span class="settings-fold-title">飞书表单</span>
+          </button>
+          <label class="dash-switch" title="播报人工确认/打包/报错时自动提交">
+            <input id="settings-feishu-enabled" type="checkbox">
+            <span class="dash-switch-ui" aria-hidden="true"></span>
+            <span class="dash-switch-text">启用</span>
+          </label>
+        </div>
+        <div class="settings-fold-body" data-fold-body hidden>
+          <div class="path-fields order-config-grid">
+            <label class="path-field">
+              <span>测试场地（选项）</span>
+              <select id="settings-feishu-site">
+                <option value="药师帮-广州">药师帮-广州</option>
+              </select>
+            </label>
+            <label class="path-field"><span>测试人员 open_id（可选）</span><input id="settings-feishu-tester" placeholder="ou_xxx，人员字段不能填姓名"></label>
+            <label class="path-field"><span>App ID</span><input id="settings-feishu-app-id" placeholder="cli_xxx"></label>
+            <label class="path-field"><span>App Secret</span><input id="settings-feishu-app-secret" type="password" placeholder="已保存则留空不改"></label>
+            <label class="path-field"><span>多维表格 app_token</span><input id="settings-feishu-app-token" placeholder="bascn..."></label>
+            <label class="path-field"><span>数据表 table_id</span><input id="settings-feishu-table-id" placeholder="tbl..."></label>
+          </div>
+          <div class="actions">
+            <button id="settings-feishu-sync-sites" class="secondary" type="button">同步场地</button>
+            <button id="settings-feishu-submit" class="secondary" type="button">提交当前工单</button>
+            <button id="settings-feishu-save" class="primary" type="button">保存</button>
+          </div>
+          <p class="meta compact" id="settings-feishu-status" hidden></p>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-logs" class="view" hidden>
+      <h1>日志查询</h1>
+      <div class="card">
+        <div class="actions toolbar log-toolbar">
+          <div class="toolbar-left">
+            <label class="log-service-field">
+              <span>服务</span>
+              <select id="log-service">
+                <option value="0">robot_workspace_move_test</option>
+                <option value="1">percept</option>
+                <option value="2">robotd</option>
+                <option value="3">CAMID_0</option>
+              </select>
+            </label>
+            <span id="log-service-status" class="meta compact log-service-status">—</span>
+            <div class="log-control-group">
+              <button id="log-start" class="secondary log-ctrl-btn" type="button">Start</button>
+              <button id="log-restart" class="secondary log-ctrl-btn" type="button">Restart</button>
+              <button id="log-stop" class="secondary log-ctrl-btn log-ctrl-stop" type="button">Stop</button>
+            </div>
+          </div>
+          <div class="toolbar-right">
+            <label class="mode-row"><input id="log-auto-refresh" type="checkbox" checked>自动刷新</label>
+            <button id="log-refresh" class="primary" type="button">刷新日志</button>
+          </div>
+        </div>
+        <p class="meta compact" id="log-status"></p>
+        <div class="term-window">
+          <div class="term-titlebar">
+            <span class="term-dot term-dot-red"></span>
+            <span class="term-dot term-dot-yellow"></span>
+            <span class="term-dot term-dot-green"></span>
+            <span class="term-title" id="log-term-title">terminal</span>
+          </div>
+          <pre class="term-body log-box" id="log-body">选择服务后点击刷新</pre>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+<script src="/static/dialog.js"></script>
+<script src="/static/shell.js"></script>
+<script src="/static/load.js"></script>
+<script src="/static/catalog.js"></script>
+<script src="/static/test-order.js"></script>
+<script src="/static/logs.js"></script>
+<script src="/static/dashboard.js"></script>
+<script src="/static/settings.js"></script>
+<script src="/static/app-init.js"></script>
+</body>
+</html>

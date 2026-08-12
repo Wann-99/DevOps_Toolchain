@@ -1,0 +1,977 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Order Broker API 本地测试</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card-bg: #fff; --border: #dfe1e6;
+    --primary: #0052cc; --primary-hover: #0747a6;
+    --success: #00875a; --error: #de350b;
+    --text: #172b4d; --text-light: #6b778c;
+    --mono: 'Menlo','Consolas','Liberation Mono',monospace; --radius: 8px;
+  }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);line-height:1.5}
+  .config-bar{position:sticky;top:0;z-index:100;background:#1a1a2e;color:#eee;padding:14px 24px;display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+  .config-bar label{font-size:11px;font-weight:600;color:#aaa;display:block;margin-bottom:2px}
+  .config-bar input{background:#16213e;border:1px solid #334;color:#eee;padding:5px 10px;border-radius:4px;font-size:13px;width:200px}
+  .config-bar input::placeholder{color:#556}
+  .config-bar select{background:#16213e;border:1px solid #334;color:#eee;padding:5px 10px;border-radius:4px;font-size:13px;cursor:pointer;min-width:160px}
+  .config-bar .field{display:flex;flex-direction:column}
+  .config-bar .field.wide input{width:280px}
+  .btn-token{background:var(--primary);color:#fff;border:none;padding:6px 16px;border-radius:4px;font-size:13px;font-weight:600;cursor:pointer}
+  .btn-token:hover{background:var(--primary-hover)}
+  .token-status{font-size:11px;align-self:center;margin-left:2px}
+  .token-status.ok{color:#57d9a3}.token-status.err{color:#ff5630}.token-status.none{color:#6b778c}
+  .container{max-width:1280px;margin:20px auto;padding:0 16px}
+  .card{background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:12px;overflow:hidden}
+  .card-header{display:flex;justify-content:space-between;align-items:center;padding:12px 18px;cursor:pointer;user-select:none;background:#fafbfc;border-bottom:1px solid var(--border);gap:10px}
+  .card-header:hover{background:#f1f2f4}
+  .card-header .left{display:flex;align-items:center;gap:8px}
+  .card-header h2{font-size:14px;font-weight:600;white-space:nowrap}
+  .method-badge{font-size:10px;font-weight:700;padding:2px 7px;border-radius:3px;letter-spacing:.5px;flex-shrink:0}
+  .badge-get{background:#e3fcef;color:var(--success)}
+  .badge-post{background:#deebff;color:var(--primary)}
+  .badge-put{background:#fff3cd;color:#7a6200}
+  .card-header .right{display:flex;align-items:center;gap:8px}
+  .step-status{font-size:10px;font-weight:600;padding:2px 8px;border-radius:10px}
+  .step-done{background:#e3fcef;color:var(--success)}
+  .arrow{transition:transform .2s;font-size:11px;color:var(--text-light)}
+  .card.collapsed .card-body{display:none}
+  .card.collapsed .arrow{transform:rotate(-90deg)}
+  .card-body{padding:16px 18px}
+  .form-row{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:10px}
+  .form-group{display:flex;flex-direction:column;flex:1;min-width:180px}
+  .form-group label{font-size:11px;font-weight:600;color:var(--text-light);margin-bottom:3px}
+  .form-group label .req{color:var(--error)}
+  .form-group input,.form-group select{padding:6px 9px;border:1px solid var(--border);border-radius:4px;font-size:13px;color:var(--text)}
+  .form-group input:focus,.form-group select:focus,textarea:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 2px rgba(0,82,204,.12)}
+  textarea.json-editor{width:100%;min-height:120px;padding:8px;border:1px solid var(--border);border-radius:4px;font-family:var(--mono);font-size:12px;color:var(--text);resize:vertical;tab-size:2;line-height:1.45}
+  .json-label{font-size:11px;font-weight:600;color:var(--text-light);margin-bottom:3px}
+  .toolbar{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+  .btn-gen{font-size:11px;padding:2px 9px;border:1px solid var(--border);border-radius:4px;background:#f1f2f4;cursor:pointer;color:var(--text);white-space:nowrap}
+  .btn-gen:hover{background:#e4e5e7}
+  .btn-send{background:var(--primary);color:#fff;border:none;padding:7px 22px;border-radius:4px;font-size:13px;font-weight:600;cursor:pointer;margin-top:6px}
+  .btn-send:hover{background:var(--primary-hover)}
+  .btn-send:disabled{opacity:.5;cursor:not-allowed}
+  .response-area{margin-top:12px}
+  .response-meta{display:flex;gap:10px;align-items:center;margin-bottom:4px;font-size:12px;width:100%}
+  .status-code{font-weight:700;padding:2px 7px;border-radius:3px;font-size:11px}
+  .status-2xx{background:#e3fcef;color:var(--success)}
+  .status-4xx{background:#ffebe6;color:var(--error)}
+  .status-5xx{background:#ffebe6;color:var(--error)}
+  .response-time{color:var(--text-light)}
+  .btn-copy{font-size:11px;padding:1px 8px;border:1px solid var(--border);border-radius:3px;background:#fff;color:var(--text-light);cursor:pointer;margin-left:auto}
+  .btn-copy:hover{background:#f1f2f4;color:var(--text)}
+  .response-body{background:#1e1e2e;color:#cdd6f4;padding:12px;border-radius:6px;font-family:var(--mono);font-size:12px;white-space:pre-wrap;word-break:break-word;max-height:320px;overflow-y:auto}
+  #resp-2{flex:1;display:flex;flex-direction:column}
+  #resp-2 .response-body{flex:1;max-height:none;min-height:80px}
+  .hidden{display:none}
+  .desc{font-size:12px;color:var(--text-light);margin-bottom:10px}
+  .desc code{background:#f1f2f4;padding:1px 4px;border-radius:3px;font-size:11px}
+  .card.locked .card-body{position:relative;pointer-events:none;opacity:.45}
+  .card.locked .card-body::after{content:attr(data-lock-msg);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:600;color:var(--text-light);background:rgba(244,245,247,.5);border-radius:0 0 var(--radius) var(--radius)}
+  .lock-badge{font-size:10px;font-weight:600;padding:2px 8px;border-radius:10px;background:#f1f2f4;color:var(--text-light)}
+  .item-card{border:1px solid var(--border);border-radius:6px;margin-bottom:8px;background:#fafbfc;overflow:hidden}
+  .item-card .item-header{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;cursor:pointer;user-select:none}
+  .item-card .item-header:hover{background:#f1f2f4}
+  .item-card .item-header span{font-size:12px;font-weight:600;color:var(--text)}
+  .item-card .item-header .item-arrow{font-size:10px;color:var(--text-light);transition:transform .2s;margin-right:6px}
+  .item-card.item-collapsed .item-body{display:none}
+  .item-card.item-collapsed .item-arrow{transform:rotate(-90deg)}
+  .item-card .item-body{padding:6px 12px 10px}
+  .item-card .item-summary{font-size:11px;color:var(--text-light);margin-left:8px;font-weight:400}
+  .item-group{margin-bottom:8px}
+  .item-group:last-child{margin-bottom:0}
+  .item-group-label{font-size:10px;font-weight:600;color:var(--primary);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;padding-bottom:3px;border-bottom:1px dashed #e0e3e8}
+  .item-card .item-fields{display:flex;flex-wrap:wrap;gap:8px}
+  .item-card .item-fields .mini-field{display:flex;flex-direction:column;min-width:100px;flex:1}
+  .item-card .item-fields .mini-field.wide{min-width:160px;flex:2}
+  .item-card .item-fields .mini-field.narrow{flex:0 0 80px;min-width:70px}
+  .item-card .item-fields .mini-field label{font-size:10px;color:var(--text-light);margin-bottom:2px}
+  .item-card .item-fields .mini-field input{padding:4px 7px;border:1px solid var(--border);border-radius:3px;font-size:12px;color:var(--text)}
+  .item-card .item-fields .mini-field input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 2px rgba(0,82,204,.1)}
+  .btn-remove-item{font-size:11px;padding:2px 8px;border:1px solid #ddd;border-radius:3px;background:#fff;color:var(--error);cursor:pointer}
+  .btn-remove-item:hover{background:#ffebe6}
+  .field-toggle{display:flex;align-items:center;gap:3px}
+  .field-toggle input[type=checkbox]{margin:0;width:12px;height:12px;cursor:pointer}
+  .mini-field.disabled input[type=text],.mini-field.disabled input[type=number]{opacity:.35;pointer-events:none}
+  .form-group.fee-off input[type=text]{opacity:.35;pointer-events:none}
+  .opt-label{font-size:11px;font-weight:400;color:var(--text-light)}
+  .edge-badge{display:inline-block;font-size:11px;font-weight:700;color:#b45309;background:#fef3c7;border:1px solid #fcd34d;border-radius:4px;padding:1px 7px;margin-left:8px;vertical-align:middle;letter-spacing:.3px}
+  .task-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:10px}
+  .task-table th{background:#f1f2f4;padding:6px 10px;text-align:left;font-weight:600;color:var(--text-light);border-bottom:2px solid var(--border);white-space:nowrap}
+  .task-table td{padding:6px 10px;border-bottom:1px solid var(--border);color:var(--text);vertical-align:middle}
+  .task-table tr:hover td{background:#f8f9ff;cursor:pointer}
+  .task-table .mono{font-family:var(--mono);font-size:11px;color:var(--text-light)}
+  .status-badge{font-size:10px;font-weight:700;padding:2px 7px;border-radius:10px;white-space:nowrap}
+  .s-pending{background:#fff3cd;color:#856404}.s-dispatched{background:#cce5ff;color:#004085}
+  .s-running{background:#d4edff;color:#0066cc}.s-success{background:#e3fcef;color:var(--success)}
+  .s-error{background:#ffebe6;color:var(--error)}.s-cancel{background:#f1f2f4;color:var(--text-light)}
+  .s-awaiting_pack{background:#ede7f6;color:#6a1b9a}.s-other{background:#e8e8e8;color:#555}
+  .task-table .btn-use{font-size:10px;padding:2px 7px;border:1px solid var(--primary);border-radius:3px;background:#fff;color:var(--primary);cursor:pointer;white-space:nowrap}
+  .task-table .btn-use:hover{background:#deebff}
+  .task-list-meta{font-size:11px;color:var(--text-light);margin-top:6px}
+  .sub-task-list{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+  .sub-task-tag{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;background:#f8f9ff;border:1px solid #dde3f5;border-radius:6px}
+  .sub-task-id{font-family:var(--mono);font-size:11px;color:var(--text);word-break:break-all;flex:1}
+  .btn-sub-detail{font-size:11px;padding:3px 10px;border:1px solid var(--primary);border-radius:4px;background:#fff;color:var(--primary);cursor:pointer;white-space:nowrap;flex-shrink:0}
+  .btn-sub-detail:hover{background:#deebff}
+  .sub-task-empty{font-size:12px;color:var(--text-light);padding:10px 0}
+</style>
+</head>
+<body>
+
+<div class="config-bar">
+  <div class="field wide"><label>服务地址</label><input id="cfg-server" type="text" placeholder="http://localhost:8000" value="http://localhost:8000"></div>
+  <div class="field">
+    <label>客户 (CUSTOMER_SOURCE)</label>
+    <select id="cfg-customer" onchange="applyCustomer(this.value);saveConfig()">
+      <option value="dashenlin">dashenlin — 大参林</option>
+      <option value="yaoshibang">yaoshibang — 药师帮</option>
+    </select>
+  </div>
+  <div class="field"><label>Client ID</label><input id="cfg-client-id" type="text" placeholder="client_id" value=""></div>
+  <div class="field"><label>Client Secret</label><input id="cfg-client-secret" type="password" placeholder="client_secret"></div>
+  <div class="field">
+    <label>调用模式</label>
+    <select id="cfg-mode" onchange="applyMode();saveConfig()">
+      <option value="server">服务侧</option>
+      <option value="edge">服务侧 + 边缘侧</option>
+    </select>
+  </div>
+  <button class="btn-token" onclick="getToken()">获取 Token</button>
+  <span id="token-status" class="token-status none">未获取</span>
+  <div class="field wide">
+    <label>门店 (取列表后选择，回填 store_id / store_name)</label>
+    <div style="display:flex;gap:6px">
+      <select id="cfg-store" onchange="onStoreSelect(this.value)" style="flex:1"><option value="">— 未获取 —</option></select>
+      <button class="btn-gen" onclick="fetchMyStores()" style="white-space:nowrap">获取门店</button>
+    </div>
+  </div>
+</div>
+
+<div class="container">
+
+<!-- 1. 创建订单任务 -->
+<div class="card" id="card-1">
+  <div class="card-header" onclick="toggleCard('card-1')">
+    <div class="left"><span class="method-badge badge-post">POST</span><h2>创建订单任务</h2></div>
+    <div class="right"><span id="status-1" class="step-status hidden"></span><span class="arrow">&#9660;</span></div>
+  </div>
+  <div class="card-body">
+    <p class="desc"><code>POST /api/robot-tasks</code></p>
+    <div class="form-row">
+      <div class="form-group" style="flex:0 0 220px;min-width:0">
+        <label>store_id (门店ID)</label>
+        <input id="f1-store-id" type="text" value="dashenlin_test" oninput="syncBodyFromItems()">
+      </div>
+      <div class="form-group" style="flex:0 0 280px;min-width:0">
+        <label>order_no <span class="req">*</span> (商家订单编号) <span style="font-weight:400;color:var(--text-light)">· 订单结束后自动换号</span></label>
+        <div style="display:flex;gap:6px"><input id="f1-order-no" type="text" style="flex:1" oninput="currentOrderNo=this.value.trim();syncBodyFromItems()"><button class="btn-gen" onclick="refreshMerchantOrderNo()" style="align-self:stretch">随机</button></div>
+      </div>
+      <div class="form-group" style="flex:0 0 200px;min-width:0">
+        <label>order_source (订单来源)</label>
+        <select id="f1-order-source" onchange="syncBodyFromItems()">
+          <!-- options 由 applyCustomer() 按当前客户动态生成 -->
+        </select>
+      </div>
+      <div class="form-group" style="flex:0 0 260px;min-width:0">
+        <label>platform_order_no (平台单号，自动生成)</label>
+        <input id="f1-platform-order-no" type="text" readonly style="background:#f4f5f7;color:var(--text-light);cursor:default">
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group" style="flex:0 0 200px;min-width:0">
+        <label>rider_pickup_number (骑手取货号)</label>
+        <div style="display:flex;gap:6px;align-items:center"><input id="f1-pickup-num" type="text" style="width:100px" oninput="syncBodyFromItems()"><button class="btn-gen" onclick="el('f1-pickup-num').value=String(Math.floor(Math.random()*1000)+1);syncBodyFromItems()">随机</button></div>
+      </div>
+      <div class="form-group" style="flex:0 0 160px;min-width:0">
+        <label class="field-toggle"><input type="checkbox" id="f1-delivery-fee-on" checked onchange="syncBodyFromItems()"><span>delivery_fee (配送费)</span></label>
+        <input id="f1-delivery-fee" type="text" value="3.00" oninput="syncBodyFromItems()">
+      </div>
+      <div class="form-group" style="flex:0 0 160px;min-width:0">
+        <label class="field-toggle"><input type="checkbox" id="f1-packaging-fee-on" checked onchange="syncBodyFromItems()"><span>packaging_fee (打包费)</span></label>
+        <input id="f1-packaging-fee" type="text" value="0.50" oninput="syncBodyFromItems()">
+      </div>
+    </div>
+    <div style="display:flex;gap:16px;align-items:flex-start">
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <div class="json-label" style="margin-bottom:0;font-size:13px;font-weight:700;color:var(--text)">商品列表 (items) <span id="f1-item-count" style="font-weight:400;color:var(--text-light);font-size:11px"></span></div>
+          <button class="btn-gen" id="btn-add-item" onclick="addItem()">+ 添加商品</button>
+        </div>
+        <div id="f1-items-list" style="max-height:480px;overflow-y:auto"></div>
+        <div id="f1-summary" style="margin-top:8px;padding:8px 10px;background:#f0f4ff;border-radius:6px;font-size:12px;color:var(--text);display:flex;flex-wrap:wrap;gap:12px"></div>
+      </div>
+      <div style="flex:1;min-width:0">
+        <div class="json-label" style="font-size:13px;font-weight:700;color:var(--text);margin-bottom:8px">完整请求体 JSON (可直接编辑)</div>
+        <textarea id="f1-body" class="json-editor" style="min-height:480px;margin-top:0"></textarea>
+      </div>
+    </div>
+    <button class="btn-send" onclick="createTask()">发送请求</button>
+    <div class="response-area hidden" id="resp-1"></div>
+  </div>
+</div>
+
+<!-- 门店任务列表 -->
+<div class="card collapsed" id="card-list">
+  <div class="card-header" onclick="toggleCard('card-list')">
+    <div class="left"><span class="method-badge badge-get">GET</span><h2>门店任务列表 <span class="opt-label">(可选)</span></h2></div>
+    <div class="right"><span id="status-list" class="step-status hidden"></span><span class="arrow">&#9660;</span></div>
+  </div>
+  <div class="card-body">
+    <p class="desc"><code>GET /api/robot-tasks</code> &mdash; 查找已有任务，点击"填充任务ID"可快速查询详情</p>
+    <div class="form-row">
+      <div class="form-group" style="flex:0 0 220px;min-width:0">
+        <label>store_id (门店ID)</label>
+        <input id="fl-store-id" type="text">
+      </div>
+      <div class="form-group" style="flex:0 0 120px;min-width:0">
+        <label>page_size (最大50)</label>
+        <input id="fl-page-size" type="number" value="10" min="1" max="50">
+      </div>
+      <div class="form-group" style="flex:0 0 80px;min-width:0">
+        <label>page</label>
+        <input id="fl-page" type="number" value="1" min="1">
+      </div>
+      <div class="form-group" style="flex:0 0 120px;min-width:0">
+        <label>order_by</label>
+        <select id="fl-order-by">
+          <option value="desc" selected>desc（最新）</option>
+          <option value="asc">asc（最早）</option>
+        </select>
+      </div>
+      <div class="form-group" style="flex:0 0 200px;min-width:0">
+        <label>status 筛选（可选）</label>
+        <select id="fl-status">
+          <option value="">全部</option>
+          <option value="pending">pending — 等待中</option>
+          <option value="dispatched">dispatched — 已拆单</option>
+          <option value="running">running — 运行中</option>
+          <option value="success">success — 完成</option>
+          <option value="error">error — 失败</option>
+          <option value="cancel">cancel — 取消</option>
+          <option value="awaiting_pack">awaiting_pack — 等待打包</option>
+        </select>
+      </div>
+    </div>
+    <button class="btn-send" onclick="fetchTaskList()">查询列表</button>
+    <div id="fl-result" class="hidden">
+      <div id="fl-meta" class="task-list-meta"></div>
+      <div style="overflow-x:auto">
+        <table class="task-table">
+          <thead><tr><th>创建时间</th><th>order_no</th><th style="width:80px">来源</th><th style="width:100px">状态</th><th>business_mode_code</th><th style="width:300px">task_id</th><th style="width:70px"></th></tr></thead>
+          <tbody id="fl-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 2. 获取任务详情 -->
+<div class="card collapsed" id="card-2">
+  <div class="card-header" onclick="toggleCard('card-2')">
+    <div class="left"><span class="method-badge badge-get">GET</span><h2>获取任务详情</h2></div>
+    <div class="right"><span id="status-2" class="step-status hidden"></span><span class="arrow">&#9660;</span></div>
+  </div>
+  <div class="card-body">
+    <p class="desc"><code>GET /api/robot-tasks/{task_id}</code> &mdash; 获取父任务完整详情，自动填充后续步骤</p>
+    <div class="form-row"><div class="form-group">
+      <label>task_id <span class="req">*</span> (自动从步骤1填充，或手动输入已有任务ID)</label>
+      <div style="display:flex;gap:6px"><input id="f2-task-id" type="text" placeholder="自动填充或手动输入" style="flex:1"><button class="btn-send" onclick="fetchTaskDetail()" style="margin-top:0">查询详情</button></div>
+    </div></div>
+    <div style="display:flex;gap:16px;margin-top:4px">
+      <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+        <div class="response-area hidden" id="resp-2"></div>
+      </div>
+      <div style="flex:0 0 320px;min-width:0">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+          <div class="json-label" style="margin-bottom:0">子任务 ID 列表 <span class="opt-label">(可选)</span></div>
+          <button class="btn-gen" id="btn-sub-ids" onclick="fetchSubTaskIds()">获取子任务</button>
+        </div>
+        <div id="sub-task-list-area"><div class="sub-task-empty">点击"获取子任务"按钮查询</div></div>
+        <div class="response-area hidden" id="resp-sub" style="margin-top:10px"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 3. 创建子任务 -->
+<div class="card collapsed locked" id="card-3">
+  <div class="card-header" onclick="toggleCard('card-3')">
+    <div class="left"><span class="method-badge badge-post">POST</span><h2>创建子任务 <span class="opt-label">(可选)</span><span class="edge-badge">边缘侧调用</span></h2></div>
+    <div class="right"><span id="lock-3" class="lock-badge">待获取任务详情</span><span id="status-3" class="step-status hidden"></span><span class="arrow">&#9660;</span></div>
+  </div>
+  <div class="card-body" data-lock-msg="请先完成「获取任务详情」">
+    <p class="desc"><code>POST /api/robot-tasks/{task_id}/sub-tasks</code></p>
+    <div class="form-row"><div class="form-group">
+      <label>父任务 task_id <span class="req">*</span> (自动从步骤2填充)</label>
+      <input id="f3-task-id" type="text" placeholder="自动填充">
+    </div></div>
+    <div class="toolbar"><div class="json-label" style="margin-bottom:0">请求体 (JSON) <span class="req">*</span></div></div>
+    <textarea id="f3-body" class="json-editor" style="min-height:300px"></textarea>
+    <button class="btn-send" onclick="createSubTasks()">发送请求</button>
+    <div class="response-area hidden" id="resp-3"></div>
+  </div>
+</div>
+
+<!-- 4. 解析追溯码 -->
+<div class="card collapsed locked" id="card-4">
+  <div class="card-header" onclick="toggleCard('card-4')">
+    <div class="left"><span class="method-badge badge-post">POST</span><h2>解析追溯码 <span class="opt-label">(可选)</span><span class="edge-badge">边缘侧调用</span></h2></div>
+    <div class="right"><span id="lock-4" class="lock-badge">待获取任务详情</span><span id="status-4" class="step-status hidden"></span><span class="arrow">&#9660;</span></div>
+  </div>
+  <div class="card-body" data-lock-msg="请先完成「获取任务详情」">
+    <p class="desc"><code>POST /api/orders/{order_no}/traceability/parse</code></p>
+    <div class="form-row">
+      <div class="form-group"><label>order_no <span class="req">*</span> (自动从步骤2填充)</label><input id="f4-order-no" type="text" placeholder="自动填充"></div>
+      <div class="form-group"><label>trace_code <span class="req">*</span> (20位药品追溯码)</label><div style="display:flex;gap:6px"><input id="f4-trace-code" type="text" placeholder="自动生成" style="flex:1"><button class="btn-gen" onclick="generateTraceCode()" style="align-self:stretch">随机</button></div></div>
+      <div class="form-group"><label>item_id <span class="req">*</span> (自动从任务详情填充)</label><select id="f4-item-id"><option value="">请先完成步骤2</option></select></div>
+    </div>
+    <button class="btn-send" onclick="parseTraceability()">发送请求</button>
+    <div class="response-area hidden" id="resp-4"></div>
+  </div>
+</div>
+
+<!-- 5. 事件更新 -->
+<div class="card collapsed locked" id="card-5">
+  <div class="card-header" onclick="toggleCard('card-5')">
+    <div class="left"><span class="method-badge badge-post">POST</span><h2>事件更新<span class="edge-badge">边缘侧调用</span></h2></div>
+    <div class="right"><span id="lock-5" class="lock-badge">待获取任务详情</span><span id="status-5" class="step-status hidden"></span><span class="arrow">&#9660;</span></div>
+  </div>
+  <div class="card-body" data-lock-msg="请先完成「获取任务详情」">
+    <p class="desc"><code>POST /api/robot-tasks/events</code></p>
+    <div class="form-row">
+      <div class="form-group"><label>event_id <span class="req">*</span> (自动生成UUID)</label><input id="f5-event-id" type="text"></div>
+      <div class="form-group"><label>event_type <span class="req">*</span></label>
+        <select id="f5-event-type" onchange="onEventTypeChange()"></select>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>parent_task_id <span class="req">*</span> (自动从步骤2填充)</label><input id="f5-parent-task-id" type="text" placeholder="自动填充"></div>
+      <div class="form-group"><label>sub_task_id (自动从步骤3填充)</label><input id="f5-sub-task-id" type="text" placeholder="自动填充"></div>
+    </div>
+    <div class="toolbar"><div class="json-label" style="margin-bottom:0">task_execution_result (JSON)</div><button class="btn-gen" onclick="generateEventExecResult()">从任务详情生成</button></div>
+    <textarea id="f5-exec-result" class="json-editor" style="min-height:140px"></textarea>
+    <button class="btn-send" onclick="sendEvent()">发送请求</button>
+    <div class="response-area hidden" id="resp-5"></div>
+  </div>
+</div>
+
+<!-- 6. 更新订单任务 -->
+<div class="card collapsed locked" id="card-6">
+  <div class="card-header" onclick="toggleCard('card-6')">
+    <div class="left"><span class="method-badge badge-put">PUT</span><h2>更新订单任务，下发零售单信息 <span class="opt-label">(可选)</span></h2></div>
+    <div class="right"><span id="lock-6" class="lock-badge">待获取任务详情</span><span id="status-6" class="step-status hidden"></span><span class="arrow">&#9660;</span></div>
+  </div>
+  <div class="card-body" data-lock-msg="请先完成「获取任务详情」">
+    <p class="desc"><code>PUT /api/robot-tasks/{task_id}</code></p>
+    <div class="form-row">
+      <div class="form-group"><label>task_id <span class="req">*</span> (自动从步骤2填充)</label><input id="f6-task-id" type="text" placeholder="自动填充"></div>
+      <div class="form-group"><label>retail_order_id <span class="req">*</span> (零售单号)</label><input id="f6-retail-order-id" type="text" placeholder="零售单ID"></div>
+      <div class="form-group"><label>retail_order_time <span class="req">*</span> (零售单时间)</label><input id="f6-retail-order-time" type="text" placeholder="零售单时间"></div>
+    </div>
+    <button class="btn-send" onclick="updateTask()">发送请求</button>
+    <div class="response-area hidden" id="resp-6"></div>
+  </div>
+</div>
+
+<!-- 7. 取消任务 -->
+<div class="card collapsed locked" id="card-7">
+  <div class="card-header" onclick="toggleCard('card-7')">
+    <div class="left"><span class="method-badge badge-post">POST</span><h2>取消任务 <span class="opt-label">(可选)</span></h2></div>
+    <div class="right"><span id="lock-7" class="lock-badge">待获取任务详情</span><span id="status-7" class="step-status hidden"></span><span class="arrow">&#9660;</span></div>
+  </div>
+  <div class="card-body" data-lock-msg="请先完成「获取任务详情」">
+    <p class="desc"><code>POST /api/robot-tasks/{task_id}/cancel</code></p>
+    <div class="form-row">
+      <div class="form-group"><label>task_id <span class="req">*</span> (自动从步骤2填充)</label><input id="f7-task-id" type="text" placeholder="自动填充"></div>
+      <div class="form-group"><label>cancel_type (取消类型)</label><input id="f7-cancel-type" type="text" value="user"></div>
+      <div class="form-group" style="flex:2"><label>cancel_reason (取消原因)</label><input id="f7-cancel-reason" type="text" value="直接取消"></div>
+    </div>
+    <button class="btn-send" onclick="cancelTask()" style="background:var(--error)">取消任务</button>
+    <div class="response-area hidden" id="resp-7"></div>
+  </div>
+</div>
+
+</div>
+
+<script>
+let accessToken = '';
+let myStores = [];
+let lastTaskDetail = null;
+
+function val(id) { return document.getElementById(id).value.trim(); }
+function el(id) { return document.getElementById(id); }
+function generateUUID() { return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c==='x'?r:(r&0x3|0x8)).toString(16)}); }
+function nowStr() { const d=new Date(),p=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; }
+function oneYearLater(){ const d=new Date();d.setFullYear(d.getFullYear()+1);const p=n=>String(n).padStart(2,'0');return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`;}
+function generateOrderNo() { const d=new Date(),p=(n,w)=>String(n).padStart(w,'0'); return `TEST${d.getFullYear()}${p(d.getMonth()+1,2)}${p(d.getDate(),2)}${p(d.getHours(),2)}${p(d.getMinutes(),2)}${p(d.getSeconds(),2)}${p(d.getMilliseconds(),3)}`; }
+
+// --- Config persistence ---
+const STORAGE_KEY = 'ob_api_test_config';
+function saveConfig() { try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ server:val('cfg-server'), clientId:val('cfg-client-id'), clientSecret:val('cfg-client-secret'), mode:el('cfg-mode').value, customer:el('cfg-customer').value })); } catch {} }
+function loadConfig() { try { const c=JSON.parse(localStorage.getItem(STORAGE_KEY)); if(c){if(c.server)el('cfg-server').value=c.server;if(c.clientId)el('cfg-client-id').value=c.clientId;if(c.clientSecret)el('cfg-client-secret').value=c.clientSecret;if(c.mode)el('cfg-mode').value=c.mode;if(c.customer)el('cfg-customer').value=c.customer;} } catch {} }
+
+// --- Mode: server / edge ---
+function applyMode(){
+  const isEdge = el('cfg-mode').value === 'edge';
+  ['card-3','card-4','card-5'].forEach(id=>{
+    el(id).style.display = isEdge ? '' : 'none';
+  });
+}
+
+loadConfig();
+applyMode();
+['cfg-server','cfg-client-id','cfg-client-secret'].forEach(id=>el(id).addEventListener('change',saveConfig));
+
+// --- Item editor for step 1 ---
+// 各客户 profile：创建订单任务的差异参数（页面结构/请求逻辑三家通用，仅这些数据不同）
+const CUSTOMER_PROFILES = {
+  dashenlin: {
+    label:'大参林', storeId:'dashenlin_test', businessModeCode:'MODE_PICK_WAIT_PACK',
+    needImageUpload:false, hasPriceFields:true, defaultSource:'meituan', twoStage:true,
+    orderSources:[
+      {value:'meituan',prefix:'MT',cn:'美团外卖'},{value:'eleme',prefix:'ELEM',cn:'淘宝闪购'},
+      {value:'jd',prefix:'JD',cn:'京东'},{value:'dy',prefix:'DY',cn:'抖音'},
+      {value:'dsl',prefix:'DSL',cn:'大参林健康'},{value:'elemzb',prefix:'ELEMZB',cn:'淘宝闪购滋补店'},
+      {value:'qjw',prefix:'QJW',cn:'企健网'},{value:'zheb',prefix:'ZHEB',cn:'智慧E保'},
+    ],
+    requiredItemKeys:['item_id','quantity'],
+    itemFields:[
+      {key:'item_id',label:'商品编码',group:'基本信息'},{key:'common_name',label:'商品名称',wide:true,group:'基本信息'},{key:'quantity',label:'数量',type:'number',narrow:true,group:'基本信息'},{key:'spec',label:'规格',narrow:true,group:'基本信息'},
+      {key:'barcode',label:'条形码',group:'库存批次'},{key:'location_code',label:'货位',group:'库存批次'},{key:'batch_number',label:'批号',group:'库存批次'},{key:'expiry_date',label:'有效期',group:'库存批次'},
+      {key:'retail_price',label:'零售价',group:'价格'},{key:'item_amount',label:'金额',group:'价格'},{key:'discount_amount',label:'折扣金额',group:'价格'},
+      {key:'manufacturer',label:'生产厂家',wide:true,group:'生产信息'},{key:'dosage',label:'剂型',group:'生产信息'},{key:'approval_number',label:'批准文号',group:'生产信息'},{key:'production_place',label:'产地',group:'生产信息'},
+    ],
+    defaultItem:{ item_id:"8303048",common_name:"隆力奇蛇油护手霜",spec:"50g",quantity:1,barcode:"",item_name:"",dosage:"化妆品",expiry_date:oneYearLater(),item_amount:"4.5",batch_number:"10906NA1",manufacturer:"卡莱丽化妆品有限公司",retail_price:"4.5",location_code:null,approval_number:"苏妆20160055",discount_amount:"3.99",production_place:"江苏" },
+    baseOrderFields:{store_name:"02048店广州龙溪西",store_phone:"020-81416683",store_address:"广州市荔湾区西华路58号首层铺自编A栋001",recipient_name:"梁小燊",recipient_phone:"15800225375",delivery_address:"广东省广州市荔湾区龙溪中路333号(大参林总部副中心)b栋",order_time_timezone:"Asia/Shanghai"},
+    execProcessedItem:(item)=>({quantity:item.quantity||1,product_id:item.item_id||'',trace_code:null,product_barcode:item.barcode||'',batch_number:item.batch_number||null}),
+  },
+  yaoshibang: {
+    label:'药师帮', storeId:'6', businessModeCode:'MODE_PICK',
+    needImageUpload:true, hasPriceFields:false, defaultSource:'meituan', twoStage:false,
+    orderSources:[
+      {value:'meituan',prefix:'MT',cn:'美团外卖'},{value:'eleme',prefix:'ELEM',cn:'淘宝闪购'},
+      {value:'jd',prefix:'JD',cn:'京东'},{value:'dy',prefix:'DY',cn:'抖音'},
+    ],
+    requiredItemKeys:['item_id','quantity'],
+    itemFields:[
+      {key:'item_id',label:'商品编码',group:'基本信息'},{key:'common_name',label:'商品名称',wide:true,group:'基本信息'},{key:'quantity',label:'数量',type:'number',narrow:true,group:'基本信息'},{key:'spec',label:'规格',narrow:true,group:'基本信息'},
+      {key:'barcode',label:'条形码',group:'库存批次'},{key:'location_code',label:'货位',group:'库存批次'},
+      {key:'manufacturer',label:'生产厂家',wide:true,group:'生产信息'},{key:'approval_number',label:'批准文号',group:'生产信息'},
+    ],
+    defaultItem:{ item_id:"1783",common_name:"百洛特 草酸艾司西酞普兰片",spec:"10mg*7片",quantity:1,barcode:"6920587904956",item_name:"",manufacturer:"四川科伦药业股份有限公司",location_code:"270104",approval_number:"国药准字H20080788" },
+    baseOrderFields:{store_name:"广州快道信息科技有限公司碧映路分店",store_phone:"13012345678",recipient_name:"曾(**)",recipient_phone:"14745211440_1399",delivery_address:"和丰大厦 (704房)@#广东省广州市海珠区凤阳街道和丰大厦",order_time_timezone:"Asia/Shanghai"},
+    execProcessedItem:(item)=>({quantity:item.quantity||1,product_id:item.item_id||'',trace_code:"83887340323177079887",location_code:item.location_code||'',oss_image_key:"images/2026/07/07/c364f48d7bb0.jpg",product_barcode:item.barcode||''}),
+  },
+};
+let activeCustomer = 'dashenlin';
+let profile = CUSTOMER_PROFILES[activeCustomer];
+let defaultItem = { ...profile.defaultItem };
+let requiredItemKeys = new Set(profile.requiredItemKeys);
+let itemFields = profile.itemFields;
+let defaultEnabledKeys = new Set(itemFields.map(f=>f.key));
+let itemsData = [{ ...defaultItem }];
+let itemsEnabled = [new Set(defaultEnabledKeys)];
+
+function escapeAttr(s){return s.replace(/"/g,'&quot;').replace(/</g,'&lt;');}
+const MAX_ITEMS=5;
+let itemCollapsed=[];
+function itemSummary(item){const name=item.common_name||item.item_name||'';const id=item.item_id||'';return name?`${id} ${name} ×${item.quantity||1}`:`${id} ×${item.quantity||1}`;}
+function renderItems() {
+  const c=el('f1-items-list'); c.innerHTML='';
+  el('f1-item-count').textContent=`(${itemsData.length}/${MAX_ITEMS})`;
+  const addBtn=el('btn-add-item');if(addBtn)addBtn.disabled=itemsData.length>=MAX_ITEMS;
+  itemsData.forEach((item,idx)=>{
+    if(!itemsEnabled[idx]) itemsEnabled[idx]=new Set(defaultEnabledKeys);
+    const collapsed=itemCollapsed[idx]||false;
+    const card=document.createElement('div'); card.className='item-card'+(collapsed?' item-collapsed':'');
+    let h=`<div class="item-header" onclick="toggleItemCard(${idx})"><div style="display:flex;align-items:center"><span class="item-arrow">&#9660;</span><span>商品 #${idx+1}</span>`;
+    if(collapsed) h+=`<span class="item-summary">${escapeHtml(itemSummary(item))}</span>`;
+    h+=`</div><div style="display:flex;gap:6px">`;
+    if(itemsData.length>1) h+=`<button class="btn-remove-item" onclick="event.stopPropagation();removeItem(${idx})">删除</button>`;
+    h+=`</div></div>`;
+    h+=`<div class="item-body">`;
+    const groups=[];const seen={};
+    itemFields.forEach(f=>{const g=f.group||'其他';if(!seen[g]){seen[g]=[];groups.push(g);}seen[g].push(f);});
+    groups.forEach(g=>{
+      h+=`<div class="item-group"><div class="item-group-label">${g}</div><div class="item-fields">`;
+      seen[g].forEach(f=>{
+        const v=item[f.key]!=null?item[f.key]:'';
+        const isReq=requiredItemKeys.has(f.key);
+        const on=itemsEnabled[idx].has(f.key);
+        const dis=!on&&!isReq;
+        h+=`<div class="mini-field${f.wide?' wide':''}${f.narrow?' narrow':''}${dis?' disabled':''}">`;
+        if(isReq){
+          h+=`<label>${f.label}</label>`;
+        } else {
+          h+=`<label class="field-toggle"><input type="checkbox" ${on?'checked':''} data-idx="${idx}" data-key="${f.key}" onchange="toggleItemField(this)"><span>${f.label}</span></label>`;
+        }
+        h+=`<input type="${f.type||'text'}" value="${escapeAttr(String(v))}" data-idx="${idx}" data-key="${f.key}" oninput="updateItemField(this)"${f.type==='number'?' min="1"':''}></div>`;
+      });
+      h+='</div></div>';
+    });
+    h+='</div>';
+    card.innerHTML=h; c.appendChild(card);
+  });
+  syncBodyFromItems();
+}
+function toggleItemCard(idx){itemCollapsed[idx]=!itemCollapsed[idx];renderItems();}
+function toggleItemField(cb){const idx=+cb.dataset.idx,key=cb.dataset.key;if(cb.checked)itemsEnabled[idx].add(key);else itemsEnabled[idx].delete(key);renderItems();}
+function updateItemField(input){
+  const idx=+input.dataset.idx,key=input.dataset.key;let v=input.value;
+  if(key==='quantity')v=parseInt(v)||1;
+  const it=itemsData[idx];
+  if(key==='quantity'){
+    const oldQty=parseInt(it.quantity)||1;
+    it[key]=v;
+    const newQty=parseInt(v)||1;
+    const price=parseFloat(it.retail_price)||0;
+    it.item_amount=String((price*newQty).toFixed(2));
+    const oldDiscount=parseFloat(it.discount_amount)||0;
+    if(oldQty>0) it.discount_amount=String((oldDiscount/oldQty*newQty).toFixed(2));
+    updateItemUI(idx,'item_amount',it.item_amount);
+    updateItemUI(idx,'discount_amount',it.discount_amount);
+  } else if(key==='retail_price'){
+    it[key]=v;
+    const qty=parseInt(it.quantity)||1;
+    const price=parseFloat(v)||0;
+    it.item_amount=String((price*qty).toFixed(2));
+    updateItemUI(idx,'item_amount',it.item_amount);
+  } else {
+    it[key]=v;
+  }
+  syncBodyFromItems();
+}
+function updateItemUI(idx,key,val){const inp=document.querySelector(`input[data-idx="${idx}"][data-key="${key}"]`);if(inp)inp.value=val;}
+function addItem(){
+  if(itemsData.length>=MAX_ITEMS){alert(`最多添加 ${MAX_ITEMS} 个商品`);return;}
+  itemCollapsed=itemCollapsed.map(()=>true);
+  const last=itemsData[itemsData.length-1];
+  const newItem={...last};
+  const lastId=parseInt(last.item_id)||0;
+  const newId=lastId>0?String(lastId+10):'';
+  newItem.item_id=newId;
+  if(newId&&last.common_name){
+    const baseName=last.common_name.replace(/-\d+$/,'');
+    newItem.common_name=`${baseName}-${newId}`;
+  }
+  itemsData.push(newItem);
+  itemsEnabled.push(new Set(itemsEnabled[itemsEnabled.length-1]));
+  itemCollapsed.push(false);
+  renderItems();
+}
+function removeItem(idx){if(itemsData.length<=1)return;itemsData.splice(idx,1);itemsEnabled.splice(idx,1);itemCollapsed.splice(idx,1);renderItems();}
+
+let baseOrderFields = { ...profile.baseOrderFields };
+let SOURCE_PREFIXES = Object.fromEntries(profile.orderSources.map(s=>[s.value,s.prefix]));
+let SOURCE_LABELS = Object.fromEntries(profile.orderSources.map(s=>[s.value,s.cn]));
+function generatePlatformOrderNo(source){const p=SOURCE_PREFIXES[source]||source.toUpperCase();const d=new Date(),pad=n=>String(n).padStart(2,'0');const ts=`${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}`;const rnd=String(Math.floor(Math.random()*10000)).padStart(4,'0');return `${p}${ts}${rnd}`;}
+let currentOrderNo=generateOrderNo(), currentOrderTime=nowStr(), currentBuyerNote='', currentPlatformOrderNo='', lastOrderSource='';
+const ORDER_TERMINAL_STATUS=new Set(['success','error','cancel']);
+let orderWatchTimer=null;
+let orderWatchTaskId='';
+let lastOrderNoRefreshTaskId='';
+
+function refreshMerchantOrderNo(){
+  currentOrderNo=generateOrderNo();
+  el('f1-order-no').value=currentOrderNo;
+  currentOrderTime=nowStr();
+  const orderSource=el('f1-order-source').value;
+  currentPlatformOrderNo=generatePlatformOrderNo(orderSource);
+  lastOrderSource=orderSource;
+  el('f1-platform-order-no').value=currentPlatformOrderNo;
+  syncBodyFromItems();
+}
+
+function stopOrderWatch(){
+  if(orderWatchTimer){clearInterval(orderWatchTimer);orderWatchTimer=null;}
+  orderWatchTaskId='';
+}
+
+function onOrderEnded(taskId){
+  const id=String(taskId||'').trim();
+  if(!id||lastOrderNoRefreshTaskId===id)return;
+  lastOrderNoRefreshTaskId=id;
+  stopOrderWatch();
+  refreshMerchantOrderNo();
+}
+
+function startOrderWatch(taskId){
+  const id=String(taskId||'').trim();
+  if(!id)return;
+  stopOrderWatch();
+  orderWatchTaskId=id;
+  let ticks=0;
+  const tick=async()=>{
+    if(!orderWatchTaskId||orderWatchTaskId!==id)return;
+    ticks+=1;
+    try{
+      const r=await apiCall('GET',`/api/robot-tasks/${encodeURIComponent(id)}`);
+      const detail=r.data?.data||r.data;
+      const status=String(detail?.status||'').trim();
+      if(ORDER_TERMINAL_STATUS.has(status)){
+        onOrderEnded(id);
+        return;
+      }
+      if(ticks>=360)stopOrderWatch();
+    }catch(e){
+      if(ticks>=8)stopOrderWatch();
+    }
+  };
+  tick();
+  orderWatchTimer=setInterval(tick,5000);
+}
+
+function syncBodyFromItems() {
+  currentOrderNo=val('f1-order-no')||currentOrderNo;
+  const totalQty=itemsData.reduce((s,it)=>s+(parseInt(it.quantity)||1),0);
+  const goodsAmount=itemsData.reduce((s,it)=>s+(parseFloat(it.retail_price)||0)*(parseInt(it.quantity)||1),0);
+  const payAmount=itemsData.reduce((s,it)=>s+(parseFloat(it.discount_amount)||0),0);
+  const items=itemsData.map((it,idx)=>{
+    const enabled=itemsEnabled[idx]||defaultEnabledKeys;
+    const obj={};
+    itemFields.forEach(f=>{
+      if(!enabled.has(f.key)&&!requiredItemKeys.has(f.key))return;
+      obj[f.key]=f.type==='number'?(parseInt(it[f.key])||0):(it[f.key]||'');
+    });
+    if('location_code' in obj&&obj.location_code==='')obj.location_code=null;
+    if(enabled.has('item_amount'))obj.item_amount=String(((parseFloat(it.retail_price)||0)*(parseInt(it.quantity)||1)).toFixed(2));
+    return obj;
+  });
+  const pickupNum=val('f1-pickup-num');
+  const storeId=val('f1-store-id');
+  const deliveryOn=el('f1-delivery-fee-on').checked;
+  const packagingOn=el('f1-packaging-fee-on').checked;
+  const deliveryFee=val('f1-delivery-fee')||'0.0';
+  const packagingFee=val('f1-packaging-fee')||'0.0';
+  el('f1-delivery-fee').closest('.form-group').classList.toggle('fee-off',!deliveryOn);
+  el('f1-packaging-fee').closest('.form-group').classList.toggle('fee-off',!packagingOn);
+  const discountTotal=goodsAmount-payAmount;
+  const orderSource=el('f1-order-source').value;
+  if(orderSource!==lastOrderSource||!currentPlatformOrderNo){currentPlatformOrderNo=generatePlatformOrderNo(orderSource);lastOrderSource=orderSource;}
+  el('f1-platform-order-no').value=currentPlatformOrderNo;
+  const body={store_id:storeId,...baseOrderFields,platform_order_no:currentPlatformOrderNo,buyer_note:currentBuyerNote,order_source:orderSource,order_no:currentOrderNo,order_time:currentOrderTime,items,total_quantity:String(totalQty),goods_amount:goodsAmount.toFixed(2),pay_amount:payAmount.toFixed(2),total_price:payAmount.toFixed(2),discount_amount:discountTotal.toFixed(2),rider_pickup_number:pickupNum};
+  if(profile.needImageUpload)body.need_image_upload=true;
+  if(deliveryOn)body.delivery_fee=deliveryFee;
+  if(packagingOn)body.packaging_fee=packagingFee;
+  el('f1-body').value=JSON.stringify(body,null,2);
+  const sm=el('f1-summary');
+  let smHtml=`<span><b>总数量:</b> ${totalQty}</span><span><b>商品总额:</b> ¥${goodsAmount.toFixed(2)}</span><span><b>实付金额:</b> ¥${payAmount.toFixed(2)}</span><span><b>优惠金额:</b> ¥${discountTotal.toFixed(2)}</span>`;
+  if(deliveryOn)smHtml+=`<span><b>配送费:</b> ¥${deliveryFee}</span>`;
+  if(packagingOn)smHtml+=`<span><b>打包费:</b> ¥${packagingFee}</span>`;
+  if(sm)sm.innerHTML=smHtml;
+}
+el('f1-body').addEventListener('blur',()=>{try{const b=JSON.parse(el('f1-body').value);if(b.store_id!=null)el('f1-store-id').value=b.store_id;if(b.order_source)el('f1-order-source').value=b.order_source;if(b.buyer_note!=null)currentBuyerNote=b.buyer_note;if(b.order_no){currentOrderNo=b.order_no;el('f1-order-no').value=currentOrderNo;}if(b.order_time)currentOrderTime=b.order_time;if(b.rider_pickup_number!=null)el('f1-pickup-num').value=b.rider_pickup_number;if(b.delivery_fee!=null)el('f1-delivery-fee').value=b.delivery_fee;if(b.packaging_fee!=null)el('f1-packaging-fee').value=b.packaging_fee;if(Array.isArray(b.items)&&b.items.length>0){itemsData=b.items.map(it=>({...defaultItem,...it}));renderItems();}}catch{}});
+
+// --- 客户切换：按当前 profile 刷新创建任务的全部参数 ---
+function buildSourceOptions(){
+  const sel=el('f1-order-source'); if(!sel)return;
+  sel.innerHTML=profile.orderSources.map(s=>`<option value="${s.value}">${s.value} — ${s.cn}</option>`).join('');
+  sel.value=profile.defaultSource;
+}
+function subTaskTemplate(items){return JSON.stringify({sub_tasks:[{task_id:generateUUID(),params:{items:items||[],metadata:{},current_sub_task_index:1,total_sub_task_count:1,business_mode_code:profile.businessModeCode}}]},null,2);}
+function execResultTemplate(items){const src=(items&&items.length)?items:[defaultItem];return JSON.stringify({status:true,error_code:0,error_message:null,context:{processed_items:src.map(it=>profile.execProcessedItem(it))}},null,2);}
+// 失败事件的 task_execution_result（无 processed_items，取自 yaoshibang 真实失败子任务数据形状）
+function execFailedTemplate(){return JSON.stringify({status:false,error_code:5,error_message:"Task no wait error: obj <barcode> not in template candidate, you cann't find it",context:null},null,2);}
+// 事件类型下拉：last_sub_task_pick_succeeded / pack_task_* 仅两段式(MODE_PICK_WAIT_PACK)客户显示
+function buildEventTypeOptions(){
+  const sel=el('f5-event-type'); if(!sel)return;
+  const opts=[
+    {v:'sub_task_started',always:true},
+    {v:'sub_task_succeeded',always:true},
+    {v:'sub_task_failed',always:true},
+    {v:'last_sub_task_pick_succeeded',twoStage:true},
+    {v:'pack_task_succeeded',twoStage:true},
+    {v:'pack_task_failed',twoStage:true},
+    {v:'pack_task_canceled',twoStage:true},
+  ].filter(o=>o.always||(o.twoStage&&profile.twoStage));
+  sel.innerHTML=opts.map(o=>`<option value="${o.v}"${o.v==='sub_task_succeeded'?' selected':''}>${o.v}</option>`).join('');
+}
+// task_execution_result 模板按当前事件类型切换：failed→异常体；succeeded/其它→拣货结果体
+function onEventTypeChange(){
+  const et=val('f5-event-type');
+  const ta=el('f5-exec-result'); if(!ta)return;
+  if(et.endsWith('failed')){ ta.value=execFailedTemplate(); }
+  else { const items=lastTaskDetail?.params?.items; ta.value=execResultTemplate(items&&items.length?items:[defaultItem]); }
+}
+function applyCustomer(name){
+  activeCustomer = CUSTOMER_PROFILES[name] ? name : 'dashenlin';
+  profile = CUSTOMER_PROFILES[activeCustomer];
+  defaultItem = { ...profile.defaultItem };
+  requiredItemKeys = new Set(profile.requiredItemKeys);
+  itemFields = profile.itemFields;
+  defaultEnabledKeys = new Set(itemFields.map(f=>f.key));
+  baseOrderFields = { ...profile.baseOrderFields };
+  SOURCE_PREFIXES = Object.fromEntries(profile.orderSources.map(s=>[s.value,s.prefix]));
+  SOURCE_LABELS = Object.fromEntries(profile.orderSources.map(s=>[s.value,s.cn]));
+  el('cfg-customer').value = activeCustomer;
+  el('f1-store-id').value = profile.storeId;
+  const flStore=el('fl-store-id'); if(flStore&&!flStore.value) flStore.value=profile.storeId;
+  buildSourceOptions();
+  lastOrderSource=''; currentPlatformOrderNo='';
+  itemsData=[{ ...defaultItem }]; itemsEnabled=[new Set(defaultEnabledKeys)]; itemCollapsed=[];
+  renderItems();
+  el('f3-body').value=subTaskTemplate([]);
+  buildEventTypeOptions();
+  onEventTypeChange();
+  // 切客户 = 切租户，门店列表失效，清空待重新获取
+  myStores=[]; const storeSel=el('cfg-store'); if(storeSel) storeSel.innerHTML='<option value="">— 未获取 —</option>';
+}
+
+// --- Init ---
+// loadConfig() 已在 L419 早期调用（HTML select 已存在），此处不重复；直接按已恢复的
+// cfg-customer 值应用客户 profile（含 renderItems + 模板初始化）。
+applyCustomer(el('cfg-customer').value);
+el('f1-order-no').value=currentOrderNo;
+el('f1-pickup-num').value=String(Math.floor(Math.random()*1000)+1);
+el('f5-event-id').value=generateUUID();
+el('f6-retail-order-id').value='RO'+generateOrderNo().replace('TEST','');
+el('f6-retail-order-time').value=nowStr();
+
+// --- UI helpers ---
+function toggleCard(id){document.getElementById(id).classList.toggle('collapsed');}
+function openCard(id){document.getElementById(id).classList.remove('collapsed');}
+function unlockCards(...ids){ids.forEach(n=>{el(`card-${n}`).classList.remove('locked');const l=el(`lock-${n}`);if(l)l.classList.add('hidden');});}
+function markStep(n,ok){const b=el(`status-${n}`);b.classList.remove('hidden');b.className=`step-status ${ok?'step-done':''}`;b.textContent=ok?'成功':'失败';b.style.cssText=ok?'':'background:#ffebe6;color:#de350b;';}
+function escapeHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function serverUrl(){let s=val('cfg-server');return s.endsWith('/')?s.slice(0,-1):s;}
+function showResponse(id,status,ms,body){const a=el(id);a.classList.remove('hidden');let sc='status-2xx';if(status>=400&&status<500)sc='status-4xx';if(status>=500)sc='status-5xx';let b;try{b=JSON.stringify(body,null,2);}catch{b=String(body);}const copyId=`copy-${id}`;a.innerHTML=`<div class="response-meta"><span class="status-code ${sc}">${status}</span><span class="response-time">${ms}ms</span><button id="${copyId}" class="btn-copy" onclick="copyResponse('${copyId}','${id}-body')" title="复制">复制</button></div><div class="response-body" id="${id}-body">${escapeHtml(b)}</div>`;}
+function copyResponse(btnId,bodyId){const text=el(bodyId)?.textContent||'';navigator.clipboard.writeText(text).then(()=>{const btn=el(btnId);const orig=btn.textContent;btn.textContent='已复制!';btn.style.color='var(--success)';setTimeout(()=>{btn.textContent=orig;btn.style.color='';},1500);}).catch(()=>alert('复制失败，请手动选中复制'));}
+async function apiCall(method,path,body){const h={'Content-Type':'application/json'};if(accessToken)h['Authorization']=`Bearer ${accessToken}`;const t0=performance.now();const r=await fetch(serverUrl()+path,{method,headers:h,body:body?JSON.stringify(body):undefined});const elapsed=Math.round(performance.now()-t0);let data;try{data=await r.json();}catch{data=await r.text();}return{status:r.status,elapsed,data};}
+
+document.querySelectorAll('.json-editor').forEach(ta=>{ta.addEventListener('blur',()=>{try{ta.value=JSON.stringify(JSON.parse(ta.value),null,2);ta.style.borderColor='';}catch{ta.style.borderColor='var(--error)';}});});
+
+function cascadeFromDetail() {
+  if(!lastTaskDetail) return;
+  const taskId=lastTaskDetail.task_id;
+  el('f2-task-id').value=taskId;
+  el('f3-task-id').value=taskId;
+  el('f5-parent-task-id').value=taskId;
+  el('f6-task-id').value=taskId;
+  el('f7-task-id').value=taskId;
+  if(lastTaskDetail.params?.order_no) el('f4-order-no').value=lastTaskDetail.params.order_no;
+  else if(lastTaskDetail.order_no) el('f4-order-no').value=lastTaskDetail.order_no;
+  generateSubTaskBody();
+  generateEventExecResult();
+  populateItemIdSelect();
+}
+
+// ---- API calls ----
+
+async function getToken(){
+  const s=el('token-status');s.className='token-status none';s.textContent='请求中...';
+  try{const body={client_id:val('cfg-client-id'),client_secret:val('cfg-client-secret')};const r=await fetch(serverUrl()+'/api/client/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await r.json();const td=data?.data||data;
+  if(r.ok&&td.access_token){accessToken=td.access_token;s.className='token-status ok';s.textContent=`已获取 (${td.expires_in||'?'}s)`;saveConfig();}
+  else{accessToken='';s.className='token-status err';s.textContent=`失败: ${data.msg||data.detail||JSON.stringify(data).slice(0,60)}`;}}
+  catch(e){accessToken='';s.className='token-status err';s.textContent=`网络错误: ${e.message}`;}
+}
+
+// --- 门店列表（GET /api/retail-stores/mine）：取有权限门店，选中回填 store_id / store_name ---
+async function fetchMyStores(){
+  const sel=el('cfg-store');
+  if(!accessToken){alert('请先获取 Token');return;}
+  sel.innerHTML='<option value="">加载中...</option>';
+  try{
+    const r=await apiCall('GET','/api/retail-stores/mine');
+    const list=r.data?.data||r.data;
+    if(r.status>=200&&r.status<300&&Array.isArray(list)){
+      myStores=list;
+      if(list.length===0){sel.innerHTML='<option value="">（无可访问门店）</option>';return;}
+      sel.innerHTML='<option value="">— 选择门店 —</option>'+list.map((s,i)=>`<option value="${i}">${escapeAttr(s.store_id)} — ${escapeAttr(s.store_name||'')}</option>`).join('');
+    } else {
+      myStores=[];sel.innerHTML='<option value="">获取失败</option>';
+      alert('获取门店失败: '+(r.data?.msg||r.data?.detail||JSON.stringify(r.data).slice(0,80)));
+    }
+  }catch(e){myStores=[];sel.innerHTML='<option value="">网络错误</option>';alert('网络错误: '+e.message);}
+}
+function onStoreSelect(idx){
+  if(idx===''||!myStores[idx])return;
+  const store=myStores[idx];
+  // 回填下单表单 store_id；store_name / store_address 并入 baseOrderFields（下单 body extra 透传）
+  el('f1-store-id').value=store.store_id;
+  const flStore=el('fl-store-id'); if(flStore) flStore.value=store.store_id;
+  if(store.store_name!=null) baseOrderFields.store_name=store.store_name;
+  if(store.address!=null&&'store_address' in baseOrderFields) baseOrderFields.store_address=store.address;
+  syncBodyFromItems();
+}
+
+// Step 1: Create task
+async function createTask(){
+  let body;try{body=JSON.parse(val('f1-body'));}catch{alert('请求体 JSON 格式无效');return;}
+  try{const r=await apiCall('POST','/api/robot-tasks',body);showResponse('resp-1',r.status,r.elapsed,r.data);
+  const d=r.data?.data||r.data;const ok=r.status>=200&&r.status<300;markStep(1,ok);
+  if(ok&&d?.task_id){
+    el('f2-task-id').value=d.task_id;
+    if(body.order_no)el('f4-order-no').value=body.order_no;
+    openCard('card-2');
+    startOrderWatch(d.task_id);
+  }}
+  catch(e){showResponse('resp-1',0,0,{error:e.message});markStep(1,false);}
+}
+
+// Step 2: Get task detail
+async function fetchTaskDetail(){
+  const taskId=val('f2-task-id');if(!taskId){alert('请输入 task_id');return;}
+  el('sub-task-list-area').innerHTML='<div class="sub-task-empty">点击"获取子任务"按钮查询</div>';
+  el('resp-sub').classList.add('hidden');
+  try{const r=await apiCall('GET',`/api/robot-tasks/${encodeURIComponent(taskId)}`);
+  showResponse('resp-2',r.status,r.elapsed,r.data);
+  const detail=r.data?.data||r.data;const ok=r.status>=200&&r.status<300;markStep(2,ok);
+  if(ok&&detail?.params){lastTaskDetail=detail;cascadeFromDetail();unlockCards(3,4,5,6,7);}
+  if(ok&&ORDER_TERMINAL_STATUS.has(String(detail?.status||'').trim())){
+    onOrderEnded(taskId);
+  }}
+  catch(e){showResponse('resp-2',0,0,{error:e.message});markStep(2,false);}
+}
+
+// Sub-task IDs
+async function fetchSubTaskIds(){
+  const taskId=val('f2-task-id');if(!taskId){alert('请先填写 task_id');return;}
+  el('sub-task-list-area').innerHTML='<div class="sub-task-empty">获取中…</div>';
+  el('resp-sub').classList.add('hidden');
+  try{
+    const r=await apiCall('GET',`/api/robot-tasks/${encodeURIComponent(taskId)}/sub-task-ids`);
+    const ids=(r.data?.data)||[];
+    if(!Array.isArray(ids)||ids.length===0){
+      el('sub-task-list-area').innerHTML='<div class="sub-task-empty">暂无子任务</div>';
+      return;
+    }
+    const list=document.createElement('div');list.className='sub-task-list';
+    ids.forEach((id,i)=>{
+      const tag=document.createElement('div');tag.className='sub-task-tag';tag.dataset.subId=id;
+      tag.innerHTML=`<span class="sub-task-id" title="${escapeHtml(id)}">${escapeHtml(id)}</span><button class="btn-sub-detail" onclick="fetchSubTaskDetail('${escapeHtml(id)}',this)">查看详情</button>`;
+      list.appendChild(tag);
+    });
+    el('sub-task-list-area').innerHTML='';
+    el('sub-task-list-area').appendChild(list);
+  }catch(e){el('sub-task-list-area').innerHTML=`<div class="sub-task-empty" style="color:var(--error)">获取失败: ${escapeHtml(e.message)}</div>`;}
+}
+
+async function fetchSubTaskDetail(subTaskId, btn){
+  document.querySelectorAll('.sub-task-tag').forEach(t=>t.style.background='');
+  if(btn)btn.closest('.sub-task-tag').style.background='#dbeafe';
+  el('resp-sub').classList.remove('hidden');
+  el('resp-sub').innerHTML='<div class="response-body" style="color:#aaa">获取中…</div>';
+  try{
+    const r=await apiCall('GET',`/api/robot-tasks/${encodeURIComponent(subTaskId)}`);
+    showResponse('resp-sub',r.status,r.elapsed,r.data);
+  }catch(e){showResponse('resp-sub',0,0,{error:e.message});}
+}
+
+function generateSubTaskBody(){
+  if(!lastTaskDetail)return;const params=lastTaskDetail.params;const items=params.items||[];const metadata={...params};delete metadata.items;
+  // business_mode_code 优先用任务详情里的真实值，缺失则回落当前客户 profile 默认
+  const bmc=lastTaskDetail.business_mode_code||params.business_mode_code||profile.businessModeCode;
+  el('f3-body').value=JSON.stringify({sub_tasks:[{task_id:generateUUID(),params:{items,metadata,current_sub_task_index:1,total_sub_task_count:1,business_mode_code:bmc}}]},null,2);
+}
+
+function populateItemIdSelect(){
+  const select=el('f4-item-id');select.innerHTML='';
+  if(!lastTaskDetail?.params?.items?.length){select.innerHTML='<option value="">请先完成步骤2</option>';return;}
+  lastTaskDetail.params.items.forEach((item,i)=>{const opt=document.createElement('option');opt.value=item.item_id||'';opt.textContent=item.item_id+(item.common_name||item.item_name?` (${item.common_name||item.item_name})`:'');if(i===0)opt.selected=true;select.appendChild(opt);});
+  generateTraceCode();
+}
+el('f4-item-id').addEventListener('change',generateTraceCode);
+
+function generateTraceCode(){const itemId=val('f4-item-id')||'00000000';const suffix=String(Math.floor(Math.random()*1e12)).padStart(12,'0');el('f4-trace-code').value=(itemId+suffix).slice(0,20).padEnd(20,'0');}
+
+function generateEventExecResult(){
+  const et=val('f5-event-type');
+  if(et.endsWith('failed')){ el('f5-exec-result').value=execFailedTemplate(); return; }
+  if(!lastTaskDetail?.params?.items)return;const items=lastTaskDetail.params.items;
+  // processed_items 形状按当前客户 profile（dashenlin 带 batch_number；yaoshibang 带 location_code+oss_image_key）
+  el('f5-exec-result').value=execResultTemplate(items);
+}
+
+// Step 3: Create sub-tasks
+async function createSubTasks(){
+  const taskId=val('f3-task-id');if(!taskId){alert('父任务 task_id 不能为空');return;}
+  let body;try{body=JSON.parse(val('f3-body'));}catch{alert('请求体 JSON 格式无效');return;}
+  try{const r=await apiCall('POST',`/api/robot-tasks/${encodeURIComponent(taskId)}/sub-tasks`,body);showResponse('resp-3',r.status,r.elapsed,r.data);
+  const ok=r.status>=200&&r.status<300;markStep(3,ok);
+  if(ok){const d=r.data?.data||r.data;if(Array.isArray(d)&&d.length>0&&d[0]?.task_id)el('f5-sub-task-id').value=d[0].task_id;}}
+  catch(e){showResponse('resp-3',0,0,{error:e.message});markStep(3,false);}
+}
+
+// Step 4: Parse traceability
+async function parseTraceability(){
+  const orderNo=val('f4-order-no');if(!orderNo){alert('order_no 不能为空');return;}
+  try{const r=await apiCall('POST',`/api/orders/${encodeURIComponent(orderNo)}/traceability/parse`,{trace_code:val('f4-trace-code'),item_id:val('f4-item-id')});
+  showResponse('resp-4',r.status,r.elapsed,r.data);markStep(4,r.status>=200&&r.status<300);}
+  catch(e){showResponse('resp-4',0,0,{error:e.message});markStep(4,false);}
+}
+
+// Step 5: Send event
+async function sendEvent(){
+  let execResult=null;const raw=val('f5-exec-result');
+  if(raw){try{execResult=JSON.parse(raw);}catch{alert('task_execution_result JSON 格式无效');return;}}
+  const body={event_id:val('f5-event-id'),event_type:val('f5-event-type'),parent_task_id:val('f5-parent-task-id')};
+  const subId=val('f5-sub-task-id');if(subId)body.sub_task_id=subId;if(execResult)body.task_execution_result=execResult;
+  try{const r=await apiCall('POST','/api/robot-tasks/events',body);showResponse('resp-5',r.status,r.elapsed,r.data);
+  const ok=r.status>=200&&r.status<300;markStep(5,ok);el('f5-event-id').value=generateUUID();
+  }
+  catch(e){showResponse('resp-5',0,0,{error:e.message});markStep(5,false);}
+}
+
+// Step 6: Update task
+async function updateTask(){
+  const taskId=val('f6-task-id');if(!taskId){alert('task_id 不能为空');return;}
+  try{const r=await apiCall('PUT',`/api/robot-tasks/${encodeURIComponent(taskId)}`,{retail_order_id:val('f6-retail-order-id'),retail_order_time:val('f6-retail-order-time')});
+  showResponse('resp-6',r.status,r.elapsed,r.data);markStep(6,r.status>=200&&r.status<300);}
+  catch(e){showResponse('resp-6',0,0,{error:e.message});markStep(6,false);}
+}
+
+// Task list
+const STATUS_CLASS={pending:'s-pending',dispatched:'s-dispatched',running:'s-running',success:'s-success',error:'s-error',cancel:'s-cancel',awaiting_pack:'s-awaiting_pack'};
+const STATUS_LABEL={pending:'等待中',dispatched:'已拆单',running:'运行中',success:'完成',error:'失败',cancel:'取消',awaiting_pack:'等待打包'};
+async function fetchTaskList(){
+  const storeId=val('fl-store-id')||val('f1-store-id');if(!storeId){alert('store_id 不能为空');return;}
+  let pageSize=parseInt(el('fl-page-size').value)||10;if(pageSize>50)pageSize=50;if(pageSize<1)pageSize=1;
+  const page=parseInt(el('fl-page').value)||1;
+  const orderBy=val('fl-order-by');
+  const status=val('fl-status');
+  let qs=`store_id=${encodeURIComponent(storeId)}&page_size=${pageSize}&page=${page}&order_by=${orderBy}&tz=Asia/Shanghai`;
+  if(status)qs+=`&status=${encodeURIComponent(status)}`;
+  const t0=performance.now();
+  try{
+    const r=await apiCall('GET',`/api/robot-tasks?${qs}`);
+    const elapsed=Math.round(performance.now()-t0);
+    const ok=r.status>=200&&r.status<300;
+    const sb=el('status-list');sb.classList.remove('hidden');sb.className=`step-status ${ok?'step-done':''}`;sb.textContent=ok?'成功':'失败';sb.style.cssText=ok?'':'background:#ffebe6;color:#de350b;';
+    if(!ok){alert(`请求失败: ${r.status}`);return;}
+    const tasks=(r.data?.data?.tasks)||[];
+    const hasMore=r.data?.data?.has_more||false;
+    el('fl-meta').textContent=`共 ${tasks.length} 条${hasMore?' (还有更多，可调大 page_size)':''}  · ${elapsed}ms`;
+    const tbody=el('fl-tbody');tbody.innerHTML='';
+    if(tasks.length===0){tbody.innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--text-light);padding:16px">暂无数据</td></tr>';}
+    else{tasks.forEach(t=>{
+      const det=t.task_detail||{};
+      const sc=STATUS_CLASS[t.status]||'s-other';
+      const statusLabel=STATUS_LABEL[t.status]||'';
+      const statusText=`${t.status||''}${statusLabel?`<br><span style="font-weight:400;font-size:10px">${statusLabel}</span>`:''}`;
+      const src=det.order_source||'';const srcLabel=SOURCE_LABELS[src]?`${src}<br><span style="font-weight:400;font-size:10px">${SOURCE_LABELS[src]}</span>`:src;
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td>${t.create_time||''}</td><td>${escapeHtml(det.order_no||'')}</td><td><span class="status-badge s-other" style="background:#e8f0fe;color:#1a56cc;line-height:1.6;display:inline-block;text-align:left">${srcLabel}</span></td><td><span class="status-badge ${sc}" style="line-height:1.6;display:inline-block;text-align:left">${statusText}</span></td><td class="mono">${escapeHtml(t.business_mode_code||'')}</td><td class="mono" style="word-break:break-all">${escapeHtml(t.task_id||'')}</td><td><button class="btn-use" onclick="useTask('${escapeHtml(t.task_id||'')}')">填充任务ID</button></td>`;
+      tbody.appendChild(tr);
+    });}
+    el('fl-result').classList.remove('hidden');
+  }catch(e){alert(`网络错误: ${e.message}`);}
+}
+function useTask(taskId){el('f2-task-id').value=taskId;openCard('card-2');el('f2-task-id').scrollIntoView({behavior:'smooth',block:'center'});}
+
+// Step 7: Cancel task
+async function cancelTask(){
+  const taskId=val('f7-task-id');if(!taskId){alert('task_id 不能为空');return;}
+  if(!confirm('确认取消该任务？'))return;
+  try{const r=await apiCall('POST',`/api/robot-tasks/${encodeURIComponent(taskId)}/cancel`,{cancel_type:val('f7-cancel-type'),cancel_reason:val('f7-cancel-reason')});
+  showResponse('resp-7',r.status,r.elapsed,r.data);markStep(7,r.status>=200&&r.status<300);}
+  catch(e){showResponse('resp-7',0,0,{error:e.message});markStep(7,false);}
+}
+</script>
+</body>
+</html>

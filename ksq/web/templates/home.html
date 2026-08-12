@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Knowledge 库位查询</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<main>
+  <h1>Knowledge 库位查询</h1>
+  <section>
+    <h2>加载数据</h2>
+    <div class="tabs">
+      <button class="tab active" type="button" data-panel="path-panel">本机路径</button>
+      <button class="tab" type="button" data-panel="upload-panel">上传压缩包</button>
+    </div>
+    <div id="path-panel" class="panel active">
+      <form id="path-form">
+        <div class="path-fields">
+          <label class="path-field"><span>Knowledge 目录</span><input id="knowledge-path" value="__KNOWLEDGE__" required></label>
+          <label class="path-field"><span>库位表（sku-shelves*.csv）</span><input id="shelves-path" value="__SHELVES__" required></label>
+          <label class="path-field"><span>不可处理列表</span><input id="unavailable-path" value="__UNAVAILABLE__"></label>
+          <label class="path-field"><span>工具映射</span><input id="tool-mapping-path" value="__TOOL_MAPPING__"></label>
+          <label class="path-field"><span>闭环吸取列表</span><input id="pick-strategy-path" value="__PICK_STRATEGY__"></label>
+        </div>
+        <div class="actions"><button class="primary" type="submit">加载</button></div>
+      </form>
+    </div>
+    <div id="upload-panel" class="panel">
+      <form id="upload-form">
+        <div class="upload-grid">
+          <label class="file-pick" data-file-pick>
+            <input id="bundle-zip" type="file" accept=".zip,application/zip" required>
+            <div class="file-icon">包</div>
+            <div class="file-copy">
+              <p class="file-title">数据压缩包</p>
+              <p class="file-name" data-file-name>未选择</p>
+            </div>
+            <span class="file-action">选择</span>
+          </label>
+        </div>
+        <div class="actions"><button class="primary" type="submit">上传并解析</button></div>
+      </form>
+    </div>
+    <div id="load-status"></div>
+    <div id="query-link" class="load-next" hidden><a class="btn primary" href="/query">进入查询</a></div>
+  </section>
+  <section id="missing-section" hidden>
+    <h2>缺少 knowledge</h2>
+    <div class="mode-row">
+      <label id="exclude-unavailable-label"><input id="exclude-unavailable" type="checkbox">排除不可处理</label>
+    </div>
+    <p class="meta" id="missing-meta"></p>
+    <div class="missing-table-wrap">
+      <table>
+        <thead><tr><th>69码</th><th>药品名称</th><th>库位</th></tr></thead>
+        <tbody id="missing-table-body"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script src="/static/home.js"></script>
+</body>
+</html>
