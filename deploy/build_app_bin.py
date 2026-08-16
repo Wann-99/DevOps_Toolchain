@@ -25,6 +25,7 @@ REQUIRED_ARCHIVE_FILES = frozenset(
         "__main__.py",
         "ksq/__init__.py",
         "ksq/cli.py",
+        "ksq/config_pnp.py",
         "ksq/web/templates/shell.html",
         "ksq/web/static/app.css",
     }

@@ -22,7 +22,7 @@
     if (!node) return;
     const message = text || "";
     node.className = isError ? "meta compact error" : "meta compact";
-    node.textContent = message;
+    global.KsqStatus.flash(node, message, isError);
     if (node.id === "settings-feishu-status") {
       node.hidden = !message;
     }
@@ -365,7 +365,7 @@
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "读取配置失败");
       el("settings-cfg-server").value = data.server || "";
-      el("settings-cfg-customer").value = data.customer || "dashenlin";
+      el("settings-cfg-customer").value = data.customer || "";
       el("settings-cfg-client-id").value = data.client_id || "";
       el("settings-cfg-client-secret").value = "";
       el("settings-cfg-client-secret").placeholder = data.has_client_secret

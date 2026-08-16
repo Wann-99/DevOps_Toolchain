@@ -44,8 +44,10 @@
         <label class="path-field"><span>服务地址</span><input id="cfg-server" placeholder="http://localhost:8000"></label>
         <label class="path-field"><span>客户</span>
           <select id="cfg-customer">
+            <option value="">—</option>
             <option value="dashenlin">大参林</option>
             <option value="yaoshibang">药师帮</option>
+            <option value="shuyu">漱玉</option>
           </select>
         </label>
         <label class="path-field"><span>Client ID</span><input id="cfg-client-id"></label>
@@ -101,7 +103,6 @@
       <div class="actions">
         <input id="last-task-id" placeholder="task_id" style="max-width:420px">
         <button id="btn-task-detail" class="secondary" type="button">详情</button>
-        <button id="btn-task-cancel" class="secondary" type="button">取消</button>
       </div>
       <pre class="response-box" id="order-result-body" hidden></pre>
     </section>

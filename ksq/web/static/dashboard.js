@@ -12,6 +12,23 @@
     skipped: "未执行",
     order_ended: "工单已结束",
   };
+  const BROKER_STATUS_LABELS = {
+    pending: "等待中",
+    dispatched: "已拆单",
+    running: "运行中",
+    success: "完成",
+    error: "失败",
+    cancel: "已取消",
+    awaiting_pack: "等待打包",
+    manual_transferred: "人工转单",
+    manual_transferred_completed: "人工转单完成",
+  };
+  const CANCELABLE_STATUSES = new Set([
+    "pending",
+    "dispatched",
+    "running",
+    "awaiting_pack",
+  ]);
   const el = (id) => document.getElementById(id);
 
   let timerId = 0;
@@ -24,6 +41,19 @@
   let modalDismissTimer = 0;
   let focusTaskId = "";
   let lastStatus = "idle";
+  let currentOrderTaskId = "";
+  let currentOrderNo = "";
+  let currentBrokerStatus = "";
+  let currentDashboardMode = "test";
+  let orderActionBusy = false;
+  let taskActionBusy = false;
+  let orderListBusy = false;
+  let orderListPage = 1;
+  let orderListTotalPages = 1;
+  let orderListHasMore = false;
+  let lastOrderListData = null;
+  let brokerConfigured = true;
+  let orderListLoaded = false;
 
   function escapeHtml(value) {
     return String(value == null ? "" : value)
@@ -73,7 +103,9 @@
     // Latched after first active human-gate speak; ignore invalid 0s latch.
     if (
       (life.timer_stop_reason === "human_prompt" ||
-        life.timer_stop_reason === "confirm") &&
+        life.timer_stop_reason === "confirm" ||
+        life.timer_stop_reason === "broker_ended" ||
+        life.timer_stop_reason === "order_ended") &&
       life.frozen_elapsed_seconds != null &&
       !Number.isNaN(Number(life.frozen_elapsed_seconds)) &&
       Number(life.frozen_elapsed_seconds) > 0
@@ -170,10 +202,17 @@
   }
 
   function focusStatus(data) {
+    const orderStatus = String(data.status || "");
+    if (
+      data.needs_confirm &&
+      (orderStatus === "await_confirm" || orderStatus === "await_error")
+    ) {
+      return orderStatus;
+    }
     if (data.current_item && data.current_item.status) {
       return String(data.current_item.status);
     }
-    return data.status || "idle";
+    return orderStatus || "idle";
   }
 
   function updateSteps(status) {
@@ -326,6 +365,20 @@
     node.title = "订单来源 · " + (meta ? meta.label : source);
   }
 
+  function showBrokerNotConfigured() {
+    const body = el("dash-order-list-body");
+    const meta = el("dash-order-list-meta");
+    if (meta)
+      meta.textContent = "未配置 Broker，Broker 状态已暂停";
+    if (body)
+      body.innerHTML =
+        '<tr><td colspan="7" class="dash-order-list-empty">未配置 Broker，请在设置页配置下单 Broker</td></tr>';
+    const prev = el("dash-order-list-prev");
+    const next = el("dash-order-list-next");
+    if (prev) prev.disabled = true;
+    if (next) next.disabled = true;
+  }
+
   function renderOrder(data) {
     const panel = el("dash-order");
     const order = data.order;
@@ -334,6 +387,19 @@
     const broker = data.broker_order || {};
     if (!panel) return;
     if (!order && !data.task_id) {
+      const hadCurrentTask = !!currentOrderTaskId;
+      const previousIdleMode = currentDashboardMode;
+      currentOrderTaskId = "";
+      currentOrderNo = "";
+      currentBrokerStatus = "";
+      currentDashboardMode = String(data.dashboard_mode || "test");
+      renderOrderActions();
+      if (
+        (hadCurrentTask || previousIdleMode !== currentDashboardMode) &&
+        lastOrderListData
+      ) {
+        renderOrderList(lastOrderListData);
+      }
       panel.hidden = true;
       return;
     }
@@ -342,6 +408,7 @@
     const orderTask = el("dash-order-task");
     const lifeTag = el("dash-order-life");
     const brokerTag = el("dash-order-broker");
+    const queueTag = el("dash-order-queue");
     const progressLabel = el("dash-order-progress-label");
     const progressMeta = el("dash-order-progress-meta");
     const bar = el("dash-order-bar");
@@ -350,6 +417,18 @@
     const failed = Number(progress.failed || 0);
     const skipped = Number(progress.skipped || 0);
     const active = Number(progress.active || 0);
+    const previousTaskId = currentOrderTaskId;
+    const previousMode = currentDashboardMode;
+    currentOrderTaskId = String(
+      (order && order.task_id) || data.task_id || focusTaskId || ""
+    );
+    currentOrderNo = String(
+      (order && (order.order_no || order.platform_order_no)) ||
+        broker.order_no ||
+        ""
+    );
+    currentBrokerStatus = String(broker.status || "");
+    currentDashboardMode = String(data.dashboard_mode || "test");
     renderOrderSource(order, broker);
     if (orderNo) {
       const taskId =
@@ -376,7 +455,9 @@
       } else if (life.ended) lifeTag.classList.add("is-ended");
     }
     if (brokerTag) {
-      if (broker.ok) {
+      if (!brokerConfigured) {
+        brokerTag.textContent = "未配置 Broker";
+      } else if (broker.ok) {
         brokerTag.textContent =
           "工单状态 " + (broker.status_label || broker.status || "—");
       } else {
@@ -384,6 +465,18 @@
           ? "工单状态不可用"
           : "工单状态 —";
       }
+    }
+    if (queueTag) {
+      const queue = data.order_queue || {};
+      const waiting = Array.isArray(queue.queued) ? queue.queued[0] : null;
+      queueTag.hidden = !waiting;
+      queueTag.textContent = waiting
+        ? "下一单等待 · " +
+          (waiting.order_no || String(waiting.task_id || "").slice(0, 8) || "未命名") +
+          " · " +
+          Number(waiting.item_count || 0) +
+          " SKU"
+        : "";
     }
     if (progressLabel) progressLabel.textContent = done + " / " + total;
     if (progressMeta) {
@@ -404,6 +497,358 @@
       const finished = done + failed + skipped;
       const pct = total > 0 ? Math.round((finished / total) * 100) : 0;
       bar.style.width = pct + "%";
+    }
+    renderOrderActions();
+    if (
+      (previousTaskId !== currentOrderTaskId ||
+        previousMode !== currentDashboardMode) &&
+      lastOrderListData
+    ) {
+      renderOrderList(lastOrderListData);
+    }
+  }
+
+  function renderOrderActions() {
+    const wrap = el("dash-order-actions");
+    const cancel = el("dash-order-cancel");
+    const claim = el("dash-order-manual-claim");
+    const complete = el("dash-order-manual-complete");
+    const writable = currentDashboardMode === "test" && !!currentOrderTaskId;
+    const showCancel = writable && CANCELABLE_STATUSES.has(currentBrokerStatus);
+    const showClaim = writable && currentBrokerStatus === "running";
+    const showComplete = writable && currentBrokerStatus === "manual_transferred";
+    if (cancel) {
+      cancel.hidden = !showCancel;
+      cancel.disabled = orderActionBusy;
+    }
+    if (claim) {
+      claim.hidden = !showClaim;
+      claim.disabled = orderActionBusy;
+    }
+    if (complete) {
+      complete.hidden = !showComplete;
+      complete.disabled = orderActionBusy;
+    }
+    if (wrap) wrap.hidden = !(showCancel || showClaim || showComplete);
+  }
+
+  function taskDetailNode(task) {
+    if (!task || typeof task !== "object") return {};
+    return task.task_detail && typeof task.task_detail === "object"
+      ? task.task_detail
+      : task.params && typeof task.params === "object"
+        ? task.params
+        : {};
+  }
+
+  function taskActionButtons(taskId, orderNo, status) {
+    // Broker task writes are test-mode only; prod returns 403 upstream.
+    if (currentDashboardMode !== "test" || !taskId) return "";
+    const disabled = taskActionBusy ? " disabled" : "";
+    const attrs =
+      ' data-task-id="' +
+      escapeHtml(taskId) +
+      '" data-order-no="' +
+      escapeHtml(orderNo) +
+      '" data-status="' +
+      escapeHtml(status) +
+      '"';
+    const buttons = [];
+    if (CANCELABLE_STATUSES.has(status)) {
+      buttons.push(
+        '<button class="secondary dash-order-task-action" type="button" data-action="cancel"' +
+          attrs +
+          disabled +
+          ">取消任务</button>"
+      );
+    }
+    if (status === "running") {
+      buttons.push(
+        '<button class="danger dash-order-task-action" type="button" data-action="manual_claim"' +
+          attrs +
+          disabled +
+          ">转人工处理</button>"
+      );
+    }
+    if (status === "manual_transferred") {
+      buttons.push(
+        '<button class="primary dash-order-task-action" type="button" data-action="manual_complete"' +
+          attrs +
+          disabled +
+          ">标记完成</button>"
+      );
+    }
+    return buttons.join("");
+  }
+
+  function renderOrderList(data) {
+    lastOrderListData = data;
+    const body = el("dash-order-list-body");
+    const meta = el("dash-order-list-meta");
+    const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+    orderListHasMore = !!data.has_more;
+    orderListPage = Number(data.page || orderListPage || 1);
+    orderListTotalPages = Math.max(1, Number(data.total_pages || 1));
+    const pageNode = el("dash-order-list-page");
+    if (pageNode) pageNode.textContent = String(orderListPage);
+    const pagesNode = el("dash-order-list-pages");
+    if (pagesNode) pagesNode.textContent = String(orderListTotalPages);
+    const prev = el("dash-order-list-prev");
+    const next = el("dash-order-list-next");
+    if (prev) prev.disabled = orderListBusy || orderListPage <= 1;
+    if (next) next.disabled = orderListBusy || !orderListHasMore;
+    if (meta) {
+      const total = Math.max(0, Number(data.total || 0));
+      meta.textContent =
+        "门店 " +
+        (data.store_id || "—") +
+        " · Broker 数据 · 共 " +
+        total.toLocaleString("zh-CN") +
+        " 条 · 本页 " +
+        tasks.length +
+        " 条";
+    }
+    if (!body) return;
+    if (!tasks.length) {
+      body.innerHTML = '<tr><td colspan="7" class="dash-order-list-empty">暂无任务</td></tr>';
+      return;
+    }
+    body.innerHTML = tasks
+      .map((task) => {
+        const detail = taskDetailNode(task);
+        const taskId = String(task.task_id || "");
+        const orderNo = String(task.order_no || detail.order_no || "");
+        const source = String(task.order_source || detail.order_source || "");
+        const status = String(task.status || "");
+        const businessMode = String(
+          task.business_mode_code || detail.business_mode_code || ""
+        );
+        const isCurrent = !!taskId && taskId === currentOrderTaskId;
+        return (
+          "<tr>" +
+          "<td>" + escapeHtml(task.create_time || task.order_time || "—") + "</td>" +
+          "<td>" + escapeHtml(orderNo || "—") +
+          (isCurrent ? '<span class="dash-order-list-current">当前</span>' : "") +
+          "</td>" +
+          "<td>" + escapeHtml(source || "—") + "</td>" +
+          "<td>" + escapeHtml(BROKER_STATUS_LABELS[status] || status || "—") + "</td>" +
+          "<td class=\"mono\">" + escapeHtml(businessMode || "—") + "</td>" +
+          "<td class=\"mono\">" + escapeHtml(taskId || "—") + "</td>" +
+          '<td><div class="dash-order-list-ops">' +
+          '<button class="secondary dash-order-detail" type="button" data-task-id="' +
+          escapeHtml(taskId) + '">查看详情</button>' +
+          taskActionButtons(taskId, orderNo, status) +
+          "</div></td></tr>"
+        );
+      })
+      .join("");
+  }
+
+  async function refreshOrderList(forceRefresh) {
+    if (orderListBusy) return;
+    orderListBusy = true;
+    const meta = el("dash-order-list-meta");
+    if (meta) meta.textContent = "读取 Broker 任务并统计总数…";
+    const prev = el("dash-order-list-prev");
+    const next = el("dash-order-list-next");
+    if (prev) prev.disabled = true;
+    if (next) next.disabled = true;
+    try {
+      const status = el("dash-order-list-status");
+      const size = el("dash-order-list-size");
+      const query = new URLSearchParams({
+        page: String(orderListPage),
+        page_size: String((size && size.value) || "10"),
+        order_by: "desc",
+        status: String((status && status.value) || ""),
+        tz: "Asia/Shanghai",
+      });
+      if (forceRefresh) query.set("refresh", "1");
+      const response = await fetch("/api/order/tasks?" + query.toString());
+      const data = await readJson(response);
+      if (!response.ok) {
+        throw new Error(data.error || "任务列表获取失败");
+      }
+      renderOrderList(data);
+    } catch (error) {
+      if (meta) meta.textContent = error.message || String(error);
+    } finally {
+      orderListBusy = false;
+      if (prev) prev.disabled = orderListPage <= 1;
+      if (next) next.disabled = !orderListHasMore;
+    }
+  }
+
+  async function showOrderDetail(taskId) {
+    try {
+      const response = await fetch("/api/order/tasks/" + encodeURIComponent(taskId));
+      const data = await readJson(response);
+      if (!response.ok) {
+        await global.KsqDialog.apiError({
+          title: "任务详情获取失败",
+          payload: data,
+          httpStatus: response.status,
+        });
+        return;
+      }
+      await global.KsqDialog.notice({
+        title: "任务详情",
+        message: "task_id " + taskId,
+        details: data,
+        confirmText: "关闭",
+      });
+    } catch (error) {
+      setDetail(error.message || String(error), true);
+    }
+  }
+
+  async function runCurrentOrderAction(action) {
+    if (orderActionBusy || !currentOrderTaskId) return;
+    const labels = {
+      cancel: "取消任务",
+      manual_claim: "转人工处理",
+      manual_complete: "标记完成",
+    };
+    let reason = "";
+    if (action === "cancel") {
+      reason = await global.KsqDialog.prompt({
+        title: "取消当前任务",
+        message: "当前订单 " + (currentOrderNo || "—") + "，请填写取消原因。",
+        fieldLabel: "取消原因",
+        defaultValue: "手动取消",
+        confirmText: "确认取消",
+        cancelText: "返回",
+      });
+      if (reason == null || !String(reason).trim()) return;
+    } else {
+      const confirmed = await global.KsqDialog.confirm({
+        title: labels[action],
+        message:
+          "确认对当前订单 " +
+          (currentOrderNo || "—") +
+          (action === "manual_claim"
+            ? " 执行转人工？机器人将停止处理该订单。"
+            : " 标记人工处理完成并恢复流程？"),
+        confirmText: "确认" + labels[action],
+        cancelText: "返回",
+      });
+      if (!confirmed) return;
+    }
+    orderActionBusy = true;
+    renderOrderActions();
+    const path = action === "cancel" ? "cancel" : action.replace("_", "-");
+    try {
+      const response = await fetch("/api/order/current/" + path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(action === "cancel" ? { cancel_reason: String(reason).trim() } : {}),
+      });
+      const data = await readJson(response);
+      if (!response.ok) {
+        await global.KsqDialog.apiError({
+          title: labels[action] + "失败",
+          payload: data,
+          httpStatus: response.status,
+        });
+        return;
+      }
+      await refresh();
+      await refreshOrderList(true);
+      await global.KsqDialog.notice({
+        title: labels[action] + "成功",
+        message: "当前订单操作已提交，状态已刷新。",
+        details: data,
+        confirmText: "关闭",
+      });
+    } catch (error) {
+      setDetail(error.message || String(error), true);
+    } finally {
+      orderActionBusy = false;
+      renderOrderActions();
+    }
+  }
+
+  async function runTaskAction(action, taskId, orderNo) {
+    if (taskActionBusy || !taskId) return;
+    const labels = {
+      cancel: "取消任务",
+      manual_claim: "人工转单",
+      manual_complete: "标记完成",
+    };
+    const target = orderNo || taskId.slice(0, 8) || "—";
+    let body = {};
+    if (action === "cancel") {
+      const result = await global.KsqDialog.prompt({
+        title: "取消任务",
+        message: "订单 " + target + "，确认后将提交取消。请填写取消原因。",
+        fieldLabel: "取消原因（必填）",
+        defaultValue: "直接取消",
+        extraField: { label: "取消类型（默认 user）", value: "user" },
+        confirmText: "确认取消",
+        cancelText: "返回",
+      });
+      if (result == null) return;
+      const reason = String(result.value || "").trim();
+      if (!reason) {
+        await global.KsqDialog.notice({
+          title: "取消原因不能为空",
+          message: "请重新发起取消并填写取消原因。",
+          confirmText: "关闭",
+        });
+        return;
+      }
+      body = { cancel_reason: reason };
+      const cancelType = String(result.extra || "").trim();
+      if (cancelType && cancelType !== "user") body.cancel_type = cancelType;
+    } else {
+      const confirmed = await global.KsqDialog.confirm({
+        title: labels[action],
+        message:
+          "确认对任务 " +
+          target +
+          (action === "manual_claim"
+            ? " 执行人工转单？机器人将停止处理该订单。"
+            : " 标记人工处理完成？"),
+        confirmText: "确认" + labels[action],
+        cancelText: "返回",
+      });
+      if (!confirmed) return;
+    }
+    taskActionBusy = true;
+    if (lastOrderListData) renderOrderList(lastOrderListData);
+    const path = action === "cancel" ? "cancel" : action.replace("_", "-");
+    try {
+      const response = await fetch(
+        "/api/order/tasks/" + encodeURIComponent(taskId) + "/" + path,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }
+      );
+      const data = await readJson(response);
+      if (!response.ok) {
+        await global.KsqDialog.apiError({
+          title: labels[action] + "失败",
+          payload: data,
+          httpStatus: response.status,
+        });
+        return;
+      }
+      taskActionBusy = false;
+      await refresh();
+      await refreshOrderList(true);
+      await global.KsqDialog.notice({
+        title: labels[action] + "成功",
+        message: "任务操作已提交，列表已刷新。",
+        details: data,
+        confirmText: "关闭",
+      });
+    } catch (error) {
+      setDetail(error.message || String(error), true);
+    } finally {
+      taskActionBusy = false;
+      if (lastOrderListData) renderOrderList(lastOrderListData);
     }
   }
 
@@ -664,7 +1109,16 @@
       if (Object.prototype.hasOwnProperty.call(data, "auto_confirm")) {
         applyAutoConfirm(!!data.auto_confirm);
       }
+      const wasBrokerConfigured = brokerConfigured;
+      brokerConfigured = data.broker_configured !== false;
       render(data);
+      if (brokerConfigured && (!orderListLoaded || !wasBrokerConfigured)) {
+        orderListLoaded = true;
+        refreshOrderList();
+      } else if (!brokerConfigured) {
+        orderListLoaded = false;
+        showBrokerNotConfigured();
+      }
       const fp = fingerprint(data);
       lastFingerprint = fp;
       const serverDismissed = String(data.dismissed_fingerprint || "");
@@ -724,6 +1178,8 @@
   function activate(options) {
     active = true;
     if (options && options.taskId) focusTaskId = String(options.taskId);
+    orderListPage = 1;
+    orderListLoaded = false;
     refresh();
     startPoll();
   }
@@ -759,12 +1215,46 @@
         }
       });
     }
+    const cancelOrder = el("dash-order-cancel");
+    if (cancelOrder) cancelOrder.addEventListener("click", () => runCurrentOrderAction("cancel"));
+    const claimOrder = el("dash-order-manual-claim");
+    if (claimOrder) claimOrder.addEventListener("click", () => runCurrentOrderAction("manual_claim"));
+    const completeOrder = el("dash-order-manual-complete");
+    if (completeOrder) completeOrder.addEventListener("click", () => runCurrentOrderAction("manual_complete"));
+    const listRefresh = el("dash-order-list-refresh");
+    if (listRefresh) listRefresh.addEventListener("click", () => refreshOrderList(true));
+    const listStatus = el("dash-order-list-status");
+    if (listStatus) listStatus.addEventListener("change", () => { orderListPage = 1; refreshOrderList(); });
+    const listSize = el("dash-order-list-size");
+    if (listSize) listSize.addEventListener("change", () => { orderListPage = 1; refreshOrderList(); });
+    const listPrev = el("dash-order-list-prev");
+    if (listPrev) listPrev.addEventListener("click", () => { if (orderListPage > 1) { orderListPage -= 1; refreshOrderList(); } });
+    const listNext = el("dash-order-list-next");
+    if (listNext) listNext.addEventListener("click", () => { if (orderListHasMore) { orderListPage += 1; refreshOrderList(); } });
+    const listBody = el("dash-order-list-body");
+    if (listBody) listBody.addEventListener("click", (event) => {
+      if (!(event.target instanceof Element)) return;
+      const actionButton = event.target.closest(".dash-order-task-action");
+      if (actionButton && actionButton.dataset.taskId) {
+        runTaskAction(
+          actionButton.dataset.action,
+          actionButton.dataset.taskId,
+          actionButton.dataset.orderNo || ""
+        );
+        return;
+      }
+      const button = event.target.closest(".dash-order-detail");
+      if (button && button.dataset.taskId) showOrderDetail(button.dataset.taskId);
+    });
   }
 
   bind();
 
   async function registerOrder(session) {
     if (!session || typeof session !== "object") return;
+    // /api/order/create has already registered the current/waiting order.
+    // Posting a queued session here would overwrite the order being executed.
+    if (session.queue_position != null) return;
     focusTaskId = String(session.task_id || focusTaskId || "");
     try {
       await fetch("/api/dashboard/order", {
@@ -786,7 +1276,10 @@
       if (typeof payload === "string" || payload == null) {
         session = { task_id: payload || "" };
       }
-      focusTaskId = String((session && session.task_id) || "");
+      const queued = !!(session && Number(session.queue_position) > 0);
+      if (!queued) {
+        focusTaskId = String((session && session.task_id) || "");
+      }
       await registerOrder(session || {});
       if (global.KsqShell && global.KsqShell.showView) {
         global.KsqShell.showView("dashboard");

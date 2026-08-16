@@ -611,7 +611,7 @@
     function setStatus(text, isError) {
       if (!statusNode) return;
       statusNode.className = isError ? "meta compact error" : "meta compact";
-      statusNode.innerHTML = text || "";
+      global.KsqStatus.flash(statusNode, text, isError, { html: true });
     }
 
     function isDataNotLoadedError(error) {
@@ -641,6 +641,25 @@
         }
       }
       setStatus(escapeHtml(message), true);
+    }
+
+    async function reportOrderApiError(response, data, fallback) {
+      const message =
+        global.KsqDialog && global.KsqDialog.errorSummary
+          ? global.KsqDialog.errorSummary(data, fallback)
+          : String((data && data.error) || fallback || "下单失败");
+      setStatus(escapeHtml(message), true);
+      if (global.KsqDialog && global.KsqDialog.apiError) {
+        await global.KsqDialog.apiError({
+          title: "下单失败",
+          payload: data,
+          httpStatus: response.status,
+          fallback: fallback,
+        });
+      }
+      const error = new Error(message);
+      error.orderApiReported = true;
+      return error;
     }
 
     function rebuildScanIndexes() {
@@ -1746,7 +1765,7 @@
           dot.classList.remove("ok");
           dot.classList.add("err");
         }
-        throw new Error(data.error || "获取 Token 失败");
+        throw await reportOrderApiError(response, data, "获取 Token 失败");
       }
       tokenReady = true;
       if (dot) {
@@ -1968,7 +1987,9 @@
           body: JSON.stringify({ items: items, mode: mode }),
         });
         const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "下单失败");
+        if (!response.ok) {
+          throw await reportOrderApiError(response, data, "下单失败");
+        }
         selectedOrders.clear();
         closeSelectedList();
         updateSelectedOrderUI();
@@ -1982,12 +2003,19 @@
           body.textContent = JSON.stringify(data, null, 2);
         }
         if (data.task_id) {
+          const queued = !!(
+            data.order_session && Number(data.order_session.queue_position) > 0
+          );
           role("last-task-id").value = data.task_id;
           if (meta) {
             meta.textContent =
-              "下单成功 · " + items.length + " 件 · task_id=" + data.task_id;
+              (queued ? "下一单已进入等待队列" : "下单成功") +
+              " · " +
+              items.length +
+              " 件 · task_id=" +
+              data.task_id;
           }
-          setStatus("下单成功，正在查询状态...");
+          setStatus(queued ? "下一单已排队，当前单结束后自动执行" : "下单成功，正在查询状态...");
           startOrderStatusPoll(data.task_id, items.length);
         } else {
           if (meta) meta.textContent = "已返回响应，请检查 task_id";
@@ -2015,7 +2043,7 @@
         }
       } catch (error) {
         stopOrderStatusPoll();
-        await reportError(error);
+        if (!error.orderApiReported) await reportError(error);
         const panel = role("order-result-panel");
         const body = role("order-result-body");
         if (panel) panel.hidden = false;
@@ -2391,27 +2419,6 @@
           setStatus("开始下载：" + name);
         });
       }
-      resultBody.addEventListener("contextmenu", (event) => {
-        const row = event.target.closest("tr[data-record-id]");
-        if (!row) return;
-        event.preventDefault();
-        const itemId = row.dataset.recordId;
-        if (!itemId) return;
-        const name = itemId + ".json";
-        const select = role("export-file-select");
-        if (select) {
-          let option = Array.from(select.options).find((item) => item.value === name);
-          if (!option) {
-            option = document.createElement("option");
-            option.value = name;
-            option.textContent = name;
-            select.appendChild(option);
-          }
-          select.value = name;
-        }
-        downloadByUrl("/api/export/file?name=" + encodeURIComponent(name));
-        setStatus("下载当前行 knowledge：" + name);
-      });
     }
 
     if (isOrder) {
@@ -2492,57 +2499,6 @@
           await reportError(error);
         }
       });
-      const cancelBtn = role("btn-task-cancel");
-      if (cancelBtn) {
-        cancelBtn.addEventListener("click", async () => {
-          const taskId = role("last-task-id").value.trim();
-          if (!taskId) return;
-          const reason = await window.KsqDialog.prompt({
-            title: "取消任务",
-            message: "请填写取消原因。",
-            fieldLabel: "取消原因",
-            defaultValue: "手动取消",
-            confirmText: "确认取消",
-            cancelText: "返回",
-          });
-          if (reason == null || !String(reason).trim()) return;
-          try {
-            const response = await fetch(
-              "/api/order/tasks/" + encodeURIComponent(taskId) + "/cancel",
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  cancel_type: "manual",
-                  cancel_reason: String(reason).trim(),
-                }),
-              }
-            );
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.error || "取消失败");
-            const body = role("order-result-body");
-            body.hidden = false;
-            body.textContent = JSON.stringify(data, null, 2);
-            try {
-              const result = await fetchOrderTaskDetail(taskId);
-              stopOrderStatusPoll();
-              renderOrderStatus(result.task, {
-                taskId: taskId,
-                itemCount: orderStatusItemCount,
-                polling: false,
-                showRaw: true,
-                raw: result.raw,
-              });
-            } catch (_error) {
-              // keep cancel response body
-            }
-          } catch (error) {
-            const body = role("order-result-body");
-            body.hidden = false;
-            body.textContent = error.message;
-          }
-        });
-      }
     }
 
     function focusScan() {

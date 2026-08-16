@@ -29,11 +29,13 @@ EXPOSE 8765
 HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=3 \
     CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/status', timeout=2)"]
 
+# CMD 旧参数（由 config_pnp 目录驱动，不再逐项指定）:
+#   --shelves /data/config_pnp/sku-shelves.csv
+#   --unavailable /data/config_pnp/unavailabel_obj.json
+#   --tool-mapping /data/config_pnp/obj_tool_mapping.json
+#   --pick-strategy /data/config_pnp/pick_strategy_obj.json
 CMD ["python3", "/opt/ksq/knowledge_shelf_query.bin", \
      "--host", "0.0.0.0", \
      "--port", "8765", \
-     "--knowledge", "/data/knowledge", \
-     "--shelves", "/data/config_pnp/sku-shelves.csv", \
-     "--unavailable", "/data/config_pnp/unavailabel_obj.json", \
-     "--tool-mapping", "/data/config_pnp/obj_tool_mapping.json", \
-     "--pick-strategy", "/data/config_pnp/pick_strategy_obj.json"]
+     "--config-pnp", "/data/config_pnp", \
+     "--knowledge", "/data/knowledge"]

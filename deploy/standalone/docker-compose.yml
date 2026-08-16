@@ -12,16 +12,19 @@ services:
       - 0.0.0.0
       - --port
       - "8765"
+      - --config-pnp
+      - /data/config_pnp
       - --knowledge
       - /data/knowledge
-      - --shelves
-      - /data/config_pnp/sku-shelves.csv
-      - --unavailable
-      - /data/config_pnp/unavailabel_obj.json
-      - --tool-mapping
-      - /data/config_pnp/obj_tool_mapping.json
-      - --pick-strategy
-      - /data/config_pnp/pick_strategy_obj.json
+      # 旧参数（由 config_pnp 目录驱动，不再逐项指定）:
+      # - --shelves
+      # - /data/config_pnp/sku-shelves.csv
+      # - --unavailable
+      # - /data/config_pnp/unavailabel_obj.json
+      # - --tool-mapping
+      # - /data/config_pnp/obj_tool_mapping.json
+      # - --pick-strategy
+      # - /data/config_pnp/pick_strategy_obj.json
     environment:
       # 容器默认 UTC，会导致备份文件名/订单时间比现场慢 8 小时。
       TZ: ${TZ:-Asia/Shanghai}
@@ -37,6 +40,8 @@ services:
       - ./config/test_order_state.json:/app/test_order_state.json
       - ./config/order_config.json:/app/order_config.json
       - ./config/order_config.prod.json:/app/order_config.prod.json
+      # 登录账号（start.sh 首次启动自动初始化，明文密码登录后自动哈希化）
+      - ./config/users.json:/app/users.json
       # 业务数据（设备自带，默认标准布局路径，可用环境变量 CONFIG_PNP_DIR / KNOWLEDGE_DIR 覆盖）
       - ${CONFIG_PNP_DIR:-/home/nvidia/compiled/PNPApp_deploy/config_pnp}:/data/config_pnp
       - ${KNOWLEDGE_DIR:-/home/nvidia/compiled/VfmApp_deploy/model/templates/knowledge}:/data/knowledge

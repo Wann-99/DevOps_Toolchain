@@ -580,7 +580,7 @@ function readOrderConfigForm() {
 
 function fillOrderConfigForm(config) {
   document.getElementById("cfg-server").value = config.server || "";
-  document.getElementById("cfg-customer").value = config.customer || "dashenlin";
+  document.getElementById("cfg-customer").value = config.customer || "";
   document.getElementById("cfg-client-id").value = config.client_id || "";
   document.getElementById("cfg-client-secret").value = "";
   document.getElementById("cfg-client-secret").placeholder = config.has_client_secret
@@ -686,10 +686,16 @@ async function quickOrder() {
     orderResultBody.hidden = false;
     orderResultBody.textContent = JSON.stringify(data, null, 2);
     if (data.task_id) {
+      const queued = !!(
+        data.order_session && Number(data.order_session.queue_position) > 0
+      );
       lastTaskIdInput.value = data.task_id;
       orderResultMeta.textContent =
-        "下单成功 · " + items.length + " 件 · task_id=" + data.task_id;
-      reloadStatus.textContent = "下单成功：" + data.task_id;
+        (queued ? "下一单已进入等待队列" : "下单成功") +
+        " · " + items.length + " 件 · task_id=" + data.task_id;
+      reloadStatus.textContent = queued
+        ? "下一单已排队，当前单结束后自动执行"
+        : "下单成功：" + data.task_id;
     } else {
       orderResultMeta.textContent = "已返回响应，请检查 task_id";
       reloadStatus.textContent = "下单已返回，请查看结果";
@@ -825,36 +831,6 @@ document.getElementById("btn-task-detail").addEventListener("click", async () =>
     if (!response.ok) throw new Error(data.error || "查询失败");
     orderResultBody.hidden = false;
     orderResultBody.textContent = JSON.stringify(data, null, 2);
-  } catch (error) {
-    orderResultBody.hidden = false;
-    orderResultBody.textContent = error.message;
-  }
-});
-
-document.getElementById("btn-task-cancel").addEventListener("click", async () => {
-  const taskId = lastTaskIdInput.value.trim();
-  if (!taskId) return;
-  const confirmed = await window.KsqDialog.confirm({
-    title: "取消任务",
-    message: "确认取消该任务？",
-    confirmText: "确认取消",
-    cancelText: "返回",
-  });
-  if (!confirmed) return;
-  try {
-    const response = await fetch(
-      "/api/order/tasks/" + encodeURIComponent(taskId) + "/cancel",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cancel_type: "manual", cancel_reason: "测试取消" }),
-      }
-    );
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "取消失败");
-    orderResultBody.hidden = false;
-    orderResultBody.textContent = JSON.stringify(data, null, 2);
-    orderResultMeta.textContent = "已提交取消：" + taskId;
   } catch (error) {
     orderResultBody.hidden = false;
     orderResultBody.textContent = error.message;

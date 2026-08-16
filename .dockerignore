@@ -9,3 +9,7 @@ docs/manual/images
 .pytest_cache
 data.kpkg
 /test_order_state.json
+/dashboard_active_order.json
+/dashboard_settings.json
+/order_config.json
+/order_config.prod.json

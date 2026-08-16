@@ -27,4 +27,5 @@ venv/
 /test_order_state.json
 /devOps/robot_keyboard.env
 *.bak*
+.backup/
 .DS_Store

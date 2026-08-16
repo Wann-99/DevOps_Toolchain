@@ -244,6 +244,14 @@ def import_uploaded_files(form: cgi.FieldStorage) -> Dict[str, object]:
         "message": message,
     }
 
+    # Mark imported paths as explicit so reload_config_pnp_paths() won't
+    # override them with config.py values on the next reload.
+    explicit_kinds = {
+        item["kind"] for item in written if item["kind"] in DATASET_IMPORT_KINDS
+    }
+    if explicit_kinds:
+        state._explicit_config_keys = state._explicit_config_keys | explicit_kinds
+
     touched_dataset = any(item["kind"] in DATASET_IMPORT_KINDS for item in written)
     if touched_dataset and configured_paths_ready():
         reload_info = apply_configured_paths_reload()

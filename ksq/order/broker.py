@@ -6,7 +6,7 @@ import json
 import urllib.error
 import urllib.request
 from typing import Dict, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 
 class OrderBrokerError(RuntimeError):
@@ -134,6 +134,30 @@ def get_robot_task(server: str, token: str, task_id: str) -> Tuple[int, object]:
     return _request_json("GET", url, None, token)
 
 
+def list_robot_tasks(
+    server: str,
+    token: str,
+    store_id: str,
+    page_size: int,
+    order_by: str,
+    status: str,
+    timezone_name: str,
+    cursor: str = "",
+) -> Tuple[int, object]:
+    query: Dict[str, object] = {
+        "store_id": store_id,
+        "page_size": page_size,
+        "order_by": order_by,
+        "tz": timezone_name,
+    }
+    if status:
+        query["status"] = status
+    if cursor:
+        query["cursor"] = cursor
+    url = f"{_normalize_server(server)}/api/robot-tasks?{urlencode(query)}"
+    return _request_json("GET", url, None, token)
+
+
 def cancel_robot_task(
     server: str,
     token: str,
@@ -149,3 +173,19 @@ def cancel_robot_task(
         {"cancel_type": cancel_type, "cancel_reason": cancel_reason},
         token,
     )
+
+
+def manual_claim_order(
+    server: str, token: str, order_no: str
+) -> Tuple[int, object]:
+    encoded = quote(order_no, safe="")
+    url = f"{_normalize_server(server)}/api/orders/{encoded}/manual-claim"
+    return _request_json("POST", url, None, token)
+
+
+def manual_complete_order(
+    server: str, token: str, order_no: str
+) -> Tuple[int, object]:
+    encoded = quote(order_no, safe="")
+    url = f"{_normalize_server(server)}/api/orders/{encoded}/manual-complete"
+    return _request_json("POST", url, None, token)

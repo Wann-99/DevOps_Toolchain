@@ -5,17 +5,15 @@
   const bodyNode = document.getElementById("log-body");
   const termTitle = document.getElementById("log-term-title");
   const refreshButton = document.getElementById("log-refresh");
-  const autoRefresh = document.getElementById("log-auto-refresh");
   const startButton = document.getElementById("log-start");
   const restartButton = document.getElementById("log-restart");
   const stopButton = document.getElementById("log-stop");
   const LOG_TAIL = 800;
-  let timerId = 0;
-  let lastText = "";
-  let lastSince = "";
-  let busy = false;
+
+  let active = false;
+  let eventSource = null;
   let controlBusy = false;
-  let pollCount = 0;
+  let renderedLines = [];
 
   function escapeHtml(value) {
     return String(value == null ? "" : value)
@@ -25,9 +23,18 @@
       .replace(/"/g, "&quot;");
   }
 
-  function setStatus(text, isError) {
+  function parseEvent(event) {
+    try {
+      const data = JSON.parse(event.data || "{}");
+      return data && typeof data === "object" ? data : {};
+    } catch (_error) {
+      return {};
+    }
+  }
+
+  function setStatus(message, isError) {
     statusNode.className = isError ? "meta compact error" : "meta compact";
-    statusNode.textContent = text || "";
+    statusNode.textContent = isError ? (message || "") : "";
   }
 
   function selectedServiceLabel() {
@@ -46,6 +53,12 @@
       serviceStatus.className = "meta compact ok-text";
       return;
     }
+    const state = String(info.status || "");
+    if (state === "starting" || state === "reconnecting") {
+      serviceStatus.textContent = "连接中";
+      serviceStatus.className = "meta compact";
+      return;
+    }
     serviceStatus.textContent = info.exists === false ? "不存在" : "未启动";
     serviceStatus.className = "meta compact error";
   }
@@ -61,19 +74,6 @@
     return bodyNode.scrollHeight - bodyNode.scrollTop - bodyNode.clientHeight < 80;
   }
 
-  function extractSince(text) {
-    const lines = String(text || "")
-      .split("\n")
-      .filter(Boolean);
-    if (!lines.length) return "";
-    const match = lines[lines.length - 1].match(
-      /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)/
-    );
-    return match ? match[1] : "";
-  }
-
-  // Docker/app logs often contain ANSI color codes like "\x1b[32mINFO\x1b[0m".
-  // Browsers show ESC as □ and leave "[32m...[0m" looking like garbled text.
   function stripAnsi(text) {
     return String(text || "")
       .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
@@ -86,10 +86,6 @@
 
   function colorizeLine(escapedLine) {
     let html = escapedLine;
-    html = html.replace(
-      /^(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s*/,
-      '<span class="term-ts">$1</span> '
-    );
     html = html.replace(
       /^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\s*/,
       '<span class="term-ts">$1</span> '
@@ -115,29 +111,46 @@
     return html;
   }
 
-  function renderTerminal(text) {
-    const content = stripAnsi(text || "");
-    if (!content.trim()) {
-      bodyNode.innerHTML =
-        '<span class="term-muted">(无日志输出)</span>';
-      return;
+  function lineNode(line) {
+    const node = document.createElement("div");
+    node.className = "term-line";
+    const cleaned = stripAnsi(line);
+    node.innerHTML = cleaned
+      ? colorizeLine(escapeHtml(cleaned))
+      : "&nbsp;";
+    return node;
+  }
+
+  function renderSnapshot(lines) {
+    const stick = nearBottom();
+    renderedLines = Array.isArray(lines)
+      ? lines.map((line) => String(line == null ? "" : line)).slice(-LOG_TAIL)
+      : [];
+    bodyNode.innerHTML = "";
+    if (!renderedLines.length) {
+      bodyNode.innerHTML = '<span class="term-muted">(无日志输出)</span>';
+    } else {
+      const fragment = document.createDocumentFragment();
+      renderedLines.forEach((line) => fragment.appendChild(lineNode(line)));
+      bodyNode.appendChild(fragment);
     }
-    const lines = content.split("\n");
-    const html = lines
-      .map((line) => {
-        if (!line) return '<div class="term-line">&nbsp;</div>';
-        return (
-          '<div class="term-line">' + colorizeLine(escapeHtml(line)) + "</div>"
-        );
-      })
-      .join("");
-    bodyNode.innerHTML = html;
+    if (stick) bodyNode.scrollTop = bodyNode.scrollHeight;
+  }
+
+  function appendLine(line) {
+    const stick = nearBottom();
+    if (!renderedLines.length) bodyNode.innerHTML = "";
+    renderedLines.push(String(line == null ? "" : line));
+    bodyNode.appendChild(lineNode(line));
+    while (renderedLines.length > LOG_TAIL) {
+      renderedLines.shift();
+      if (bodyNode.firstChild) bodyNode.removeChild(bodyNode.firstChild);
+    }
+    if (stick) bodyNode.scrollTop = bodyNode.scrollHeight;
   }
 
   function updateTermTitle() {
-    if (termTitle) {
-      termTitle.textContent = selectedServiceLabel();
-    }
+    if (termTitle) termTitle.textContent = selectedServiceLabel();
   }
 
   async function refreshServices() {
@@ -152,74 +165,67 @@
     return data;
   }
 
-  async function refreshLogs(options) {
-    const opts = options || {};
-    if (busy) return;
-    busy = true;
-    if (!opts.silent) setStatus("拉取日志中...");
-    try {
-      pollCount += 1;
-      if (!opts.silent || pollCount % 5 === 1) {
-        await refreshServices();
-      }
-      updateTermTitle();
-      const params = new URLSearchParams();
-      params.set("service", serviceSelect.value);
-      params.set("tail", String(LOG_TAIL));
-      if (opts.incremental && lastSince) {
-        params.set("since", lastSince);
-      }
-      const response = await fetch("/api/logs?" + params.toString());
-      const data = await response.json();
-      if (!response.ok) {
-        lastText = "";
-        lastSince = "";
-        renderTerminal(data.error || "无法读取日志");
-        setStatus(data.error || "无法读取日志", true);
-        return;
-      }
-      const stick = nearBottom();
-      const chunk = data.logs || "";
-      if (opts.incremental && lastSince && chunk) {
-        const merged = lastText
-          ? lastText + (lastText.endsWith("\n") ? "" : "\n") + chunk
-          : chunk;
-        const lines = merged.split("\n");
-        const deduped = [];
-        const seen = new Set();
-        for (let index = lines.length - 1; index >= 0; index -= 1) {
-          const line = lines[index];
-          if (!line || seen.has(line)) continue;
-          seen.add(line);
-          deduped.push(line);
-          if (deduped.length >= LOG_TAIL) break;
-        }
-        deduped.reverse();
-        lastText = deduped.join("\n");
-      } else if (chunk !== lastText) {
-        lastText = chunk || "(无日志输出)";
-      }
-      renderTerminal(lastText);
-      const nextSince = extractSince(chunk || lastText);
-      if (nextSince) lastSince = nextSince;
-      setStatus(
-        data.name +
-          " · 实时" +
-          (autoRefresh.checked ? "刷新中" : "") +
-          (data.mode === "since"
-            ? " · 增量"
-            : " · 最近 " + LOG_TAIL + " 行")
-      );
-      setServiceBadge(data);
-      if (stick) bodyNode.scrollTop = bodyNode.scrollHeight;
-    } catch (error) {
-      if (!opts.silent) {
-        renderTerminal(error.message);
-        setStatus(error.message, true);
-      }
-    } finally {
-      busy = false;
+  function closeStream() {
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
     }
+  }
+
+  function applyStreamState(data) {
+    setServiceBadge(data);
+    const name = data.name || selectedServiceLabel();
+    if (data.running) {
+      const source = data.source === "attach" ? "attach 降级" : "docker logs -f";
+      setStatus(name + " · 实时跟随中 · " + source, false);
+    } else if (data.error) {
+      setStatus(name + " · " + data.error, false);
+    }
+  }
+
+  function connectStream(clearOutput) {
+    closeStream();
+    updateTermTitle();
+    if (clearOutput) renderSnapshot([]);
+    if (!active) return;
+    setStatus("正在连接 " + selectedServiceLabel() + " ...", false);
+    const params = new URLSearchParams({
+      service: serviceSelect.value,
+      tail: String(LOG_TAIL),
+    });
+    const source = new EventSource("/api/logs/stream?" + params.toString());
+    eventSource = source;
+
+    source.addEventListener("open", () => {
+      if (eventSource !== source) return;
+      setStatus(selectedServiceLabel() + " · 实时连接已建立", false);
+    });
+    source.addEventListener("snapshot", (event) => {
+      if (eventSource !== source) return;
+      const data = parseEvent(event);
+      renderSnapshot(data.lines || []);
+      applyStreamState(data);
+      if (data.notice) setStatus(data.notice, false);
+    });
+    source.addEventListener("line", (event) => {
+      if (eventSource !== source) return;
+      const data = parseEvent(event);
+      appendLine(data.line == null ? "" : data.line);
+    });
+    source.addEventListener("state", (event) => {
+      if (eventSource !== source) return;
+      applyStreamState(parseEvent(event));
+    });
+    source.addEventListener("notice", (event) => {
+      if (eventSource !== source) return;
+      const data = parseEvent(event);
+      if (data.message) setStatus(data.message, false);
+    });
+    source.addEventListener("error", () => {
+      if (eventSource !== source || !active) return;
+      setServiceBadge({ running: false, status: "reconnecting" });
+      setStatus(selectedServiceLabel() + " · 连接中断，正在自动重连...", false);
+    });
   }
 
   async function controlService(action) {
@@ -241,25 +247,12 @@
       const response = await fetch("/api/logs/control", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          service: serviceSelect.value,
-          action: action,
-        }),
+        body: JSON.stringify({ service: serviceSelect.value, action: action }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || label + "失败");
-      const svc = data.service || {};
-      setServiceBadge(svc);
-      setStatus(
-        (svc.name || serviceName) +
-          " · 已" +
-          label +
-          (svc.message ? " · " + svc.message : "") +
-          " · 状态 " +
-          (svc.status || "-")
-      );
-      lastSince = "";
-      await refreshLogs({ silent: true, incremental: false });
+      setServiceBadge(data.service || {});
+      connectStream(true);
     } catch (error) {
       setStatus(error.message, true);
     } finally {
@@ -268,57 +261,31 @@
     }
   }
 
-  function syncAutoRefresh() {
-    clearInterval(timerId);
-    timerId = 0;
-    if (!autoRefresh.checked) return;
-    timerId = window.setInterval(() => {
-      if (document.getElementById("view-logs").hidden) return;
-      refreshLogs({ silent: true, incremental: true });
-    }, 1000);
-  }
-
-  refreshButton.addEventListener("click", () => {
-    lastSince = "";
-    refreshLogs({ silent: false, incremental: false });
-  });
+  refreshButton.addEventListener("click", () => connectStream(true));
   serviceSelect.addEventListener("change", () => {
-    lastText = "";
-    lastSince = "";
-    updateTermTitle();
-    refreshLogs({ silent: false, incremental: false });
+    renderedLines = [];
+    connectStream(true);
   });
-  autoRefresh.addEventListener("change", () => {
-    syncAutoRefresh();
-    if (autoRefresh.checked) {
-      refreshLogs({ silent: true, incremental: Boolean(lastSince) });
-    }
-  });
-  if (startButton) {
-    startButton.addEventListener("click", () => controlService("start"));
-  }
-  if (restartButton) {
-    restartButton.addEventListener("click", () => controlService("restart"));
-  }
-  if (stopButton) {
-    stopButton.addEventListener("click", () => controlService("stop"));
-  }
+  if (startButton) startButton.addEventListener("click", () => controlService("start"));
+  if (restartButton) restartButton.addEventListener("click", () => controlService("restart"));
+  if (stopButton) stopButton.addEventListener("click", () => controlService("stop"));
 
   window.KsqLogs = {
     activate: async () => {
+      if (active) return;
+      active = true;
+      updateTermTitle();
+      setControlEnabled(true);
       try {
-        updateTermTitle();
-        setControlEnabled(true);
         await refreshServices();
-        lastSince = "";
-        await refreshLogs({ silent: false, incremental: false });
-        if (!autoRefresh.checked) {
-          autoRefresh.checked = true;
-        }
-        syncAutoRefresh();
       } catch (error) {
         setStatus(error.message, true);
       }
+      connectStream(true);
+    },
+    deactivate: () => {
+      active = false;
+      closeStream();
     },
   };
 })();

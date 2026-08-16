@@ -108,6 +108,9 @@ def apply_configured_paths_reload() -> Dict[str, object]:
     """Reload in-memory dataset from configured host paths (full features)."""
     from ksq.web import edit_workspace
 
+    # Re-parse config_pnp/config.py so device-side file-name changes take
+    # effect without a restart.  Explicit CLI arguments are preserved.
+    state.reload_config_pnp_paths()
     dataset, tool_mapping, closed_loop_ids, unavailable_ids, elapsed = (
         load_from_configured_paths()
     )

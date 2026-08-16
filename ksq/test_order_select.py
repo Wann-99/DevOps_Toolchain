@@ -43,6 +43,19 @@ CSV_EXPORT_FIELDS = (
     "是否闭环抓取",
 )
 
+# 生成清单时的固定展示列（key 与 public_item 输出字段一致）。
+# 导入 CSV 时改为文件自身的表头，见 parse_import_csv_full。
+DEFAULT_COLUMNS: List[Dict[str, str]] = [
+    {"key": "out_item_id", "label": "商品编码"},
+    {"key": "location_display", "label": "库位"},
+    {"key": "sku_code", "label": "69码"},
+    {"key": "name", "label": "药品名称"},
+    {"key": "是否闭环抓取", "label": "是否闭环抓取"},
+    {"key": "货架属性", "label": "货架属性"},
+    {"key": "推荐工具", "label": "推荐工具"},
+    {"key": "包装类型", "label": "包装类型"},
+]
+
 
 def load_unavailable(path: Optional[Path]) -> Set[str]:
     if path is None or not path.is_file():
@@ -147,7 +160,7 @@ def item_key(item: Dict[str, str]) -> Tuple[str, str]:
 
 
 def public_item(item: Dict[str, str]) -> Dict[str, str]:
-    return {
+    public = {
         "out_item_id": item.get("out_item_id", ""),
         "location_code": item.get("location_code", ""),
         "location_display": format_location_display(item.get("location_code", "")),
@@ -163,8 +176,27 @@ def public_item(item: Dict[str, str]) -> Dict[str, str]:
         "is_small": item.get("is_small", "0"),
         "is_special": item.get("is_special", "0"),
         "is_code_pusher": item.get("is_code_pusher", "0"),
-        "key": f"{item.get('sku_code', '')}|{item.get('location_code', '')}",
+        # 组合模式下同一 69码 可能属于多个组合，key 追加组合标识保证唯一
+        "key": (
+            f"{item.get('sku_code', '')}|{item.get('location_code', '')}"
+            + (
+                f"|{str(item.get('group_id') or '').strip()}"
+                if str(item.get("group_id") or "").strip()
+                else ""
+            )
+        ),
     }
+    for field in ("order_batch_id", "ordered_at", "order_no", "task_id"):
+        value = item.get(field, "")
+        if value:
+            public[field] = value
+    # 导入 CSV 时保留的原始行数据与组合标识，用于动态列渲染
+    display = item.get("display")
+    if isinstance(display, dict):
+        public["display"] = {str(key): str(value) for key, value in display.items()}
+    if "group_id" in item:
+        public["group_id"] = str(item.get("group_id") or "")
+    return public
 
 
 def load_candidates(
@@ -493,6 +525,30 @@ def rows_to_csv_bytes(rows: List[Dict[str, str]]) -> bytes:
     return buffer.getvalue().encode("utf-8-sig")
 
 
+def display_rows_to_csv_bytes(
+    rows: List[Dict[str, str]],
+    columns: List[Dict[str, str]],
+    leading: Tuple[Tuple[str, str], ...] = (),
+) -> bytes:
+    """按当前展示列导出 CSV：表头用列 label，单元格取行 display 值。
+
+    leading 为附加的前置列 (表头, 取值键)，例如已下单列表的下单时间/订单号。
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow([header for header, _ in leading] + [col["label"] for col in columns])
+    for item in rows:
+        display = item.get("display")
+        display = display if isinstance(display, dict) else {}
+        row = [str(item.get(key, "") or "") for _, key in leading]
+        row.extend(
+            str(display.get(col["key"], item.get(col["key"], "")) or "")
+            for col in columns
+        )
+        writer.writerow(row)
+    return buffer.getvalue().encode("utf-8-sig")
+
+
 def normalize_import_location(raw: str) -> str:
     text = str(raw or "").strip().replace(" ", "")
     if not text:
@@ -517,80 +573,249 @@ def normalize_import_location(raw: str) -> str:
     return text.replace("-", "")
 
 
+_IMPORT_FIELD_ALIASES = {
+    "out_item_id": frozenset(
+        {"outitemid", "itemid", "商品编码", "商品id", "货品编码"}
+    ),
+    "location_code": frozenset(
+        {"locationcode", "库位", "库位编码", "货位", "货位编码"}
+    ),
+    "sku_code": frozenset(
+        {"skucode", "sku", "69码", "商品条码", "条形码", "barcode"}
+    ),
+}
+
+
+def _halfwidth(text: str) -> str:
+    """全角 ASCII（０-９Ａ-Ｚａ-ｚ等）转半角，便于表头与编码匹配。"""
+    return "".join(
+        (
+            chr(ord(char) - 0xFEE0)
+            if 0xFF01 <= ord(char) <= 0xFF5E
+            else (" " if char == "\u3000" else char)
+        )
+        for char in str(text or "")
+    )
+
+
+def _normalize_import_header(raw: object) -> str:
+    text = _halfwidth(str(raw or "").strip()).lower()
+    return "".join(
+        char for char in text if not char.isspace() and char not in {"_", "-"}
+    )
+
+
+def _canonical_import_field(raw: object) -> str:
+    normalized = _normalize_import_header(raw)
+    for field, aliases in _IMPORT_FIELD_ALIASES.items():
+        if normalized in aliases:
+            return field
+    return ""
+
+
+def _normalize_import_identifier(raw: object) -> str:
+    value = _halfwidth(str(raw or "").strip())
+    if value.endswith(".0") and value[:-2].isdigit():
+        return value[:-2]
+    return value
+
+
+def _import_identifiers(row: Dict[str, str]) -> Dict[str, str]:
+    values = {"out_item_id": "", "location_code": "", "sku_code": ""}
+    for raw_key, raw_value in row.items():
+        field = _canonical_import_field(raw_key)
+        if not field or values[field]:
+            continue
+        value = _normalize_import_identifier(raw_value)
+        if field == "location_code":
+            value = normalize_import_location(value)
+        values[field] = value
+    return values
+
+
 def _lookup_maps(
     candidates: List[Dict[str, str]],
-) -> Tuple[Dict[Tuple[str, str], Dict[str, str]], Dict[Tuple[str, str], Dict[str, str]]]:
-    by_sku: Dict[Tuple[str, str], Dict[str, str]] = {}
-    by_out: Dict[Tuple[str, str], Dict[str, str]] = {}
+) -> Tuple[
+    Dict[str, List[Dict[str, str]]],
+    Dict[str, List[Dict[str, str]]],
+    Dict[str, List[Dict[str, str]]],
+]:
+    by_sku: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    by_out: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    by_location: Dict[str, List[Dict[str, str]]] = defaultdict(list)
     for item in candidates:
         loc = item.get("location_code") or ""
         sku = item.get("sku_code") or ""
         out_id = item.get("out_item_id") or ""
-        if sku and loc:
-            by_sku[(sku, loc)] = item
-        if out_id and loc:
-            by_out[(out_id, loc)] = item
-    return by_sku, by_out
+        if sku:
+            by_sku[sku].append(item)
+        if out_id:
+            by_out[out_id].append(item)
+        if loc:
+            by_location[loc].append(item)
+    return dict(by_sku), dict(by_out), dict(by_location)
 
 
 def _build_item_from_import_row(
     row: Dict[str, str],
-    by_sku: Dict[Tuple[str, str], Dict[str, str]],
-    by_out: Dict[Tuple[str, str], Dict[str, str]],
+    by_sku: Dict[str, List[Dict[str, str]]],
+    by_out: Dict[str, List[Dict[str, str]]],
+    by_location: Dict[str, List[Dict[str, str]]],
+    identifiers: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, str], str]:
+    values = identifiers if identifiers is not None else _import_identifiers(row)
+    criteria = [
+        ("商品编码", values["out_item_id"], by_out),
+        ("库位", values["location_code"], by_location),
+        ("69码", values["sku_code"], by_sku),
+    ]
+    provided = [(label, value, mapping) for label, value, mapping in criteria if value]
+    if not provided:
+        raise ValueError("商品编码、库位、69码至少填写一项")
+
+    matches: Optional[List[Dict[str, str]]] = None
+    for _, value, mapping in provided:
+        current = mapping.get(value, [])
+        if matches is None:
+            matches = list(current)
+            continue
+        current_ids = {id(item) for item in current}
+        matches = [item for item in matches if id(item) in current_ids]
+    if not matches:
+        detail = "、".join(f"{label}={value}" for label, value, _ in provided)
+        raise ValueError(f"当前候选数据中未找到：{detail}")
+
+    warning = ""
+    if len(matches) > 1:
+        detail = "、".join(f"{label}={value}" for label, value, _ in provided)
+        warning = f"{detail} 匹配 {len(matches)} 条，已按候选顺序取第一条"
+    return dict(matches[0]), warning
+
+
+def _normalize_fullwidth_commas(text: str) -> str:
+    """引号外的全角逗号视作分隔符（兼容表头/数据混用中英文逗号的 CSV）。"""
+    out: List[str] = []
+    in_quotes = False
+    for char in text:
+        if char == '"':
+            in_quotes = not in_quotes
+            out.append(char)
+        elif char == "\uff0c" and not in_quotes:
+            out.append(",")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def _unique_columns(raw_headers: List[object]) -> List[Dict[str, str]]:
+    """把 CSV 原始表头转成唯一列定义（保留原始顺序与文案）。"""
+    columns: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+    for index, raw in enumerate(raw_headers, start=1):
+        label = str(raw or "").strip() or f"列{index}"
+        key = label
+        suffix = 2
+        while key in seen:
+            key = f"{label} ({suffix})"
+            suffix += 1
+        seen.add(key)
+        columns.append({"key": key, "label": label})
+    return columns
+
+
+def parse_import_csv_full(
+    csv_text: str,
+    candidates: List[Dict[str, str]],
     tools: Dict[str, str],
     small_skus: Set[str],
     packaging: Dict[str, str],
-) -> Dict[str, str]:
-    sku = (
-        (row.get("sku_code") or row.get("69码") or row.get("商品条码") or "")
-        .strip()
-    )
-    out_id = (row.get("out_item_id") or row.get("商品编码") or "").strip()
-    loc = normalize_import_location(
-        row.get("location_code") or row.get("库位") or ""
-    )
-    name = (row.get("name") or row.get("药品名称") or "").strip()
-    if not loc:
-        raise ValueError("缺少库位 location_code")
-    if not sku and not out_id:
-        raise ValueError("缺少 sku_code 或 out_item_id")
+    group_field: str = "",
+) -> Tuple[List[Dict[str, str]], List[str], List[Dict[str, str]]]:
+    """解析导入 CSV，返回 (药品列表, 提示, 动态列)。
 
-    matched = None
-    if sku and (sku, loc) in by_sku:
-        matched = by_sku[(sku, loc)]
-    elif out_id and (out_id, loc) in by_out:
-        matched = by_out[(out_id, loc)]
-    if matched is not None:
-        return dict(matched)
-
-    if not sku:
-        sku = out_id
-    if not out_id:
-        out_id = sku
-    tool = (
-        (row.get("推荐工具") or row.get("使用工具") or "").strip()
-        or tools.get(sku, DEFAULT_TOOL)
-    )
-    attr = (row.get("货架属性") or row.get("shelf_attribute") or "").strip()
-    pkg = (row.get("包装类型") or "").strip() or packaging.get(sku, "")
-    shelf = loc[:2] if len(loc) >= 2 else ""
-    level = loc[2:4] if len(loc) >= 4 else ""
-    unit = loc[4:6] if len(loc) >= 6 else ""
-    return {
-        "out_item_id": out_id,
-        "location_code": loc,
-        "sku_code": sku,
-        "name": name,
-        "推荐工具": tool,
-        "包装类型": pkg,
-        "shelf_attribute": attr,
-        "shelf_number": shelf,
-        "level": level,
-        "bin_unit": unit,
-        "is_small": "1" if sku in small_skus else "0",
-        "is_special": "1" if tool in SPECIAL_TOOLS else "0",
-        "is_code_pusher": "1" if attr == CODE_PUSHER else "0",
-    }
+    每行除解析出的候选药品字段外，还带 display（原始行内容，按动态列 key）
+    与 group_id（指定 group_field 时，为该列的原始值）。
+    """
+    text = str(csv_text or "").lstrip("\ufeff").strip()
+    if not text:
+        raise ValueError("CSV 内容为空。")
+    reader = csv.reader(io.StringIO(_normalize_fullwidth_commas(text)))
+    raw_rows = [
+        row for row in reader if any(str(cell or "").strip() for cell in row)
+    ]
+    if not raw_rows:
+        raise ValueError("CSV 缺少表头。")
+    columns = _unique_columns(raw_rows[0])
+    column_fields = [_canonical_import_field(column["label"]) for column in columns]
+    recognized_headers = set(column_fields)
+    if not recognized_headers.intersection(
+        {"out_item_id", "location_code", "sku_code"}
+    ):
+        header_text = "、".join(
+            column["label"] for column in columns if column["label"]
+        )
+        detail = f"（识别到的表头：{header_text}）" if header_text else ""
+        raise ValueError(
+            "CSV 表头至少需要商品编码、库位、69码中的一项。" + detail
+        )
+    group_field = str(group_field or "").strip()
+    if group_field and group_field not in {column["key"] for column in columns}:
+        raise ValueError(f"CSV 表头中不存在组合字段：{group_field}")
+    by_sku, by_out, by_location = _lookup_maps(candidates)
+    sku_keys = [
+        column["key"]
+        for column, field in zip(columns, column_fields)
+        if field == "sku_code"
+    ]
+    selected: List[Dict[str, str]] = []
+    selected_keys: Set[Tuple[str, ...]] = set()
+    errors: List[str] = []
+    for index, raw_row in enumerate(raw_rows[1:], start=2):
+        display = {
+            column["key"]: (
+                str(raw_row[offset]).strip() if offset < len(raw_row) else ""
+            )
+            for offset, column in enumerate(columns)
+        }
+        # 宽表：一行含多个 69码 列时，每个非空 69码 拆成一条药品
+        identifiers_per_row: List[Optional[Dict[str, str]]]
+        if len(sku_keys) > 1:
+            identifiers_per_row = []
+            for sku_key in sku_keys:
+                sku_value = _normalize_import_identifier(display.get(sku_key, ""))
+                if not sku_value:
+                    continue
+                values = _import_identifiers(display)
+                values["sku_code"] = sku_value
+                identifiers_per_row.append(values)
+        else:
+            identifiers_per_row = [None]
+        for identifiers in identifiers_per_row:
+            try:
+                item, warning = _build_item_from_import_row(
+                    display, by_sku, by_out, by_location, identifiers=identifiers
+                )
+            except ValueError as error:
+                errors.append(f"第 {index} 行：{error}")
+                continue
+            if warning:
+                errors.append(f"第 {index} 行：{warning}")
+            item["display"] = dict(display)
+            if group_field:
+                item["group_id"] = display.get(group_field, "")
+            # 组合模式允许同一药品出现在不同组合中，仅同组内去重
+            key = item_key(item) + (str(item.get("group_id") or "").strip(),)
+            if key in selected_keys:
+                continue
+            selected_keys.add(key)
+            selected.append(item)
+    if not selected:
+        detail = "；".join(errors[:5])
+        raise ValueError(
+            "CSV 未解析出有效药品。" + (f"（{detail}）" if detail else "")
+        )
+    # Keep CSV row order; UI may sort on demand.
+    return selected, errors, columns
 
 
 def parse_import_csv(
@@ -600,37 +825,7 @@ def parse_import_csv(
     small_skus: Set[str],
     packaging: Dict[str, str],
 ) -> Tuple[List[Dict[str, str]], List[str]]:
-    text = str(csv_text or "").lstrip("\ufeff").strip()
-    if not text:
-        raise ValueError("CSV 内容为空。")
-    reader = csv.DictReader(io.StringIO(text))
-    if reader.fieldnames is None:
-        raise ValueError("CSV 缺少表头。")
-    by_sku, by_out = _lookup_maps(candidates)
-    selected: List[Dict[str, str]] = []
-    selected_keys: Set[Tuple[str, str]] = set()
-    errors: List[str] = []
-    for index, row in enumerate(reader, start=2):
-        if not isinstance(row, dict):
-            continue
-        if not any(str(value or "").strip() for value in row.values()):
-            continue
-        try:
-            item = _build_item_from_import_row(
-                row, by_sku, by_out, tools, small_skus, packaging
-            )
-        except ValueError as error:
-            errors.append(f"第 {index} 行：{error}")
-            continue
-        key = item_key(item)
-        if key in selected_keys:
-            continue
-        selected_keys.add(key)
-        selected.append(item)
-    if not selected:
-        detail = "；".join(errors[:5])
-        raise ValueError(
-            "CSV 未解析出有效药品。" + (f"（{detail}）" if detail else "")
-        )
-    # Keep CSV row order; UI may sort on demand.
+    selected, errors, _columns = parse_import_csv_full(
+        csv_text, candidates, tools, small_skus, packaging
+    )
     return selected, errors

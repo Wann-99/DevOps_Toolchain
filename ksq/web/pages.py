@@ -49,6 +49,12 @@ def shell_page_html() -> str:
     )
 
 
+def login_page_html() -> str:
+    return _read_template("login.html").replace(
+        "__APP_VERSION__", html.escape(APP_VERSION)
+    )
+
+
 def home_page_html() -> str:
     return shell_page_html()
 

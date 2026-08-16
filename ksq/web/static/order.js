@@ -38,7 +38,7 @@ function showBox(node, payload) {
 
 function setStatus(node, text, isError) {
   node.className = isError ? "meta compact error" : "meta compact";
-  node.textContent = text || "";
+  window.KsqStatus.flash(node, text, isError);
 }
 
 function readConfigForm() {
@@ -68,7 +68,7 @@ function fillConfigForm(config) {
   document.getElementById("cfg-client-secret").placeholder = config.has_client_secret
     ? "已保存，留空不改"
     : "请输入 client_secret";
-  document.getElementById("cfg-customer").value = config.customer || "yaoshibang";
+  document.getElementById("cfg-customer").value = config.customer || "";
   document.getElementById("cfg-store-id").value = config.store_id || "";
   document.getElementById("cfg-store-name").value = config.store_name || "";
   document.getElementById("cfg-store-phone").value = config.store_phone || "";
@@ -260,8 +260,16 @@ document.getElementById("btn-create-order").addEventListener("click", async () =
     if (!response.ok) throw new Error(data.error || "创建失败");
     showBox(orderResponse, data);
     if (data.task_id) {
+      const queued = !!(
+        data.order_session && Number(data.order_session.queue_position) > 0
+      );
       taskIdInput.value = data.task_id;
-      setStatus(orderStatus, "创建成功：task_id=" + data.task_id);
+      setStatus(
+        orderStatus,
+        queued
+          ? "下一单已排队，当前单结束后自动执行：task_id=" + data.task_id
+          : "创建成功：task_id=" + data.task_id
+      );
     } else {
       setStatus(orderStatus, "已返回响应，请检查是否包含 task_id");
     }
@@ -284,44 +292,6 @@ document.getElementById("btn-task-detail").addEventListener("click", async () =>
     showBox(taskResponse, data);
   } catch (error) {
     showBox(taskResponse, { error: error.message });
-  }
-});
-
-document.getElementById("btn-task-cancel").addEventListener("click", async () => {
-  const taskId = taskIdInput.value.trim();
-  const reason = document.getElementById("cancel-reason").value.trim();
-  if (!taskId) {
-    setStatus(orderStatus, "请填写 task_id", true);
-    return;
-  }
-  if (!reason) {
-    setStatus(orderStatus, "请填写取消原因", true);
-    return;
-  }
-  const confirmed = await window.KsqDialog.confirm({
-    title: "取消任务",
-    message: "确认取消该任务？",
-    confirmText: "确认取消",
-    cancelText: "返回",
-  });
-  if (!confirmed) return;
-  taskResponse.hidden = true;
-  try {
-    const response = await fetch(
-      "/api/order/tasks/" + encodeURIComponent(taskId) + "/cancel",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cancel_type: "manual", cancel_reason: reason }),
-      }
-    );
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "取消失败");
-    showBox(taskResponse, data);
-    setStatus(orderStatus, "已提交取消");
-  } catch (error) {
-    showBox(taskResponse, { error: error.message });
-    setStatus(orderStatus, error.message, true);
   }
 });
 

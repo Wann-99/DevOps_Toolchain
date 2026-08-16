@@ -4,15 +4,33 @@ DevOps Toolchain 是面向药房自动化现场的数据查询与运维工具，
 
 ## 主要功能
 
-- 仪表板：查看当前工单、子任务进度、实时事件和人工确认状态。
-- 数据加载：从设备目录、ZIP 数据包或单独配置文件加载数据。
+- 登录与权限：账号密码登录，区分管理员与普通用户两级角色，普通用户仅禁止编辑类操作。
+- 仪表板：查看当前工单、门店任务列表、子任务进度和实时事件，并处置当前测试工单。
+- 数据加载：一键解析设备 `config_pnp` 目录加载数据，也支持本机路径手工指定、ZIP 数据包或单独配置文件导入。
 - 数据查询：按药品、库位等条件查询，编辑并导出业务数据。
-- 药品下单：选择药品或扫码下单，查看和取消工单。
-- 测试下单：生成、导入、导出和提交测试药品列表。
-- 日志查询：查看相关容器日志并执行启动、停止、重启操作。
+- 药品下单：选择药品或扫码下单，最多保留当前单和一张等待单，并查看工单状态和结构化失败详情。
+- 测试下单：生成、宽松 CSV 导入、导出和提交测试药品列表，按批次统计订单量。
+- 日志查询：通过 SSE 实时跟随 `docker logs -f`，并执行启动、停止、重启操作；历史日志损坏时自动跳过并继续获取新日志。
 - 设置：维护工作模式、下单接口、虚拟键盘和飞书表单配置。
 
 完整功能操作见 [软件使用说明](docs/manual/使用手册.md)。
+
+## 账号与权限
+
+系统要求登录后使用，未登录访问页面会跳转登录页，接口返回 401。
+
+| 角色 | 默认账号 | 权限 |
+| --- | --- | --- |
+| 管理员 | `admin / noematrix` | 全部操作 |
+| 普通用户 | `nvidia / nvidia` | 仅禁止三类编辑操作（见下），其余正常 |
+
+普通用户禁止的操作：
+
+1. 库位的编辑保存（数据查询页「编辑/保存」）；
+2. 设置页的配置保存（下单接口、虚拟键盘、ETM、飞书表单），**工作模式切换除外**——切换后对应模式的配置自动加载，不受权限影响；获取 Token 属下单凭据刷新，普通用户可用；
+3. 数据加载页的「导入」方式（本机路径与包加载不受限）。
+
+账号文件为部署目录下的 `config/users.json`（容器内 `/app/users.json`）。新增账号或修改密码：编辑该文件，写入明文 `password` 字段（不要手填 `salt`/`password_hash`），无需重启，首次登录时系统自动迁移为加盐哈希。会话有效期 12 小时（滑动续期），容器重启后需重新登录。
 
 ## 运行架构
 
@@ -37,14 +55,13 @@ Python 固定为 3.12，是因为项目当前仍使用该版本提供的标准�
 
 ```bash
 KNOWLEDGE_DIR=/path/to/knowledge \
-SHELVES_FILE=/path/to/config_pnp/sku-shelves.csv \
-UNAVAILABLE_FILE=/path/to/config_pnp/unavailabel_obj.json \
-TOOL_MAPPING_FILE=/path/to/config_pnp/obj_tool_mapping.json \
-PICK_STRATEGY_FILE=/path/to/config_pnp/pick_strategy_obj.json \
+CONFIG_PNP_DIR=/path/to/config_pnp \
 bash start.sh
 ```
 
-浏览器访问 `http://127.0.0.1:8765`。
+浏览器访问 `http://127.0.0.1:8765`，登录后使用（默认账号见「账号与权限」）。
+
+数据文件路径按「命令行显式参数 ＞ `config_pnp/config.py` ＞ 内置默认」的优先级确定。`--config-pnp` 指向设备 `config_pnp` 目录后，启动和重新加载时会解析其中的 `config.py`（仅 AST 解析，不执行代码），自动定位库位表、不可处理列表、工具映射和闭环吸取列表；库位表按日期命名（如 `sku-shelves_20260812.csv`）也能识别，无需随文件改名调整配置。在「数据加载」页手工填写或「导入」写入的路径同样优先于 `config.py`。
 
 ## 构建应用包
 
@@ -97,6 +114,12 @@ bash start.sh version
 bash start.sh rollback
 ```
 
+`update` 更新应用包时会先将四个运行状态文件（`test_order_state.json`、`dashboard_active_order.json`、`order_config.json`、`order_config.prod.json`）备份到 `config/.backup/`，再重置为干净初始值；应用版本变化后的首次启动也会由 `.bin` 内置逻辑自动执行同样的重置，不依赖设备上 `start.sh` 的版本。`dashboard_settings.json` 与 `users.json` 始终保留。也可随时手动重置：
+
+```bash
+bash start.sh reset-state
+```
+
 完整的在线、离线部署说明见 [部署与更新操作文档](docs/manual/部署操作文档.md)。
 
 ## 配置文件
@@ -108,7 +131,7 @@ bash start.sh rollback
 - `order_config.prod.example.json`
 - `devOps/.env.example`
 
-运行时配置、密码、Token、生成的 `.bin` 和部署压缩包均被 `.gitignore` 排除，不应提交到仓库。
+部署包的 `config/` 初始为干净值（空状态 + 默认账号），由 `deploy/make_package.sh` 写入、首次启动时 `start.sh` 补齐；运行时配置、账号文件 `users.json`、密码、Token、生成的 `.bin` 和部署压缩包均被 `.gitignore` 排除，不应提交到仓库。
 
 ## 后续更新流程
 

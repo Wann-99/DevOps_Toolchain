@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import json
 import random
+import threading
+import time
 from copy import deepcopy
+from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
+from uuid import uuid4
 
 from ksq.constants import TEST_ORDER_STATE_FILE
 from ksq.test_order_select import (
     ALL_PACKAGING,
     ALL_TOOLS,
     DEFAULT_CLOSED_LOOP_RATIO,
+    DEFAULT_COLUMNS,
     DEFAULT_PACKAGING_RATIO,
     DEFAULT_TOOL_RATIO,
     TOOL_CHOICES,
+    display_rows_to_csv_bytes,
     item_key,
     load_candidates,
     load_packaging,
@@ -22,9 +28,8 @@ from ksq.test_order_select import (
     load_tool_mapping,
     load_unavailable,
     packaging_choices,
-    parse_import_csv,
+    parse_import_csv_full,
     public_item,
-    rows_to_csv_bytes,
     select_items,
     summarize,
 )
@@ -53,21 +58,55 @@ def _empty_state() -> Dict[str, object]:
         "config": deepcopy(DEFAULT_CONFIG),
         "pending": [],
         "ordered": [],
+        "order_batches": [],
         "summary": summarize([]),
         "candidate_count": 0,
+        "columns": deepcopy(DEFAULT_COLUMNS),
+        "group_mode": "raw",
+        "group_field": "",
     }
 
 
-def _parse_key(raw: object) -> Optional[Tuple[str, str]]:
+def _normalize_columns(raw: object) -> List[Dict[str, str]]:
+    columns: List[Dict[str, str]] = []
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            key = str(entry.get("key") or "").strip()
+            label = str(entry.get("label") or "").strip() or key
+            if key:
+                columns.append({"key": key, "label": label})
+    return columns or deepcopy(DEFAULT_COLUMNS)
+
+
+def _normalize_group_mode(raw: object) -> str:
+    mode = str(raw or "").strip().lower()
+    return mode if mode in {"raw", "group"} else "raw"
+
+
+def _view_scheme(state_data: Dict[str, object]) -> Dict[str, object]:
+    """列表展示方案（动态列 + 组合模式），在状态变更时整体携带。"""
+    return {
+        "columns": _normalize_columns(state_data.get("columns")),
+        "group_mode": _normalize_group_mode(state_data.get("group_mode")),
+        "group_field": str(state_data.get("group_field") or ""),
+    }
+
+
+def _parse_key(raw: object) -> Optional[Tuple[str, str, str]]:
     text = str(raw or "").strip()
     if not text or "|" not in text:
         return None
-    sku, location = text.split("|", 1)
-    sku = sku.strip()
-    location = location.strip().replace("-", "")
+    parts = text.split("|")
+    if len(parts) < 2:
+        return None
+    sku = parts[0].strip()
+    location = parts[1].strip().replace("-", "")
+    group = parts[2].strip() if len(parts) > 2 else ""
     if not sku or not location:
         return None
-    return sku, location
+    return sku, location, group
 
 
 def _parse_ratio(source: Dict[str, object], key: str, default: object) -> float:
@@ -80,7 +119,7 @@ def _parse_ratio(source: Dict[str, object], key: str, default: object) -> float:
     return ratio
 
 
-def _candidate_packaging_choices() -> List[str]:
+def _load_packaging_choices() -> List[str]:
     try:
         unavailable = load_unavailable(state.configured_unavailable)
         tools = load_tool_mapping(state.configured_tool_mapping)
@@ -94,6 +133,28 @@ def _candidate_packaging_choices() -> List[str]:
         return packaging_choices(candidates)
     except (OSError, ValueError, FileNotFoundError, TypeError):
         return packaging_choices([])
+
+
+# 选项计算需全量扫描知识库（数千个文件），状态轮询期间缓存避免重复扫描拖垮服务
+_PACKAGING_CHOICES_CACHE_SECONDS = 60.0
+_packaging_choices_lock = threading.Lock()
+_packaging_choices_cache_at = 0.0
+_packaging_choices_cache: Optional[List[str]] = None
+
+
+def _candidate_packaging_choices() -> List[str]:
+    global _packaging_choices_cache_at, _packaging_choices_cache
+    with _packaging_choices_lock:
+        now = time.monotonic()
+        if (
+            _packaging_choices_cache is not None
+            and now - _packaging_choices_cache_at < _PACKAGING_CHOICES_CACHE_SECONDS
+        ):
+            return list(_packaging_choices_cache)
+        choices = _load_packaging_choices()
+        _packaging_choices_cache = choices
+        _packaging_choices_cache_at = now
+        return list(choices)
 
 
 def _normalize_config(raw: object) -> Dict[str, object]:
@@ -200,8 +261,20 @@ def _load_state_file() -> Dict[str, object]:
         state_data["pending"] = [item for item in pending if isinstance(item, dict)]
     if isinstance(ordered, list):
         state_data["ordered"] = [item for item in ordered if isinstance(item, dict)]
+    batches = payload.get("order_batches")
+    if isinstance(batches, list):
+        state_data["order_batches"] = [
+            batch for batch in batches if isinstance(batch, dict)
+        ]
+    state_data["order_batches"] = _normalize_order_batches(
+        state_data["order_batches"],  # type: ignore[arg-type]
+        state_data["ordered"],  # type: ignore[arg-type]
+    )
     state_data["summary"] = summarize(state_data["pending"])  # type: ignore[arg-type]
     state_data["candidate_count"] = int(payload.get("candidate_count") or 0)
+    state_data["columns"] = _normalize_columns(payload.get("columns"))
+    state_data["group_mode"] = _normalize_group_mode(payload.get("group_mode"))
+    state_data["group_field"] = str(payload.get("group_field") or "")
     return state_data
 
 
@@ -213,9 +286,129 @@ def _save_state(state_data: Dict[str, object]) -> None:
     )
 
 
+def _item_identity(item: Dict[str, str]) -> Tuple[str, str, str]:
+    sku, location = item_key(item)
+    return sku, location, str(item.get("group_id") or "").strip()
+
+
+def _item_key_text(item: Dict[str, str]) -> str:
+    sku, location, group = _item_identity(item)
+    return f"{sku}|{location}|{group}" if group else f"{sku}|{location}"
+
+
+def _normalize_order_batches(
+    raw_batches: List[Dict[str, object]],
+    ordered: List[Dict[str, str]],
+) -> List[Dict[str, object]]:
+    ordered_keys = {_item_key_text(item) for item in ordered}
+    batches: List[Dict[str, object]] = []
+    assigned: Set[str] = set()
+    for raw in raw_batches:
+        raw_keys = raw.get("item_keys")
+        if not isinstance(raw_keys, list):
+            continue
+        keys = [
+            str(key)
+            for key in raw_keys
+            if str(key) in ordered_keys and str(key) not in assigned
+        ]
+        if not keys:
+            continue
+        batch_id = str(raw.get("batch_id") or "").strip() or uuid4().hex
+        batch = {
+            "batch_id": batch_id,
+            "ordered_at": str(raw.get("ordered_at") or ""),
+            "order_no": str(raw.get("order_no") or ""),
+            "task_id": str(raw.get("task_id") or ""),
+            "item_keys": keys,
+        }
+        batches.append(batch)
+        assigned.update(keys)
+
+    legacy_keys = [
+        _item_key_text(item)
+        for item in ordered
+        if _item_key_text(item) not in assigned
+    ]
+    if legacy_keys:
+        batches.append(
+            {
+                "batch_id": "legacy",
+                "ordered_at": "",
+                "order_no": "",
+                "task_id": "",
+                "item_keys": legacy_keys,
+            }
+        )
+    return batches
+
+
+def _decorate_ordered_items(
+    ordered: List[Dict[str, str]], batches: List[Dict[str, object]]
+) -> List[Dict[str, str]]:
+    metadata: Dict[str, Dict[str, str]] = {}
+    for batch in batches:
+        batch_meta = {
+            "order_batch_id": str(batch.get("batch_id") or ""),
+            "ordered_at": str(batch.get("ordered_at") or ""),
+            "order_no": str(batch.get("order_no") or ""),
+            "task_id": str(batch.get("task_id") or ""),
+        }
+        for key in batch.get("item_keys", []):  # type: ignore[union-attr]
+            metadata[str(key)] = batch_meta
+    decorated: List[Dict[str, str]] = []
+    for item in ordered:
+        row = dict(item)
+        row.update(metadata.get(_item_key_text(item), {}))
+        decorated.append(row)
+    return decorated
+
+
+def _attach_display(
+    public: Dict[str, str], columns: List[Dict[str, str]]
+) -> Dict[str, str]:
+    """按当前列方案补齐 display：导入行用原始值，生成行回退到规范字段。"""
+    raw = public.get("display")
+    raw_display = raw if isinstance(raw, dict) else {}
+    display: Dict[str, str] = {}
+    for column in columns:
+        key = column["key"]
+        value = raw_display.get(key)
+        if value is None:
+            value = public.get(key, "")
+        display[key] = "" if value is None else str(value)
+    public["display"] = display
+    return public
+
+
 def _public_state(state_data: Dict[str, object]) -> Dict[str, object]:
-    pending = [public_item(item) for item in state_data["pending"]]  # type: ignore[index]
-    ordered = [public_item(item) for item in state_data["ordered"]]  # type: ignore[index]
+    scheme = _view_scheme(state_data)
+    columns = scheme["columns"]  # type: ignore[assignment]
+    pending = [
+        _attach_display(public_item(item), columns)  # type: ignore[arg-type]
+        for item in state_data["pending"]  # type: ignore[index]
+    ]
+    batches = _normalize_order_batches(
+        state_data.get("order_batches", []),  # type: ignore[arg-type]
+        state_data["ordered"],  # type: ignore[arg-type,index]
+    )
+    decorated = _decorate_ordered_items(
+        state_data["ordered"], batches  # type: ignore[arg-type,index]
+    )
+    ordered = [
+        _attach_display(public_item(item), columns)  # type: ignore[arg-type]
+        for item in decorated
+    ]
+    public_batches = [
+        {
+            "batch_id": str(batch.get("batch_id") or ""),
+            "ordered_at": str(batch.get("ordered_at") or ""),
+            "order_no": str(batch.get("order_no") or ""),
+            "task_id": str(batch.get("task_id") or ""),
+            "sku_count": len(batch.get("item_keys", [])),  # type: ignore[arg-type]
+        }
+        for batch in batches
+    ]
     return {
         "config": state_data["config"],
         "pending": pending,
@@ -223,9 +416,14 @@ def _public_state(state_data: Dict[str, object]) -> Dict[str, object]:
         "summary": summarize(state_data["pending"]),  # type: ignore[arg-type]
         "ordered_count": len(ordered),
         "pending_count": len(pending),
+        "order_count": len(public_batches),
+        "order_batches": public_batches,
         "candidate_count": state_data.get("candidate_count", 0),
         "known_tools": list(TOOL_CHOICES),
         "known_packaging": _candidate_packaging_choices(),
+        "columns": scheme["columns"],
+        "group_mode": scheme["group_mode"],
+        "group_field": scheme["group_field"],
     }
 
 
@@ -273,8 +471,12 @@ def generate(payload: Dict[str, object]) -> Dict[str, object]:
         "config": config,
         "pending": selected,
         "ordered": ordered_items,
+        "order_batches": current.get("order_batches", []),
         "summary": summarize(selected),
         "candidate_count": len(candidates),
+        "columns": deepcopy(DEFAULT_COLUMNS),
+        "group_mode": "raw",
+        "group_field": "",
     }
     _save_state(next_state)
     public = _public_state(next_state)
@@ -287,22 +489,38 @@ def export_pending_csv() -> Tuple[str, bytes]:
     current = _load_state_file()
     pending: List[Dict[str, str]] = current["pending"]  # type: ignore[assignment]
     if not pending:
-        raise ValueError("未下单列表为空，请先生成。")
-    return "test_order_pending.csv", rows_to_csv_bytes(pending)
+        raise ValueError("待下单 SKU 列表为空，请先生成。")
+    columns = _normalize_columns(current.get("columns"))
+    rows = [_attach_display(public_item(item), columns) for item in pending]
+    return "test_order_pending.csv", display_rows_to_csv_bytes(rows, columns)
 
 
 def export_ordered_csv() -> Tuple[str, bytes]:
     current = _load_state_file()
     ordered: List[Dict[str, str]] = current["ordered"]  # type: ignore[assignment]
     if not ordered:
-        raise ValueError("已下单列表为空。")
-    return "test_order_ordered.csv", rows_to_csv_bytes(ordered)
+        raise ValueError("已下单 SKU 列表为空。")
+    columns = _normalize_columns(current.get("columns"))
+    batches = _normalize_order_batches(
+        current.get("order_batches", []),  # type: ignore[arg-type]
+        ordered,
+    )
+    decorated = _decorate_ordered_items(ordered, batches)
+    rows = [_attach_display(public_item(item), columns) for item in decorated]
+    leading = (("下单时间", "ordered_at"), ("订单号", "order_no"))
+    return "test_order_ordered.csv", display_rows_to_csv_bytes(
+        rows, columns, leading
+    )
 
 
 def import_csv(payload: Dict[str, object]) -> Dict[str, object]:
     csv_text = payload.get("csv")
     if not isinstance(csv_text, str) or not csv_text.strip():
         raise ValueError("csv 内容不能为空。")
+    group_mode = _normalize_group_mode(payload.get("mode"))
+    group_field = str(payload.get("group_field") or "").strip()
+    if group_mode == "group" and not group_field:
+        raise ValueError("组合模式需要指定组合字段。")
 
     unavailable = load_unavailable(state.configured_unavailable)
     tools = load_tool_mapping(state.configured_tool_mapping)
@@ -311,8 +529,13 @@ def import_csv(payload: Dict[str, object]) -> Dict[str, object]:
     candidates = load_candidates(
         state.configured_shelves, unavailable, tools, small_skus, packaging
     )
-    imported, errors = parse_import_csv(
-        csv_text, candidates, tools, small_skus, packaging
+    imported, errors, columns = parse_import_csv_full(
+        csv_text,
+        candidates,
+        tools,
+        small_skus,
+        packaging,
+        group_field if group_mode == "group" else "",
     )
     if not imported:
         raise ValueError("CSV 未解析出有效药品。")
@@ -323,8 +546,12 @@ def import_csv(payload: Dict[str, object]) -> Dict[str, object]:
         "config": current["config"],
         "pending": imported,
         "ordered": [],
+        "order_batches": [],
         "summary": summarize(imported),
         "candidate_count": len(candidates),
+        "columns": columns,
+        "group_mode": group_mode,
+        "group_field": group_field if group_mode == "group" else "",
     }
     _save_state(next_state)
     public = _public_state(next_state)
@@ -338,21 +565,21 @@ def import_csv(payload: Dict[str, object]) -> Dict[str, object]:
 def _move_keys(
     source: List[Dict[str, str]],
     target: List[Dict[str, str]],
-    wanted: Set[Tuple[str, str]],
+    wanted: Set[Tuple[str, str, str]],
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
     """Move matching items from source to end of target; preserve relative orders."""
     moved: List[Dict[str, str]] = []
     next_source: List[Dict[str, str]] = []
     for item in source:
-        key = item_key(item)
+        key = _item_identity(item)
         if key in wanted:
             moved.append(item)
         else:
             next_source.append(item)
     if not moved:
         return source, target, []
-    moved_keys = {item_key(item) for item in moved}
-    next_target = [item for item in target if item_key(item) not in moved_keys]
+    moved_keys = {_item_identity(item) for item in moved}
+    next_target = [item for item in target if _item_identity(item) not in moved_keys]
     next_target.extend(moved)
     return next_source, next_target, moved
 
@@ -361,7 +588,7 @@ def mark_ordered(payload: Dict[str, object]) -> Dict[str, object]:
     keys_raw = payload.get("keys")
     if not isinstance(keys_raw, list) or not keys_raw:
         raise ValueError("keys 不能为空。")
-    wanted: Set[Tuple[str, str]] = set()
+    wanted: Set[Tuple[str, str, str]] = set()
     for raw in keys_raw:
         parsed = _parse_key(raw)
         if parsed is None:
@@ -371,44 +598,64 @@ def mark_ordered(payload: Dict[str, object]) -> Dict[str, object]:
     current = _load_state_file()
     pending: List[Dict[str, str]] = current["pending"]  # type: ignore[assignment]
     ordered: List[Dict[str, str]] = current["ordered"]  # type: ignore[assignment]
-    next_pending, next_ordered, moved = _move_keys(pending, ordered, wanted)
+    next_pending, _, moved = _move_keys(pending, ordered, wanted)
     if not moved:
-        raise ValueError("未在未下单列表中找到要移动的药品。")
+        raise ValueError("未在待下单 SKU 列表中找到要移动的药品。")
+
+    moved_keys = {_item_key_text(item) for item in moved}
+    remaining_ordered = [
+        item for item in ordered if _item_key_text(item) not in moved_keys
+    ]
+    batch_id = uuid4().hex
+    ordered_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    order_no = str(payload.get("order_no") or "").strip()
+    task_id = str(payload.get("task_id") or "").strip()
+    moved_with_metadata: List[Dict[str, str]] = []
+    for item in moved:
+        row = dict(item)
+        row.update(
+            {
+                "order_batch_id": batch_id,
+                "ordered_at": ordered_at,
+                "order_no": order_no,
+                "task_id": task_id,
+            }
+        )
+        moved_with_metadata.append(row)
+    next_ordered = moved_with_metadata + remaining_ordered
+    batches = _normalize_order_batches(
+        current.get("order_batches", []),  # type: ignore[arg-type]
+        ordered,
+    )
+    batches = [
+        batch
+        for batch in batches
+        if any(str(key) not in moved_keys for key in batch.get("item_keys", []))  # type: ignore[union-attr]
+    ]
+    for batch in batches:
+        batch["item_keys"] = [
+            str(key)
+            for key in batch.get("item_keys", [])  # type: ignore[union-attr]
+            if str(key) not in moved_keys
+        ]
+    batches.insert(
+        0,
+        {
+            "batch_id": batch_id,
+            "ordered_at": ordered_at,
+            "order_no": order_no,
+            "task_id": task_id,
+            "item_keys": [_item_key_text(item) for item in moved],
+        },
+    )
 
     next_state = {
         "config": current["config"],
         "pending": next_pending,
         "ordered": next_ordered,
+        "order_batches": batches,
         "candidate_count": current.get("candidate_count", 0),
-    }
-    next_state["summary"] = summarize(next_state["pending"])  # type: ignore[arg-type]
-    _save_state(next_state)
-    return _public_state(next_state)
-
-
-def restore(payload: Dict[str, object]) -> Dict[str, object]:
-    keys_raw = payload.get("keys")
-    if not isinstance(keys_raw, list) or not keys_raw:
-        raise ValueError("keys 不能为空。")
-    wanted: Set[Tuple[str, str]] = set()
-    for raw in keys_raw:
-        parsed = _parse_key(raw)
-        if parsed is None:
-            raise ValueError(f"无效 key：{raw}")
-        wanted.add(parsed)
-
-    current = _load_state_file()
-    pending: List[Dict[str, str]] = current["pending"]  # type: ignore[assignment]
-    ordered: List[Dict[str, str]] = current["ordered"]  # type: ignore[assignment]
-    next_ordered, next_pending, moved = _move_keys(ordered, pending, wanted)
-    if not moved:
-        raise ValueError("未在已下单列表中找到要恢复的药品。")
-
-    next_state = {
-        "config": current["config"],
-        "pending": next_pending,
-        "ordered": next_ordered,
-        "candidate_count": current.get("candidate_count", 0),
+        **_view_scheme(current),
     }
     next_state["summary"] = summarize(next_state["pending"])  # type: ignore[arg-type]
     _save_state(next_state)
@@ -424,7 +671,9 @@ def clear_list(which: object) -> Dict[str, object]:
         "config": current["config"],
         "pending": [] if target == "pending" else current["pending"],
         "ordered": [] if target == "ordered" else current["ordered"],
+        "order_batches": [] if target == "ordered" else current.get("order_batches", []),
         "candidate_count": current.get("candidate_count", 0),
+        **_view_scheme(current),
     }
     next_state["summary"] = summarize(next_state["pending"])  # type: ignore[arg-type]
     _save_state(next_state)

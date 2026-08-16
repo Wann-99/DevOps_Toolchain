@@ -246,8 +246,9 @@
       if (view === "dashboard") global.KsqDashboard.activate();
       else global.KsqDashboard.deactivate();
     }
-    if (view === "logs" && global.KsqLogs) {
-      global.KsqLogs.activate();
+    if (global.KsqLogs) {
+      if (view === "logs") global.KsqLogs.activate();
+      else if (global.KsqLogs.deactivate) global.KsqLogs.deactivate();
     }
     if (view === "test-order" && global.KsqTestOrder) {
       global.KsqTestOrder.activate();
@@ -305,7 +306,7 @@
         await promptLoadData();
         return;
       }
-      await global.KsqShell.showView("load", { force: true });
+      await global.KsqShell.showView(initial || "load", { force: true });
     } finally {
       hideBootSplash();
     }

@@ -16,16 +16,19 @@ services:
       - 0.0.0.0
       - --port
       - "8765"
+      - --config-pnp
+      - /data/config_pnp
       - --knowledge
       - /data/knowledge
-      - --shelves
-      - /data/config_pnp/sku-shelves.csv
-      - --unavailable
-      - /data/config_pnp/unavailabel_obj.json
-      - --tool-mapping
-      - /data/config_pnp/obj_tool_mapping.json
-      - --pick-strategy
-      - /data/config_pnp/pick_strategy_obj.json
+      # 旧参数（由 config_pnp 目录驱动，不再逐项指定）:
+      # - --shelves
+      # - /data/config_pnp/sku-shelves.csv
+      # - --unavailable
+      # - /data/config_pnp/unavailabel_obj.json
+      # - --tool-mapping
+      # - /data/config_pnp/obj_tool_mapping.json
+      # - --pick-strategy
+      # - /data/config_pnp/pick_strategy_obj.json
     environment:
       # 容器默认 UTC，会导致备份文件名/订单时间比现场慢 8 小时。
       TZ: ${TZ:-Asia/Shanghai}
@@ -33,12 +36,12 @@ services:
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - ../deploy/standalone/bin/knowledge_shelf_query.bin:/opt/ksq/knowledge_shelf_query.bin:ro
-      # 项目内可写配置/状态（相对本 compose 文件的上级目录）
-      - ../dashboard_settings.json:/app/dashboard_settings.json
-      - ../dashboard_active_order.json:/app/dashboard_active_order.json
-      - ../test_order_state.json:/app/test_order_state.json
-      - ../order_config.json:/app/order_config.json
-      - ../order_config.prod.json:/app/order_config.prod.json
+      # 状态/配置（up.sh 会自动初始化缺失文件到 ./config/）
+      - ./config/dashboard_settings.json:/app/dashboard_settings.json
+      - ./config/dashboard_active_order.json:/app/dashboard_active_order.json
+      - ./config/test_order_state.json:/app/test_order_state.json
+      - ./config/order_config.json:/app/order_config.json
+      - ./config/order_config.prod.json:/app/order_config.prod.json
       # 现场数据（药库配置 / 知识库）；默认兼容 compiled 同级布局
       - ${CONFIG_PNP_DIR:-/home/nvidia/compiled/PNPApp_deploy/config_pnp}:/data/config_pnp
       - ${KNOWLEDGE_DIR:-/home/nvidia/compiled/VfmApp_deploy/model/templates/knowledge}:/data/knowledge

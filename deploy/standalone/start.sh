@@ -5,12 +5,13 @@ set -euo pipefail
 # 用法:
 #   bash start.sh start                 启动（默认）
 #   bash start.sh restart               重建容器并启动
-#   bash start.sh update <应用包.bin>   更新应用包并重建容器
+#   bash start.sh update <应用包.bin>   更新应用包并重建容器（自动重置状态）
 #   bash start.sh rollback              回滚到上一个应用包
 #   bash start.sh version               查看当前应用包版本
 #   bash start.sh stop                  停止
 #   bash start.sh logs                  查看日志
 #   bash start.sh pull-runtime          仅拉取运行时镜像
+#   bash start.sh reset-state           手动重置状态文件（保留 dashboard_settings.json）
 
 CALLER_DIRECTORY="$(pwd)"
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -24,6 +25,48 @@ export CONFIG_PNP_DIR="${CONFIG_PNP_DIR:-/home/nvidia/compiled/PNPApp_deploy/con
 export KNOWLEDGE_DIR="${KNOWLEDGE_DIR:-/home/nvidia/compiled/VfmApp_deploy/model/templates/knowledge}"
 
 die() { echo "[ERROR] $*" >&2; exit 1; }
+
+# DEFAULT_ORDER_CONFIG 的 JSON 序列化（与 ksq/order/config.py 保持一致）
+DEFAULT_ORDER_CONFIG_JSON='{
+  "server": "",
+  "client_id": "",
+  "client_secret": "",
+  "customer": "",
+  "store_id": "",
+  "store_name": "",
+  "order_source": "",
+  "order_time_timezone": "Asia/Shanghai",
+  "need_image_upload": false,
+  "business_mode_code": ""
+}'
+
+# 初始账号（明文密码首次登录后自动迁移为加盐哈希；admin=管理员，user=普通用户只读）
+DEFAULT_USERS_JSON='{
+  "users": [
+    {
+      "username": "admin",
+      "display_name": "管理员",
+      "role": "admin",
+      "password": "noematrix"
+    },
+    {
+      "username": "nvidia",
+      "display_name": "普通用户",
+      "role": "viewer",
+      "password": "nvidia"
+    }
+  ]
+}'
+
+# 仅在文件不存在时写入初始值
+_init_file() {
+    local path="$1"
+    local content="$2"
+    if [[ -d "${path}" ]]; then
+        die "${path} 被误创建为目录，请删除后重试（应为 JSON 文件）"
+    fi
+    [[ -f "${path}" ]] || printf '%s\n' "${content}" > "${path}"
+}
 
 ensure_docker() {
     command -v docker >/dev/null 2>&1 || die "未找到 docker"
@@ -39,17 +82,43 @@ compose_cli() {
 
 ensure_files() {
     mkdir -p config bin
-    for f in dashboard_settings.json dashboard_active_order.json \
-             test_order_state.json order_config.json order_config.prod.json; do
-        if [[ -d "config/$f" ]]; then
-            die "config/$f 被误创建为目录，请删除后重试（应为 JSON 文件）"
-        fi
-        [[ -f "config/$f" ]] || echo '{}' > "config/$f"
-    done
+    # 各文件写入正确的初始值（而非统一 {}）
+    # test_order_state.json → {}（_load_state_file 缺失/空回退 _empty_state）
+    _init_file "config/test_order_state.json" '{}'
+    # dashboard_active_order.json → {}（_ensure_active_order_loaded 视为无活跃订单）
+    _init_file "config/dashboard_active_order.json" '{}'
+    # order_config.json / order_config.prod.json → DEFAULT_ORDER_CONFIG 序列化
+    _init_file "config/order_config.json" "${DEFAULT_ORDER_CONFIG_JSON}"
+    _init_file "config/order_config.prod.json" "${DEFAULT_ORDER_CONFIG_JSON}"
+    # dashboard_settings.json → {}（仅首次创建，不在 reset 范围）
+    _init_file "config/dashboard_settings.json" '{}'
+    # users.json → 初始账号（仅首次创建，不随 reset 重置，密码登录后自动哈希化）
+    _init_file "config/users.json" "${DEFAULT_USERS_JSON}"
     if [[ -d robot_keyboard.env ]]; then
         die "robot_keyboard.env 被误创建为目录，请删除后重试"
     fi
     [[ -f robot_keyboard.env ]] || touch robot_keyboard.env
+}
+
+# 重置状态文件为干净初始值（不触碰 dashboard_settings.json）
+# 重置前先备份到 config/.backup/（带时间戳）
+reset_state() {
+    mkdir -p config/.backup
+    local ts
+    ts="$(date +%Y%m%d_%H%M%S)"
+    local f
+    for f in test_order_state.json dashboard_active_order.json \
+             order_config.json order_config.prod.json; do
+        if [[ -f "config/${f}" ]]; then
+            cp -p "config/${f}" "config/.backup/${f}.${ts}"
+        fi
+    done
+    printf '{}\n' > "config/test_order_state.json"
+    printf '{}\n' > "config/dashboard_active_order.json"
+    printf '%s\n' "${DEFAULT_ORDER_CONFIG_JSON}" > "config/order_config.json"
+    printf '%s\n' "${DEFAULT_ORDER_CONFIG_JSON}" > "config/order_config.prod.json"
+    echo "[OK] 状态文件已重置（dashboard_settings.json 保留不变）"
+    echo "[INFO] 备份位于 config/.backup/*.${ts}"
 }
 
 ensure_paths() {
@@ -82,6 +151,7 @@ required = {
     "__main__.py",
     "KSQ_BUILD.json",
     "ksq/cli.py",
+    "ksq/config_pnp.py",
     "ksq/web/templates/shell.html",
     "ksq/web/static/app.css",
 }
@@ -94,6 +164,8 @@ try:
         missing = sorted(required - set(archive.namelist()))
         if missing:
             raise ValueError("缺少文件: " + "、".join(missing))
+        if b"--config-pnp" not in archive.read("ksq/cli.py"):
+            raise ValueError("应用包不支持 --config-pnp，不能使用当前挂载配置")
         json.loads(archive.read("KSQ_BUILD.json"))
 except Exception as error:
     print(error, file=sys.stderr)
@@ -117,7 +189,7 @@ wait_for_service() {
     local attempt
     for attempt in $(seq 1 90); do
         if docker exec knowledge_shelf_query python3 -c \
-            'import urllib.request; response = urllib.request.urlopen("http://127.0.0.1:8765/api/status", timeout=2); raise SystemExit(0 if response.status == 200 else 1)' \
+            'import urllib.request; response = urllib.request.urlopen("http://127.0.0.1:8765/api/health", timeout=2); raise SystemExit(0 if response.status == 200 else 1)' \
             >/dev/null 2>&1; then
             echo "[OK] 服务已就绪"
             return 0
@@ -197,6 +269,7 @@ case "${ACTION}" in
         ensure_docker
         ensure_paths
         ensure_runtime_image
+        reset_state
         update_app_bin "${2:-}"
         ;;
     rollback)
@@ -216,11 +289,14 @@ case "${ACTION}" in
         ensure_docker
         docker logs -f knowledge_shelf_query
         ;;
+    reset-state)
+        reset_state
+        ;;
     pull-runtime|pull)
         ensure_docker
         docker pull "${RUNTIME_IMAGE}"
         ;;
     *)
-        die "用法: bash start.sh {start|restart|update <应用包.bin>|rollback|version|stop|logs|pull-runtime}"
+        die "用法: bash start.sh {start|restart|update <应用包.bin>|rollback|version|stop|logs|pull-runtime|reset-state}"
         ;;
 esac

@@ -16,6 +16,38 @@ PKG_NAME="ksq_deploy_${TAG}"
 DIST_DIR="${SCRIPT_DIR}/dist"
 STAGE="${DIST_DIR}/${PKG_NAME}"
 
+# DEFAULT_ORDER_CONFIG 的 JSON 序列化（与 ksq/order/config.py 保持一致）
+DEFAULT_ORDER_CONFIG_JSON='{
+  "server": "",
+  "client_id": "",
+  "client_secret": "",
+  "customer": "",
+  "store_id": "",
+  "store_name": "",
+  "order_source": "",
+  "order_time_timezone": "Asia/Shanghai",
+  "need_image_upload": false,
+  "business_mode_code": ""
+}'
+
+# 初始账号（与 standalone/start.sh 的 DEFAULT_USERS_JSON 保持一致）
+DEFAULT_USERS_JSON='{
+  "users": [
+    {
+      "username": "admin",
+      "display_name": "管理员",
+      "role": "admin",
+      "password": "noematrix"
+    },
+    {
+      "username": "nvidia",
+      "display_name": "普通用户",
+      "role": "viewer",
+      "password": "nvidia"
+    }
+  ]
+}'
+
 echo "════════ 组装部署包 ${PKG_NAME} ════════"
 rm -rf "${STAGE}"
 mkdir -p "${STAGE}/config" "${STAGE}/bin"
@@ -35,17 +67,16 @@ cp "${APP_BIN_DIST}" "${STAGE}/bin/knowledge_shelf_query.bin"
   && cp "${APP_DIR}/devOps/robot_keyboard.env" "${STAGE}/robot_keyboard.env" \
   || touch "${STAGE}/robot_keyboard.env"
 
-# 4. 状态/配置文件：项目根目录有现成的就带上（含已有配置），否则初始化为空模板
-for f in dashboard_settings.json dashboard_active_order.json \
-         test_order_state.json order_config.json order_config.prod.json; do
-    if [[ -f "${APP_DIR}/${f}" ]]; then
-        cp "${APP_DIR}/${f}" "${STAGE}/config/${f}"
-        echo "  [config] 携带现有配置: ${f}"
-    else
-        echo '{}' > "${STAGE}/config/${f}"
-        echo "  [config] 初始化空模板: ${f}"
-    fi
-done
+# 4. 状态/配置文件：始终写入干净初始值（不携带项目根目录的历史状态）
+#    部署包应包含空白状态，设备首次启动时由 start.sh ensure_files 或
+#    state_reset.py 处理初始化。
+printf '{}\n' > "${STAGE}/config/dashboard_settings.json"
+printf '{}\n' > "${STAGE}/config/dashboard_active_order.json"
+printf '{}\n' > "${STAGE}/config/test_order_state.json"
+printf '%s\n' "${DEFAULT_ORDER_CONFIG_JSON}" > "${STAGE}/config/order_config.json"
+printf '%s\n' "${DEFAULT_ORDER_CONFIG_JSON}" > "${STAGE}/config/order_config.prod.json"
+printf '%s\n' "${DEFAULT_USERS_JSON}" > "${STAGE}/config/users.json"
+echo "  [config] 已写入干净初始值（6 个状态/配置文件）"
 
 # 5. 打包
 cd "${DIST_DIR}"

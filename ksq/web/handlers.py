@@ -8,13 +8,16 @@ import mimetypes
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
+from itertools import chain
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
+from ksq.constants import APP_VERSION
 from ksq.feishu.client import FeishuApiError
 from ksq.order.broker import OrderBrokerError
 from ksq.web import (
+    auth,
     dashboard_api,
     edit_workspace,
     logs_api,
@@ -34,6 +37,8 @@ from ksq.web.pages import (
     build_missing_rows,
     format_status_html,
     home_page_html,
+    login_page_html,
+    optional_path_display,
     order_page_html,
     query_page_html,
     records_payload,
@@ -53,9 +58,101 @@ def read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, object]:
 
 
 class QueryHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _current_session(self) -> Optional[Dict[str, object]]:
+        return auth.session_from_cookie(self.headers.get("Cookie", ""))
+
+    def _require_session(self, path: str) -> Optional[Dict[str, object]]:
+        """返回会话；未登录时 API 返回 401，页面跳转到登录页。"""
+        session = self._current_session()
+        if session is not None:
+            return session
+        if path.startswith("/api/") or path.startswith("/load"):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "未登录或会话已过期，请重新登录。"},
+            )
+        else:
+            self._send_redirect("/login")
+        return None
+
+    def _require_admin(self, session: Dict[str, object]) -> bool:
+        if session.get("role") == auth.ROLE_ADMIN:
+            return True
+        self._send_json(
+            HTTPStatus.FORBIDDEN,
+            {"error": "当前为普通用户，该编辑操作仅管理员可用。"},
+        )
+        return False
+
+    def _handle_login(self) -> None:
+        try:
+            payload = read_json_body(self)
+        except ValueError as error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        username = str(payload.get("username") or "").strip()
+        password = str(payload.get("password") or "")
+        if not username or not password:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "请输入用户名和密码。"}
+            )
+            return
+        entry = auth.verify_credentials(username, password)
+        if entry is None:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED, {"error": "用户名或密码错误。"}
+            )
+            return
+        token = auth.create_session(entry)
+        body = json.dumps(
+            {"ok": True, "user": auth.public_user(entry)}, ensure_ascii=False
+        ).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Set-Cookie", auth.session_cookie_header(token))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_logout(self) -> None:
+        auth.destroy_session(
+            auth.token_from_cookie(self.headers.get("Cookie", ""))
+        )
+        body = b'{"ok": true}'
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Set-Cookie", auth.clear_cookie_header())
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        if path.startswith("/static/"):
+            self._send_static(path[len("/static/") :])
+            return
+        if path == "/api/health":
+            # 公开健康检查端点（start.sh wait_for_service 使用）。
+            self._send_json(HTTPStatus.OK, {"ok": True, "version": APP_VERSION})
+            return
+        if path == "/login":
+            if self._current_session() is not None:
+                self._send_redirect("/")
+                return
+            self._send_html(HTTPStatus.OK, login_page_html())
+            return
+        if path == "/api/auth/me":
+            session = self._current_session()
+            if session is None:
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "未登录。"})
+                return
+            self._send_json(HTTPStatus.OK, auth.public_user(session))
+            return
+        if self._require_session(path) is None:
+            return
         if path == "/":
             self._send_html(HTTPStatus.OK, home_page_html())
             return
@@ -64,9 +161,6 @@ class QueryHandler(BaseHTTPRequestHandler):
             return
         if path == "/order":
             self._send_html(HTTPStatus.OK, order_page_html())
-            return
-        if path.startswith("/static/"):
-            self._send_static(path[len("/static/") :])
             return
         if path == "/api/logs/services":
             try:
@@ -77,10 +171,22 @@ class QueryHandler(BaseHTTPRequestHandler):
                     {"error": str(error)},
                 )
             return
+        if path == "/api/logs/stream":
+            query = parse_qs(parsed.query)
+            service = (query.get("service") or ["0"])[0]
+            try:
+                tail = int((query.get("tail") or ["800"])[0])
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "tail 无效。"})
+                return
+            last_event_id = self.headers.get("Last-Event-ID", "")
+            self._send_log_stream(service, tail, last_event_id)
+            return
         if path == "/api/logs":
             query = parse_qs(parsed.query)
             service = (query.get("service") or ["0"])[0]
             since = (query.get("since") or [""])[0]
+            cursor = (query.get("cursor") or [""])[0]
             try:
                 tail = int((query.get("tail") or ["500"])[0])
             except ValueError:
@@ -88,7 +194,8 @@ class QueryHandler(BaseHTTPRequestHandler):
                 return
             try:
                 self._send_json(
-                    HTTPStatus.OK, logs_api.fetch_logs(service, tail, since)
+                    HTTPStatus.OK,
+                    logs_api.fetch_logs(service, tail, since, cursor),
                 )
             except LogServiceError as error:
                 self._send_json(
@@ -336,7 +443,29 @@ class QueryHandler(BaseHTTPRequestHandler):
             except OrderBrokerError as error:
                 self._send_json(
                     HTTPStatus.BAD_GATEWAY,
-                    {"error": str(error), "upstream": error.body},
+                    order_api.broker_error_payload(error),
+                )
+            return
+        if path == "/api/order/tasks":
+            query = parse_qs(parsed.query)
+            try:
+                mode = dashboard_api.resolve_dashboard_mode("")
+                result = order_api.list_tasks(
+                    mode=mode,
+                    page=(query.get("page") or ["1"])[0],
+                    page_size=(query.get("page_size") or ["10"])[0],
+                    order_by=(query.get("order_by") or ["desc"])[0],
+                    status=(query.get("status") or [""])[0],
+                    timezone_name=(query.get("tz") or ["Asia/Shanghai"])[0],
+                    refresh=(query.get("refresh") or [""])[0],
+                )
+                self._send_json(HTTPStatus.OK, result)
+            except (ValueError, FileNotFoundError) as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except OrderBrokerError as error:
+                self._send_json(
+                    HTTPStatus.BAD_GATEWAY,
+                    order_api.broker_error_payload(error),
                 )
             return
         if path.startswith("/api/order/tasks/"):
@@ -349,7 +478,7 @@ class QueryHandler(BaseHTTPRequestHandler):
             except OrderBrokerError as error:
                 self._send_json(
                     HTTPStatus.BAD_GATEWAY,
-                    {"error": str(error), "upstream": error.body},
+                    order_api.broker_error_payload(error),
                 )
                 return
             self._send_json(HTTPStatus.OK, {"status": status, "data": data})
@@ -358,6 +487,9 @@ class QueryHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         path = urlparse(self.path).path
+        session = self._require_session(path)
+        if session is None or not self._require_admin(session):
+            return
         try:
             if path == "/api/order/config":
                 payload = read_json_body(self)
@@ -375,6 +507,22 @@ class QueryHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/auth/login":
+            self._handle_login()
+            return
+        session = self._require_session(path)
+        if session is None:
+            return
+        if path == "/api/auth/logout":
+            self._handle_logout()
+            return
+        # 普通用户仅拦截少数编辑类端点，其余操作一律放行。
+        if (
+            session.get("role") != auth.ROLE_ADMIN
+            and path in auth.VIEWER_FORBIDDEN_POST_PATHS
+        ):
+            self._require_admin(session)
+            return
         try:
             if path == "/api/order/token":
                 payload = {}
@@ -386,7 +534,14 @@ class QueryHandler(BaseHTTPRequestHandler):
                 mode = dashboard_api.resolve_dashboard_mode(
                     payload.get("mode") or (query.get("mode") or [""])[0]
                 )
-                result = order_api.refresh_token(mode)
+                try:
+                    result = order_api.refresh_token(mode)
+                except OrderBrokerError as error:
+                    self._send_json(
+                        HTTPStatus.BAD_GATEWAY,
+                        order_api.broker_error_payload(error),
+                    )
+                    return
                 self._send_json(HTTPStatus.OK, result)
                 return
             if path == "/api/import":
@@ -423,13 +578,6 @@ class QueryHandler(BaseHTTPRequestHandler):
                     result = test_order_api.mark_ordered(payload)
                 self._send_json(HTTPStatus.OK, result)
                 return
-            if path == "/api/test-order/restore":
-                state.require_full_data_source("测试下单")
-                payload = read_json_body(self)
-                with state.DATASET_LOCK:
-                    result = test_order_api.restore(payload)
-                self._send_json(HTTPStatus.OK, result)
-                return
             if path == "/api/test-order/clear":
                 payload = read_json_body(self)
                 with state.DATASET_LOCK:
@@ -440,17 +588,19 @@ class QueryHandler(BaseHTTPRequestHandler):
                 state.require_full_data_source("药品下单")
                 payload = read_json_body(self)
                 try:
-                    status, data, body = order_api.create_order(payload)
+                    status, data, body, order_session = (
+                        order_api.create_registered_order(payload, "order")
+                    )
+                except order_api.OrderQueueConflict as error:
+                    self._send_json(HTTPStatus.CONFLICT, {"error": str(error)})
+                    return
                 except OrderBrokerError as error:
                     self._send_json(
                         HTTPStatus.BAD_GATEWAY,
-                        {"error": str(error), "upstream": error.body},
+                        order_api.broker_error_payload(error),
                     )
                     return
                 task_id = order_api.extract_task_id(data) or ""
-                order_session = dashboard_api.set_active_order_from_create(
-                    task_id, body, "order"
-                )
                 self._send_json(
                     HTTPStatus.OK,
                     {
@@ -459,35 +609,103 @@ class QueryHandler(BaseHTTPRequestHandler):
                         "request_body": body,
                         "task_id": task_id,
                         "order_session": order_session,
+                        "queue": dashboard_api.order_queue_status(),
                     },
                 )
+                return
+            if path == "/api/order/current/cancel":
+                payload = read_json_body(self)
+                try:
+                    result = order_api.operate_current_order(
+                        "cancel", payload.get("cancel_reason")
+                    )
+                except order_api.ProductionOrderWriteForbidden as error:
+                    self._send_json(HTTPStatus.FORBIDDEN, {"error": str(error)})
+                    return
+                except order_api.CurrentOrderConflict as error:
+                    self._send_json(HTTPStatus.CONFLICT, {"error": str(error)})
+                    return
+                except OrderBrokerError as error:
+                    self._send_json(
+                        HTTPStatus.BAD_GATEWAY,
+                        order_api.broker_error_payload(error),
+                    )
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path in {
+                "/api/order/current/manual-claim",
+                "/api/order/current/manual-complete",
+            }:
+                action = (
+                    "manual_claim"
+                    if path.endswith("/manual-claim")
+                    else "manual_complete"
+                )
+                try:
+                    result = order_api.operate_current_order(action)
+                except order_api.ProductionOrderWriteForbidden as error:
+                    self._send_json(HTTPStatus.FORBIDDEN, {"error": str(error)})
+                    return
+                except order_api.CurrentOrderConflict as error:
+                    self._send_json(HTTPStatus.CONFLICT, {"error": str(error)})
+                    return
+                except OrderBrokerError as error:
+                    self._send_json(
+                        HTTPStatus.BAD_GATEWAY,
+                        order_api.broker_error_payload(error),
+                    )
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path.startswith("/api/order/tasks/") and (
+                path.endswith("/cancel")
+                or path.endswith("/manual-claim")
+                or path.endswith("/manual-complete")
+            ):
+                remainder = path[len("/api/order/tasks/") :]
+                task_id, _, suffix = remainder.rpartition("/")
+                task_id = unquote(task_id).strip()
+                if not task_id or "/" in task_id:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST, {"error": "task_id 无效。"}
+                    )
+                    return
+                action = {
+                    "cancel": "cancel",
+                    "manual-claim": "manual_claim",
+                    "manual-complete": "manual_complete",
+                }[suffix]
+                payload = {}
+                try:
+                    payload = read_json_body(self)
+                except ValueError:
+                    payload = {}
+                try:
+                    result = order_api.operate_task(
+                        action,
+                        task_id,
+                        payload.get("cancel_reason"),
+                        payload.get("cancel_type") or "user",
+                    )
+                except order_api.ProductionOrderWriteForbidden as error:
+                    self._send_json(HTTPStatus.FORBIDDEN, {"error": str(error)})
+                    return
+                except order_api.TaskOperationConflict as error:
+                    self._send_json(HTTPStatus.CONFLICT, {"error": str(error)})
+                    return
+                except OrderBrokerError as error:
+                    self._send_json(
+                        HTTPStatus.BAD_GATEWAY,
+                        order_api.broker_error_payload(error),
+                    )
+                    return
+                self._send_json(HTTPStatus.OK, result)
                 return
             if path == "/api/dashboard/order":
                 payload = read_json_body(self)
                 result = dashboard_api.set_active_order(payload)
                 self._send_json(HTTPStatus.OK, {"ok": True, "order": result})
-                return
-            if path.startswith("/api/order/tasks/") and path.endswith("/cancel"):
-                mid = path[len("/api/order/tasks/") : -len("/cancel")]
-                task_id = unquote(mid).strip()
-                if not task_id or "/" in task_id:
-                    raise ValueError("task_id 无效。")
-                payload = read_json_body(self)
-                cancel_type = str(payload.get("cancel_type") or "manual").strip()
-                cancel_reason = str(payload.get("cancel_reason") or "").strip()
-                if not cancel_reason:
-                    raise ValueError("cancel_reason 不能为空。")
-                try:
-                    status, data = order_api.cancel_task(
-                        task_id, cancel_type, cancel_reason
-                    )
-                except OrderBrokerError as error:
-                    self._send_json(
-                        HTTPStatus.BAD_GATEWAY,
-                        {"error": str(error), "upstream": error.body},
-                    )
-                    return
-                self._send_json(HTTPStatus.OK, {"status": status, "data": data})
                 return
             if path == "/load-paths":
                 payload = read_json_body(self)
@@ -518,6 +736,18 @@ class QueryHandler(BaseHTTPRequestHandler):
                     state.configured_unavailable = unavailable_path
                     state.configured_tool_mapping = tool_mapping_path
                     state.configured_pick_strategy = pick_strategy_path
+                    # Mark user-submitted non-empty paths as explicit so
+                    # reload_config_pnp_paths() preserves them over config.py.
+                    explicit_keys = {"knowledge", "shelves"}
+                    if unavailable_path is not None:
+                        explicit_keys.add("unavailable")
+                    if tool_mapping_path is not None:
+                        explicit_keys.add("tool_mapping")
+                    if pick_strategy_path is not None:
+                        explicit_keys.add("pick_strategy")
+                    state._explicit_config_keys = (
+                        state._explicit_config_keys | explicit_keys
+                    )
                     dataset, tool_mapping, closed_loop_ids, unavailable_ids, elapsed = (
                         load_from_configured_paths()
                     )
@@ -554,6 +784,122 @@ class QueryHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if path == "/load-auto":
+                payload = {}
+                try:
+                    payload = read_json_body(self)
+                except ValueError:
+                    payload = {}
+                knowledge_override = payload.get("knowledge")
+                paths: Dict[str, str] = {}
+                try:
+                    # Pre-check: config_pnp/config.py must exist before
+                    # attempting a one-click load.  When the file is missing
+                    # we must NOT fall back to DEFAULT_* paths (which point at
+                    # non-existent container locations) — return a clear
+                    # error instead so the user can fix the mount/config.
+                    config_pnp_dir = state.configured_config_pnp
+                    config_py_file = (
+                        (config_pnp_dir / "config.py")
+                        if config_pnp_dir is not None
+                        else None
+                    )
+                    if config_py_file is None or not config_py_file.is_file():
+                        with state.DATASET_LOCK:
+                            ref_paths = {
+                                "knowledge": str(state.configured_knowledge),
+                                "shelves": str(state.configured_shelves),
+                                "unavailable": optional_path_display(
+                                    state.configured_unavailable
+                                ),
+                                "tool_mapping": optional_path_display(
+                                    state.configured_tool_mapping
+                                ),
+                                "pick_strategy": optional_path_display(
+                                    state.configured_pick_strategy
+                                ),
+                            }
+                        search_hint = (
+                            str(config_pnp_dir)
+                            if config_pnp_dir is not None
+                            else "未配置 config_pnp 目录"
+                        )
+                        self._send_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {
+                                "error": (
+                                    "未找到 config_pnp/config.py"
+                                    f"（查找路径：{search_hint}），"
+                                    "请确认 config_pnp 目录已正确挂载或配置"
+                                ),
+                                "paths": ref_paths,
+                            },
+                        )
+                        return
+                    with state.DATASET_LOCK:
+                        if (
+                            isinstance(knowledge_override, str)
+                            and knowledge_override.strip()
+                        ):
+                            state.configured_knowledge = (
+                                Path(knowledge_override).expanduser().resolve()
+                            )
+                        # One-click load: discard manual overrides so that
+                        # config_pnp/config.py paths take full priority.
+                        state._explicit_config_keys = frozenset()
+                        state.reload_config_pnp_paths()
+                        paths = {
+                            "knowledge": str(state.configured_knowledge),
+                            "shelves": str(state.configured_shelves),
+                            "unavailable": optional_path_display(
+                                state.configured_unavailable
+                            ),
+                            "tool_mapping": optional_path_display(
+                                state.configured_tool_mapping
+                            ),
+                            "pick_strategy": optional_path_display(
+                                state.configured_pick_strategy
+                            ),
+                        }
+                        result = apply_configured_paths_reload()
+                        dataset = state.loaded_dataset
+                        has_unavailable = (
+                            state.configured_unavailable is not None
+                        )
+                        has_tool_mapping = (
+                            state.configured_tool_mapping is not None
+                        )
+                        has_pick_strategy = (
+                            state.configured_pick_strategy is not None
+                        )
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {
+                            "html": format_status_html(
+                                dataset,
+                                result["elapsed_seconds"],
+                                "已从本机路径加载",
+                                paths["knowledge"],
+                                paths["shelves"],
+                                has_unavailable,
+                                has_tool_mapping,
+                                has_pick_strategy,
+                            ),
+                            "missing_rows": build_missing_rows(dataset),
+                            "unavailable_ids": result["unavailable_ids"],
+                            "has_unavailable": has_unavailable,
+                            "load_method": "paths",
+                            "capabilities": state.load_capabilities("paths"),
+                            "paths": paths,
+                        },
+                    )
+                    return
+                except Exception as error:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": str(error), "paths": paths},
+                    )
+                    return
             if path == "/load-upload":
                 form = cgi.FieldStorage(
                     fp=self.rfile,
@@ -739,6 +1085,10 @@ class QueryHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/dashboard/keyboard":
                 payload = read_json_body(self)
+                if session.get("role") != auth.ROLE_ADMIN:
+                    # 普通用户仅放行工作模式切换，键盘/ETM/飞书等配置项
+                    # 保持服务端当前值，且不触发机器人容器重建。
+                    payload = {"mode": payload.get("mode")}
                 restart_robot = bool(payload.get("restart_robot"))
                 try:
                     # Lock is taken inside, around the settings write only: the
@@ -781,6 +1131,12 @@ class QueryHandler(BaseHTTPRequestHandler):
         ) as error:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
 
+    def _send_redirect(self, location: str) -> None:
+        self.send_response(HTTPStatus.FOUND)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _send_static(self, relative_path: str) -> None:
         file_path = resolve_static_file(relative_path)
         if file_path is None:
@@ -811,6 +1167,35 @@ class QueryHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_log_stream(
+        self, service: str, tail: int, last_event_id: str
+    ) -> None:
+        events = logs_api.stream_log_events(service, tail, last_event_id)
+        try:
+            first_event = next(events)
+        except LogServiceError as error:
+            self._send_json(
+                HTTPStatus(error.status_code),
+                {"error": str(error)},
+            )
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            for event in chain((first_event,), events):
+                frame = logs_api.encode_sse_event(event)
+                self.wfile.write(logs_api.encode_http_chunk(frame))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        finally:
+            events.close()
 
     def _send_bytes(
         self,

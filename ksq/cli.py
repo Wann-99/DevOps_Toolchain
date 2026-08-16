@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from ksq.constants import (
+    DEFAULT_CONFIG_PNP_DIR,
     DEFAULT_KNOWLEDGE,
     DEFAULT_PICK_STRATEGY,
     DEFAULT_SHELVES,
@@ -20,6 +21,7 @@ from ksq.constants import (
 )
 from ksq.dataset import build_dataset
 from ksq.package_io import save_package
+from ksq.state_reset import reset_state_if_version_changed
 from ksq.web import state
 from ksq.web.handlers import QueryHandler
 from ksq.web.loader import (
@@ -34,21 +36,56 @@ def serve(arguments: Optional[List[str]] = None) -> None:
     parser.add_argument("--host", default=HOST)
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("--knowledge", default=str(DEFAULT_KNOWLEDGE))
-    parser.add_argument("--shelves", default=str(DEFAULT_SHELVES))
-    parser.add_argument("--unavailable", default=str(DEFAULT_UNAVAILABLE))
-    parser.add_argument("--tool-mapping", default=str(DEFAULT_TOOL_MAPPING))
-    parser.add_argument("--pick-strategy", default=str(DEFAULT_PICK_STRATEGY))
+    # Use default=None for the four path arguments so we can distinguish
+    # "user passed --shelves" from "relied on the default".  The fallback
+    # to DEFAULT_* happens below; config.py may then override only those
+    # fields the user did NOT explicitly set.
+    parser.add_argument("--shelves", default=None)
+    parser.add_argument("--unavailable", default=None)
+    parser.add_argument("--tool-mapping", default=None)
+    parser.add_argument("--pick-strategy", default=None)
+    parser.add_argument(
+        "--config-pnp", default=str(DEFAULT_CONFIG_PNP_DIR)
+    )
     parsed = parser.parse_args(arguments)
     state.configured_knowledge = Path(parsed.knowledge).expanduser().resolve()
-    state.configured_shelves = Path(parsed.shelves).expanduser().resolve()
-    state.configured_unavailable = existing_optional_path(parsed.unavailable)
-    state.configured_tool_mapping = existing_optional_path(parsed.tool_mapping)
-    state.configured_pick_strategy = existing_optional_path(parsed.pick_strategy)
+    state.configured_config_pnp = Path(parsed.config_pnp).expanduser().resolve()
+    # Track which path args the user explicitly passed.
+    explicit: set[str] = set()
+    if parsed.shelves is not None:
+        explicit.add("shelves")
+    if parsed.unavailable is not None:
+        explicit.add("unavailable")
+    if parsed.tool_mapping is not None:
+        explicit.add("tool_mapping")
+    if parsed.pick_strategy is not None:
+        explicit.add("pick_strategy")
+    state._explicit_config_keys = frozenset(explicit)
+    # Apply defaults for arguments the user did not explicitly provide.
+    state.configured_shelves = Path(
+        parsed.shelves or str(DEFAULT_SHELVES)
+    ).expanduser().resolve()
+    state.configured_unavailable = existing_optional_path(
+        parsed.unavailable or str(DEFAULT_UNAVAILABLE)
+    )
+    state.configured_tool_mapping = existing_optional_path(
+        parsed.tool_mapping or str(DEFAULT_TOOL_MAPPING)
+    )
+    state.configured_pick_strategy = existing_optional_path(
+        parsed.pick_strategy or str(DEFAULT_PICK_STRATEGY)
+    )
+    # config.py overrides only fields the user did NOT explicitly pass.
+    state.reload_config_pnp_paths()
     print(f"默认 Knowledge 路径：{state.configured_knowledge}")
     print(f"默认 Shelves 路径：{state.configured_shelves}")
     print(f"默认不可处理列表：{state.configured_unavailable or '未提供'}")
     print(f"默认工具映射：{state.configured_tool_mapping or '未提供'}")
     print(f"默认闭环吸取列表：{state.configured_pick_strategy or '未提供'}")
+    # Reset state files when the application version changes (e.g. after
+    # a .bin update).  This runs before the HTTP server starts so there is
+    # no concurrent access to the state files.  Must not block startup.
+    reset_state_if_version_changed()
+
     if configured_paths_ready():
         with state.DATASET_LOCK:
             loaded = apply_configured_paths_reload()

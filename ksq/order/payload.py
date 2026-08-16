@@ -77,7 +77,9 @@ def build_create_task_body(
     config: Dict[str, object], raw_items: object
 ) -> Dict[str, object]:
     items = normalize_order_items(raw_items)
-    order_source = str(config.get("order_source") or "meituan").strip()
+    order_source = str(config.get("order_source") or "").strip()
+    if not order_source:
+        raise ValueError("请先选择客户。")
     store_id = str(config.get("store_id") or "").strip()
     if not store_id:
         raise ValueError("store_id 未配置。")

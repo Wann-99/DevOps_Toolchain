@@ -25,13 +25,16 @@ DEFAULT_SHELVES: Final[Path] = (
     APP_DIRECTORY.parent / "PNPApp_deploy/config_pnp/sku-shelves.csv"
 )
 DEFAULT_UNAVAILABLE: Final[Path] = (
-    APP_DIRECTORY.parent / "PNPApp_deploy/config_pnp/unavailabel_obj.json"
+    APP_DIRECTORY.parent / "PNPApp_deploy/config_pnp/unavailable_obj.json"
 )
 DEFAULT_TOOL_MAPPING: Final[Path] = (
     APP_DIRECTORY.parent / "PNPApp_deploy/config_pnp/obj_tool_mapping.json"
 )
 DEFAULT_PICK_STRATEGY: Final[Path] = (
     APP_DIRECTORY.parent / "PNPApp_deploy/config_pnp/pick_strategy_obj.json"
+)
+DEFAULT_CONFIG_PNP_DIR: Final[Path] = (
+    APP_DIRECTORY.parent / "PNPApp_deploy/config_pnp"
 )
 
 BASE_COLUMNS: Final[Tuple[str, ...]] = (
@@ -51,6 +54,7 @@ ORDER_CONFIG_PROD_FILE: Final[Path] = APP_DIRECTORY / "order_config.prod.json"
 TEST_ORDER_STATE_FILE: Final[Path] = APP_DIRECTORY / "test_order_state.json"
 DASHBOARD_SETTINGS_FILE: Final[Path] = APP_DIRECTORY / "dashboard_settings.json"
 DASHBOARD_ACTIVE_ORDER_FILE: Final[Path] = APP_DIRECTORY / "dashboard_active_order.json"
+USERS_FILE: Final[Path] = APP_DIRECTORY / "users.json"
 DEFAULT_ETM_BASE_URL: Final[str] = "http://127.0.0.1:12005"
 # Host-mounted path inside knowledge_shelf_query for robot keyboard env sync.
 ROBOT_KEYBOARD_ENV_FILE: Final[Path] = Path("/data/robot_keyboard.env")

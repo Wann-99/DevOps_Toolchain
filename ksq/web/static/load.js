@@ -32,6 +32,21 @@
   let activeMethod = "path";
   let missingSort = { key: "", dir: "" };
 
+  // 页面打开时的初始状态：任一加载方式成功后，其余面板恢复到该状态。
+  const PATH_INPUT_IDS = [
+    "knowledge-path",
+    "shelves-path",
+    "unavailable-path",
+    "tool-mapping-path",
+    "pick-strategy-path",
+  ];
+  const initialPathValues = {};
+  PATH_INPUT_IDS.forEach((id) => {
+    const input = document.getElementById(id);
+    if (input) initialPathValues[id] = input.value;
+  });
+  const filePickerPlaceholders = new WeakMap();
+
   const escapeHtml = (value) =>
     String(value)
       .replace(/&/g, "&amp;")
@@ -162,6 +177,37 @@
     };
   }
 
+  // 恢复面板到页面打开时的初始状态：清空结果卡片/缺少 knowledge 列表，
+  // 本机路径表单还原默认路径，包加载/导入清空已选文件。
+  function resetPanelToInitial(method) {
+    clearPanelResult(method);
+    if (method === "path") {
+      PATH_INPUT_IDS.forEach((id) => {
+        const input = document.getElementById(id);
+        if (input && Object.prototype.hasOwnProperty.call(initialPathValues, id)) {
+          input.value = initialPathValues[id];
+        }
+      });
+      return;
+    }
+    const panel = panelByMethod(method);
+    if (!panel) return;
+    panel.querySelectorAll("[data-file-pick]").forEach((picker) => {
+      const input = picker.querySelector("input");
+      const name = picker.querySelector("[data-file-name]");
+      if (input) input.value = "";
+      picker.classList.remove("has-file");
+      const placeholder = filePickerPlaceholders.get(picker);
+      if (name && placeholder) name.textContent = placeholder;
+    });
+  }
+
+  function resetOtherPanels(method) {
+    Object.keys(panelState).forEach((other) => {
+      if (other !== method) resetPanelToInitial(other);
+    });
+  }
+
   function renderProgress(method, label, percent, indeterminate) {
     const width = indeterminate
       ? ""
@@ -202,6 +248,7 @@
   }
 
   function applyLoad(method, data) {
+    resetOtherPanels(method);
     panelState[method] = {
       statusHtml: capabilityNotice(data) + (data.html || ""),
       showNext: true,
@@ -220,6 +267,7 @@
   }
 
   function applyImportResult(data) {
+    resetOtherPanels("import");
     const lines = (data.written || [])
       .map((item) => {
         let line =
@@ -286,6 +334,7 @@
     const input = picker.querySelector("input");
     const name = picker.querySelector("[data-file-name]");
     const empty = name.textContent;
+    filePickerPlaceholders.set(picker, empty);
     input.addEventListener("change", () => {
       const files = Array.from(input.files || []);
       if (!files.length) {
@@ -418,6 +467,46 @@
           pick_strategy: document.getElementById("pick-strategy-path").value.trim(),
         })
       );
+    } catch (error) {
+      panelState.path.statusHtml =
+        '<p class="error">' + escapeHtml(error.message) + "</p>";
+      panelState.path.showNext = false;
+      renderActivePanel();
+    }
+  });
+
+  function setIfExists(id, value) {
+    if (value && typeof value === "string" && value.trim()) {
+      var el = document.getElementById(id);
+      if (el) el.value = value;
+    }
+  }
+
+  document.getElementById("auto-load-btn").addEventListener("click", async () => {
+    clearPanelResult("path");
+    renderProgress("path", "一键加载中...", 0, true);
+    try {
+      var response = await fetch("/load-auto", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      var data = await response.json();
+      if (!response.ok) {
+        panelState.path.statusHtml =
+          '<p class="error">' + escapeHtml(data.error || "请求失败") + "</p>";
+        panelState.path.showNext = false;
+        renderActivePanel();
+        return;
+      }
+      if (data.paths) {
+        setIfExists("knowledge-path", data.paths.knowledge);
+        setIfExists("shelves-path", data.paths.shelves);
+        setIfExists("unavailable-path", data.paths.unavailable);
+        setIfExists("tool-mapping-path", data.paths.tool_mapping);
+        setIfExists("pick-strategy-path", data.paths.pick_strategy);
+      }
+      applyLoad("path", data);
     } catch (error) {
       panelState.path.statusHtml =
         '<p class="error">' + escapeHtml(error.message) + "</p>";

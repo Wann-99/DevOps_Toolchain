@@ -1,17 +1,36 @@
 (function (global) {
   let pending = [];
   let ordered = [];
-  let checkedPending = new Set();
-  let checkedOrdered = new Set();
+  // 勾选集合只允许原地修改（clear/delete/add），不得重新赋值：
+  // bindTable 的事件闭包持有其引用，重新赋值会导致闭包操作失联的旧对象
+  const checkedPending = new Set();
+  const checkedOrdered = new Set();
   let pendingQuery = "";
   let orderedQuery = "";
   let pendingSort = { key: "", dir: "" };
   let orderedSort = { key: "", dir: "" };
+  // 动态列与组合模式（由服务端 state 下发，导入 CSV 时跟随文件表头）
+  let columns = [];
+  let groupMode = "raw";
+  let groupField = "";
+  let columnsSignature = "";
   let busy = false;
   let active = false;
   let pollId = 0;
   const POLL_MS = 2000;
   let lastStateFingerprint = "";
+  let importDialogContext = null;
+
+  const FALLBACK_COLUMNS = [
+    { key: "out_item_id", label: "商品编码" },
+    { key: "location_display", label: "库位" },
+    { key: "sku_code", label: "69码" },
+    { key: "name", label: "药品名称" },
+    { key: "是否闭环抓取", label: "是否闭环抓取" },
+    { key: "货架属性", label: "货架属性" },
+    { key: "推荐工具", label: "推荐工具" },
+    { key: "包装类型", label: "包装类型" },
+  ];
 
   function dashboardMode() {
     if (global.KsqApp && global.KsqApp.getDashboardMode) {
@@ -30,7 +49,11 @@
     return [
       pendingKeys,
       orderedKeys,
+      JSON.stringify(data.order_batches || []),
       JSON.stringify(data.config || {}),
+      JSON.stringify(data.columns || []),
+      String(data.group_mode || "raw"),
+      String(data.group_field || ""),
     ].join("|");
   }
 
@@ -41,8 +64,27 @@
   function setStatus(message, isError) {
     const node = el("test-order-status");
     if (!node) return;
-    node.textContent = message || "";
     node.classList.toggle("error", Boolean(isError));
+    global.KsqStatus.flash(node, message, isError);
+  }
+
+  async function reportOrderApiError(response, data, fallback) {
+    const message =
+      global.KsqDialog && global.KsqDialog.errorSummary
+        ? global.KsqDialog.errorSummary(data, fallback)
+        : String((data && data.error) || fallback || "下单失败");
+    setStatus(message, true);
+    if (global.KsqDialog && global.KsqDialog.apiError) {
+      await global.KsqDialog.apiError({
+        title: "测试下单失败",
+        payload: data,
+        httpStatus: response.status,
+        fallback: fallback,
+      });
+    }
+    const error = new Error(message);
+    error.orderApiReported = true;
+    return error;
   }
 
   function escapeHtml(value) {
@@ -174,10 +216,12 @@
       .map((key) => key + " " + packaging[key])
       .join(" · ");
     el("test-order-summary").textContent =
-      "未下单 " +
+      "待下单 SKU " +
       (data.pending_count || 0) +
-      " · 已下单 " +
+      " · 已下单 SKU " +
       (data.ordered_count || 0) +
+      " · 订单量 " +
+      (data.order_count || 0) +
       " · 候选 " +
       (data.candidate_count || 0) +
       " · 货架 " +
@@ -204,20 +248,30 @@
     }
   }
 
+  function cellValue(item, key) {
+    if (!item) return "";
+    const display = item.display;
+    if (display && display[key] != null) return String(display[key]);
+    const value = item[key];
+    return value == null ? "" : String(value);
+  }
+
   function rowSearchText(item) {
     if (!item) return "";
-    return [
+    const parts = columns.map((col) => cellValue(item, col.key));
+    parts.push(
       item.out_item_id,
       item.location_code,
       item.location_display,
       item.sku_code,
       item.name,
-      item["是否闭环抓取"],
-      item["货架属性"],
-      item["推荐工具"],
-      item["包装类型"],
-      item.key,
-    ]
+      item.group_id,
+      item.ordered_at,
+      item.order_no,
+      item.task_id,
+      item.key
+    );
+    return parts
       .map((part) => String(part == null ? "" : part))
       .join(" ")
       .toLowerCase();
@@ -238,11 +292,7 @@
   }
 
   function sortValue(item, key) {
-    if (!item) return "";
-    if (key === "location_display") {
-      return String(item.location_display || item.location_code || "");
-    }
-    return String(item[key] == null ? "" : item[key]);
+    return cellValue(item, key);
   }
 
   function sortRows(rows, sortState) {
@@ -261,11 +311,16 @@
   }
 
   function visiblePending() {
-    return sortRows(filterRows(pending, pendingQuery), pendingSort);
+    const rows = filterRows(pending, pendingQuery);
+    // 组合模式下保持分组顺序，不做列排序
+    if (groupMode === "group") return rows;
+    return sortRows(rows, pendingSort);
   }
 
   function visibleOrdered() {
-    return sortRows(filterRows(ordered, orderedQuery), orderedSort);
+    const rows = filterRows(ordered, orderedQuery);
+    if (groupMode === "group") return rows;
+    return sortRows(rows, orderedSort);
   }
 
   function syncSortHeaders(tableName, sortState) {
@@ -291,62 +346,307 @@
     return { key: "", dir: "" };
   }
 
+  function formatOrderedAt(value) {
+    if (!value) return "历史记录";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString("zh-CN", { hour12: false });
+  }
+
+  function tableColspan(prefix) {
+    // 选 + 动态列；已下单另有 下单时间/订单号，原文件模式再另加 操作 列
+    if (prefix === "ordered") {
+      return columns.length + (groupMode === "group" ? 2 : 3);
+    }
+    return columns.length + 1;
+  }
+
+  function renderTableHead(tableName, hasData) {
+    const table = document.querySelector(
+      '#view-test-order table[data-test-order-table="' + tableName + '"]'
+    );
+    if (!table) return;
+    const thead = table.querySelector("thead");
+    if (!thead) return;
+    // 列表为空时不显示表头；表头始终跟随当前导入/生成的数据列
+    if (!hasData) {
+      thead.innerHTML = "";
+      return;
+    }
+    const sortable = groupMode !== "group";
+    let html = '<th style="min-width:56px">选</th>';
+    if (tableName === "ordered") {
+      html += "<th>下单时间 / 订单号</th>";
+    }
+    html += columns
+      .map((col) => {
+        const label = escapeHtml(col.label || col.key);
+        if (!sortable) return "<th>" + label + "</th>";
+        return (
+          '<th><button type="button" class="th-sort" data-sort-key="' +
+          escapeHtml(col.key) +
+          '">' +
+          label +
+          '<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>'
+        );
+      })
+      .join("");
+    if (tableName === "ordered" && groupMode !== "group") {
+      html += '<th style="min-width:72px">操作</th>';
+    }
+    thead.innerHTML = "<tr>" + html + "</tr>";
+  }
+
+  function groupKey(item) {
+    return String((item && item.group_id) || "");
+  }
+
+  function buildGroups(rows) {
+    const order = [];
+    const byId = new Map();
+    rows.forEach((item) => {
+      const gid = groupKey(item);
+      if (!byId.has(gid)) {
+        byId.set(gid, []);
+        order.push(gid);
+      }
+      byId.get(gid).push(item);
+    });
+    return order.map((gid) => ({ id: gid, items: byId.get(gid) }));
+  }
+
+  // 与服务端 sku_code 别名一致，用于定位组合行里的 69码 列
+  const SKU_ALIASES = new Set([
+    "skucode",
+    "sku",
+    "69码",
+    "商品条码",
+    "条形码",
+    "barcode",
+  ]);
+
+  function halfwidth(text) {
+    return String(text || "").replace(/[\uFF01-\uFF5E\u3000]/g, (char) =>
+      char === "\u3000" ? " " : String.fromCharCode(char.charCodeAt(0) - 0xfee0)
+    );
+  }
+
+  // 与服务端 _normalize_import_identifier 一致，用于把成员 69码 匹配回其所在列
+  function normalizeIdentifier(value) {
+    let text = halfwidth(value).trim();
+    if (/^\d+\.0$/.test(text)) text = text.slice(0, -2);
+    return text;
+  }
+
+  function isSkuColumn(col) {
+    return SKU_ALIASES.has(normalizeHeader(halfwidth(col.label || col.key)));
+  }
+
+  // 组合行的一个单元格：普通列去重取值逐行显示；69码 列给组内每个成员配勾选框
+  function renderGroupCell(col, group, checkedSet, prefix) {
+    const values = [];
+    group.items.forEach((item) => {
+      if (!item) return;
+      const value = cellValue(item, col.key);
+      if (values.indexOf(value) < 0) values.push(value);
+    });
+    if (!isSkuColumn(col)) {
+      const lines = values.filter((value) => value !== "");
+      return (
+        '<td class="wrap">' +
+        (lines.length
+          ? lines.map((value) => "<div>" + escapeHtml(value) + "</div>").join("")
+          : "-") +
+        "</td>"
+      );
+    }
+    const used = new Set();
+    const lines = [];
+    values.forEach((value) => {
+      if (!value) return;
+      const member = group.items.find(
+        (item) =>
+          item &&
+          item.key &&
+          !used.has(item.key) &&
+          normalizeIdentifier(item.sku_code) === normalizeIdentifier(value)
+      );
+      if (member) {
+        used.add(member.key);
+        const checked = checkedSet.has(member.key) ? " checked" : "";
+        lines.push(
+          '<div class="test-order-group-sku"><label class="loc-check">' +
+            '<input type="checkbox" data-role="' +
+            prefix +
+            '-check" data-key="' +
+            escapeHtml(member.key) +
+            '"' +
+            checked +
+            "></label><span>" +
+            escapeHtml(value) +
+            "</span></div>"
+        );
+      } else {
+        // 未解析进列表的取值（候选中不存在等），纯文本展示不可勾选
+        lines.push(
+          '<div class="test-order-group-sku is-plain"><span>' +
+            escapeHtml(value) +
+            "</span></div>"
+        );
+      }
+    });
+    return '<td class="wrap">' + (lines.length ? lines.join("") : "-") + "</td>";
+  }
+
+  // 已下单组合行的 下单时间/订单号 单元格（同组多次下单时逐行显示）
+  function renderGroupMetaCell(group) {
+    const seen = [];
+    group.items.forEach((item) => {
+      if (!item) return;
+      const time = formatOrderedAt(item.ordered_at);
+      const orderNo = String(item.order_no || "");
+      if (seen.some((entry) => entry.time === time && entry.no === orderNo)) {
+        return;
+      }
+      seen.push({ time: time, no: orderNo });
+    });
+    return (
+      '<td class="wrap">' +
+      seen
+        .map(
+          (entry) =>
+            "<div><strong>" +
+            escapeHtml(entry.time) +
+            "</strong>" +
+            (entry.no
+              ? '<br><span class="meta compact mono">' +
+                escapeHtml(entry.no) +
+                "</span>"
+              : "") +
+            "</div>"
+        )
+        .join("") +
+      "</td>"
+    );
+  }
+
+  // 组合模式：一组只占一行，行首组总勾选框（全选/半选/空三态），
+  // 组内每个 SKU 前各有独立勾选框，可单 SKU 或整组下单
+  function renderGroupRow(group, checkedSet, prefix) {
+    const keys = group.items.map((item) => item && item.key).filter(Boolean);
+    const allChecked = keys.length > 0 && keys.every((key) => checkedSet.has(key));
+    let html =
+      '<tr class="test-order-group-row">' +
+      '<td><label class="loc-check test-order-group-check">' +
+      '<input type="checkbox" data-role="' +
+      prefix +
+      '-group-check" data-group="' +
+      escapeHtml(group.id) +
+      '"' +
+      (allChecked ? " checked" : "") +
+      "></label></td>";
+    if (prefix === "ordered") html += renderGroupMetaCell(group);
+    html += columns
+      .map((col) => renderGroupCell(col, group, checkedSet, prefix))
+      .join("");
+    return html + "</tr>";
+  }
+
+  function renderItemRow(item, checkedSet, prefix) {
+    const key = item.key;
+    const checked = checkedSet.has(key) ? " checked" : "";
+    let html =
+      '<tr data-key="' +
+      escapeHtml(key) +
+      '">' +
+      '<td><label class="loc-check"><input type="checkbox" data-role="' +
+      prefix +
+      '-check" data-key="' +
+      escapeHtml(key) +
+      '"' +
+      checked +
+      "></label></td>";
+    if (prefix === "ordered") {
+      html +=
+        '<td class="wrap"><strong>' +
+        escapeHtml(formatOrderedAt(item.ordered_at)) +
+        "</strong>" +
+        (item.order_no
+          ? '<br><span class="meta compact mono">' +
+            escapeHtml(item.order_no) +
+            "</span>"
+          : "") +
+        "</td>";
+    }
+    html += columns
+      .map((col) => {
+        const value = cellValue(item, col.key);
+        return '<td class="wrap">' + escapeHtml(value || "-") + "</td>";
+      })
+      .join("");
+    if (prefix === "ordered" && groupMode !== "group") {
+      html +=
+        '<td><button type="button" class="secondary test-order-row-order" data-role="ordered-order-one" data-key="' +
+        escapeHtml(key) +
+        '">下单</button></td>';
+    }
+    return html + "</tr>";
+  }
+
   function renderRows(bodyId, rows, checkedSet, prefix) {
     const body = el(bodyId);
     if (!body) return;
     if (!rows.length) {
       body.innerHTML =
-        '<tr><td colspan="9" class="wrap">无匹配结果</td></tr>';
+        '<tr><td colspan="' +
+        tableColspan(prefix) +
+        '" class="wrap">无匹配结果</td></tr>';
       window.requestAnimationFrame(syncStickyTables);
       return;
     }
-    body.innerHTML = rows
-      .map((item) => {
-        const key = item.key;
-        const checked = checkedSet.has(key) ? " checked" : "";
-        return (
-          '<tr data-key="' +
-          escapeHtml(key) +
-          '">' +
-          '<td><label class="loc-check"><input type="checkbox" data-role="' +
-          prefix +
-          '-check" data-key="' +
-          escapeHtml(key) +
-          '"' +
-          checked +
-          "></label></td>" +
-          "<td>" +
-          escapeHtml(item.out_item_id || "-") +
-          "</td>" +
-          "<td>" +
-          escapeHtml(item.location_display || item.location_code || "-") +
-          "</td>" +
-          "<td>" +
-          escapeHtml(item.sku_code || "-") +
-          "</td>" +
-          '<td class="wrap">' +
-          escapeHtml(item.name || "-") +
-          "</td>" +
-          "<td>" +
-          escapeHtml(item["是否闭环抓取"] || "-") +
-          "</td>" +
-          "<td>" +
-          escapeHtml(item["货架属性"] || "-") +
-          "</td>" +
-          "<td>" +
-          escapeHtml(item["推荐工具"] || "-") +
-          "</td>" +
-          '<td class="wrap">' +
-          escapeHtml(item["包装类型"] || "-") +
-          "</td>" +
-          "</tr>"
-        );
-      })
-      .join("");
+    if (groupMode === "group") {
+      body.innerHTML = buildGroups(rows)
+        .map((group) => renderGroupRow(group, checkedSet, prefix))
+        .join("");
+    } else {
+      body.innerHTML = rows
+        .map((item) => renderItemRow(item, checkedSet, prefix))
+        .join("");
+    }
+    syncGroupChecks(body, rows, checkedSet, prefix);
     window.requestAnimationFrame(syncStickyTables);
   }
 
+  // 组勾选框的半选状态（部分成员被勾时显示横线）
+  function syncGroupChecks(body, rows, checkedSet, prefix) {
+    if (groupMode !== "group") return;
+    const memberCount = new Map();
+    const checkedCount = new Map();
+    rows.forEach((item) => {
+      if (!item || !item.key) return;
+      const gid = groupKey(item);
+      memberCount.set(gid, (memberCount.get(gid) || 0) + 1);
+      if (checkedSet.has(item.key)) {
+        checkedCount.set(gid, (checkedCount.get(gid) || 0) + 1);
+      }
+    });
+    body
+      .querySelectorAll(
+        'input[type="checkbox"][data-role="' + prefix + '-group-check"]'
+      )
+      .forEach((input) => {
+        if (!(input instanceof HTMLInputElement)) return;
+        const gid = String(input.getAttribute("data-group") || "");
+        const checked = checkedCount.get(gid) || 0;
+        const total = memberCount.get(gid) || 0;
+        input.indeterminate = checked > 0 && checked < total;
+        input.checked = total > 0 && checked === total;
+      });
+  }
+
   function renderTables() {
+    renderTableHead("pending", pending.length > 0);
+    renderTableHead("ordered", ordered.length > 0);
     renderRows(
       "test-order-pending-body",
       visiblePending(),
@@ -364,17 +664,47 @@
     syncSelectAllButtons();
   }
 
+  function normalizeColumns(raw) {
+    if (!Array.isArray(raw)) return FALLBACK_COLUMNS.slice();
+    const result = raw
+      .filter((entry) => entry && typeof entry === "object")
+      .map((entry) => ({
+        key: String(entry.key || ""),
+        label: String(entry.label || entry.key || ""),
+      }))
+      .filter((entry) => entry.key);
+    return result.length ? result : FALLBACK_COLUMNS.slice();
+  }
+
+  // 原地剔除已不存在的 key（保持 Set 对象引用不变，事件闭包才能同步）
+  function retainValidKeys(checkedSet, validKeys) {
+    Array.from(checkedSet).forEach((key) => {
+      if (!validKeys.has(key)) checkedSet.delete(key);
+    });
+  }
+
   function applyState(data) {
     pending = Array.isArray(data.pending) ? data.pending : [];
     ordered = Array.isArray(data.ordered) ? data.ordered : [];
+    const nextSignature =
+      JSON.stringify(data.columns || []) +
+      "|" +
+      String(data.group_mode || "raw") +
+      "|" +
+      String(data.group_field || "");
+    if (nextSignature !== columnsSignature) {
+      // 列方案变化（重新导入/生成）后排序状态失效
+      columnsSignature = nextSignature;
+      pendingSort = { key: "", dir: "" };
+      orderedSort = { key: "", dir: "" };
+    }
+    columns = normalizeColumns(data.columns);
+    groupMode = data.group_mode === "group" ? "group" : "raw";
+    groupField = String(data.group_field || "");
     const pendingKeys = new Set(pending.map((item) => item.key));
     const orderedKeys = new Set(ordered.map((item) => item.key));
-    checkedPending = new Set(
-      Array.from(checkedPending).filter((key) => pendingKeys.has(key))
-    );
-    checkedOrdered = new Set(
-      Array.from(checkedOrdered).filter((key) => orderedKeys.has(key))
-    );
+    retainValidKeys(checkedPending, pendingKeys);
+    retainValidKeys(checkedOrdered, orderedKeys);
     fillPackagingOptions(
       data.known_packaging,
       data.config && data.config.selected_packaging
@@ -388,7 +718,7 @@
   async function clearList(which) {
     if (busy) return;
     busy = true;
-    setStatus(which === "ordered" ? "清空已下单..." : "清空未下单...");
+    setStatus(which === "ordered" ? "清空已下单 SKU..." : "清空待下单 SKU...");
     try {
       const response = await fetch("/api/test-order/clear", {
         method: "POST",
@@ -398,14 +728,14 @@
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "清空失败");
       if (which === "pending") {
-        checkedPending = new Set();
+        checkedPending.clear();
         pendingSort = { key: "", dir: "" };
       } else {
-        checkedOrdered = new Set();
+        checkedOrdered.clear();
         orderedSort = { key: "", dir: "" };
       }
       applyState(data);
-      setStatus(which === "ordered" ? "已清空已下单列表" : "已清空未下单列表");
+      setStatus(which === "ordered" ? "已清空已下单 SKU" : "已清空待下单 SKU");
     } catch (error) {
       setStatus(error.message || String(error), true);
     } finally {
@@ -433,9 +763,9 @@
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "生成失败");
-      checkedPending = new Set();
+      checkedPending.clear();
       applyState(data);
-      let message = "已生成未下单 " + (data.pending_count || 0) + " 条";
+      let message = "已生成待下单 SKU " + (data.pending_count || 0) + " 条";
       if (data.shortfall) message += "（少于配置数量 " + data.shortfall + "）";
       setStatus(message);
     } catch (error) {
@@ -447,7 +777,7 @@
 
   function exportCsv() {
     if (!pending.length) {
-      setStatus("未下单为空，请先生成", true);
+      setStatus("待下单 SKU 为空，请先生成", true);
       return;
     }
     const link = document.createElement("a");
@@ -456,12 +786,12 @@
     document.body.appendChild(link);
     link.click();
     link.remove();
-    setStatus("开始导出未下单 CSV");
+    setStatus("开始导出待下单 SKU CSV");
   }
 
   function exportOrderedCsv() {
     if (!ordered.length) {
-      setStatus("已下单为空", true);
+      setStatus("已下单 SKU 为空", true);
       return;
     }
     const link = document.createElement("a");
@@ -470,31 +800,205 @@
     document.body.appendChild(link);
     link.click();
     link.remove();
-    setStatus("开始导出已下单 CSV");
+    setStatus("开始导出已下单 SKU CSV");
   }
 
-  async function importCsvFile(file) {
-    if (busy) return;
-    if (!file) return;
+  function parseCsvHeaderLine(text) {
+    // 取首行非空行，按引号感知的 CSV 规则拆表头
+    const source = String(text || "").replace(/^\uFEFF/, "");
+    const lines = source.split(/\r\n|\r|\n/);
+    let line = "";
+    for (let index = 0; index < lines.length; index += 1) {
+      if (lines[index].trim()) {
+        line = lines[index];
+        break;
+      }
+    }
+    if (!line) return [];
+    const cells = [];
+    let current = "";
+    let inQuotes = false;
+    for (let index = 0; index < line.length; index += 1) {
+      const char = line[index];
+      if (inQuotes) {
+        if (char === '"') {
+          if (line[index + 1] === '"') {
+            current += '"';
+            index += 1;
+          } else {
+            inQuotes = false;
+          }
+        } else {
+          current += char;
+        }
+      } else if (char === '"') {
+        inQuotes = true;
+      } else if (char === "," || char === "\uFF0C") {
+        // 引号外的全角逗号也视作分隔符（与服务端规则一致）
+        cells.push(current);
+        current = "";
+      } else {
+        current += char;
+      }
+    }
+    cells.push(current);
+    return cells.map((cell) => cell.trim());
+  }
+
+  // 与服务端 _IMPORT_FIELD_ALIASES 对应的识别字段，用于猜测组合字段
+  const IDENTIFIER_ALIASES = new Set([
+    "outitemid",
+    "itemid",
+    "商品编码",
+    "商品id",
+    "货品编码",
+    "locationcode",
+    "库位",
+    "库位编码",
+    "货位",
+    "货位编码",
+    "skucode",
+    "sku",
+    "69码",
+    "商品条码",
+    "条形码",
+    "barcode",
+  ]);
+
+  function normalizeHeader(text) {
+    return String(text || "")
+      .toLowerCase()
+      .replace(/[\s_\-]+/g, "");
+  }
+
+  function guessGroupField(headers) {
+    const nonIdentifier = headers.find(
+      (header) => header && !IDENTIFIER_ALIASES.has(normalizeHeader(header))
+    );
+    return nonIdentifier || headers[0] || "";
+  }
+
+  function importMode() {
+    const checked = document.querySelector(
+      '#test-order-import-dialog input[name="test-order-import-mode"]:checked'
+    );
+    return checked && checked.value === "group" ? "group" : "raw";
+  }
+
+  function syncImportDialog() {
+    const wrap = el("test-order-group-field-wrap");
+    if (wrap) wrap.hidden = importMode() !== "group";
+  }
+
+  function closeImportDialog() {
+    const dialog = el("test-order-import-dialog");
+    if (dialog) dialog.hidden = true;
+    importDialogContext = null;
+  }
+
+  function openImportDialog(fileName, csvText, headers) {
+    const dialog = el("test-order-import-dialog");
+    const select = el("test-order-group-field");
+    if (!dialog || !select) return;
+    importDialogContext = { csvText: csvText };
+    const nameNode = el("test-order-import-file-name");
+    if (nameNode) nameNode.textContent = "文件：" + fileName;
+    select.innerHTML = headers
+      .map(
+        (header) =>
+          '<option value="' + escapeHtml(header) + '">' + escapeHtml(header) + "</option>"
+      )
+      .join("");
+    select.value = guessGroupField(headers);
+    const rawRadio = document.querySelector(
+      '#test-order-import-dialog input[name="test-order-import-mode"][value="raw"]'
+    );
+    if (rawRadio) rawRadio.checked = true;
+    syncImportDialog();
+    dialog.hidden = false;
+  }
+
+  // Excel 中文环境导出的 CSV 常见为 GBK 编码，需自动识别避免表头乱码
+  async function readCsvFileText(file) {
+    const buffer = await file.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    if (
+      bytes.length >= 3 &&
+      bytes[0] === 0xef &&
+      bytes[1] === 0xbb &&
+      bytes[2] === 0xbf
+    ) {
+      return new TextDecoder("utf-8").decode(buffer);
+    }
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+    } catch (error) {
+      try {
+        return new TextDecoder("gbk").decode(buffer);
+      } catch (gbkError) {
+        return new TextDecoder("utf-8").decode(buffer);
+      }
+    }
+  }
+
+  async function onImportFileChosen(file) {
+    if (busy || !file) return;
+    let text = "";
+    try {
+      text = await readCsvFileText(file);
+    } catch (error) {
+      setStatus("读取文件失败：" + (error.message || String(error)), true);
+      return;
+    }
+    const headers = parseCsvHeaderLine(text);
+    if (!headers.length) {
+      setStatus("CSV 缺少表头，无法导入", true);
+      return;
+    }
+    openImportDialog(file.name || "导入文件", text, headers);
+  }
+
+  async function importCsv() {
+    if (busy || !importDialogContext) return;
+    const mode = importMode();
+    const select = el("test-order-group-field");
+    const groupField =
+      mode === "group" && select ? String(select.value || "").trim() : "";
+    if (mode === "group" && !groupField) {
+      setStatus("组合模式请选择组合字段", true);
+      return;
+    }
+    const csvText = importDialogContext.csvText;
     busy = true;
+    closeImportDialog();
     setStatus("正在解析导入 CSV...");
     try {
-      const text = await file.text();
       const response = await fetch("/api/test-order/import", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ csv: text }),
+        body: JSON.stringify({
+          csv: csvText,
+          mode: mode,
+          group_field: groupField,
+        }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "导入失败");
-      checkedPending = new Set();
-      checkedOrdered = new Set();
+      checkedPending.clear();
+      checkedOrdered.clear();
       pendingSort = { key: "", dir: "" };
       orderedSort = { key: "", dir: "" };
       applyState(data);
-      let message = "已导入未下单 " + (data.imported_count || 0) + " 条（已清空上次列表）";
+      let message =
+        "已导入待下单 SKU " +
+        (data.imported_count || 0) +
+        " 条（已清空上次列表）" +
+        (mode === "group" ? " · 组合字段 " + groupField : "");
       if (data.parse_error_count) {
-        message += " · 解析失败 " + data.parse_error_count;
+        message += " · 跳过或提示 " + data.parse_error_count + " 条";
+        if (Array.isArray(data.parse_errors) && data.parse_errors[0]) {
+          message += "（" + data.parse_errors[0] + "）";
+        }
       }
       setStatus(message);
     } catch (error) {
@@ -515,7 +1019,60 @@
       }
     );
     const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "获取 Token 失败");
+    if (!response.ok) {
+      throw await reportOrderApiError(response, data, "获取 Token 失败");
+    }
+  }
+
+  function toOrderItems(rows) {
+    return rows
+      .filter(Boolean)
+      .map((item) => ({
+        item_id: item.out_item_id || item.sku_code,
+        location_code: item.location_code,
+        barcode: item.sku_code,
+        name: item.name,
+        quantity: 1,
+      }))
+      .filter((item) => item.item_id && item.location_code);
+  }
+
+  // 创建订单并返回响应数据（失败时已统一弹窗/状态提示）
+  async function createOrder(items) {
+    await ensureToken();
+    const response = await fetch("/api/order/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items: items, mode: dashboardMode() }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw await reportOrderApiError(response, data, "下单失败");
+    }
+    return data;
+  }
+
+  function openDashboardAfterOrder(data, items) {
+    if (global.KsqDashboard && global.KsqDashboard.openAfterOrder) {
+      const requestBody = data.request_body || {};
+      global.KsqDashboard.openAfterOrder(
+        data.order_session || {
+          task_id: data.task_id || "",
+          order_no: requestBody.order_no || "",
+          platform_order_no: requestBody.platform_order_no || "",
+          items: items.map((item) => ({
+            item_id: item.item_id,
+            barcode: item.barcode || item.item_id,
+            name: item.name || "",
+            location_code: item.location_code,
+            quantity: item.quantity || 1,
+          })),
+          source: "test-order",
+        }
+      );
+    } else if (global.KsqShell && global.KsqShell.showView) {
+      global.KsqShell.showView("dashboard");
+    }
   }
 
   async function submitChecked() {
@@ -528,8 +1085,18 @@
     );
     const keys = Array.from(checkedPending);
     if (!keys.length) {
+      // 待下单未勾选时，若已下单列表有勾选则走再次下单（不改动列表内容）
+      syncCheckedFromDom(
+        "test-order-ordered-body",
+        checkedOrdered,
+        "ordered-check"
+      );
+      if (checkedOrdered.size) {
+        await reorderKeys(Array.from(checkedOrdered));
+        return;
+      }
       setStatus(
-        "请先勾选「未下单」列表中的药品（可点全选），不要勾「已下单」列表",
+        "请先勾选「待下单 SKU」列表中的药品（可点全选或整组勾选）；再次下单请勾选「已下单 SKU」列表",
         true
       );
       return;
@@ -537,17 +1104,7 @@
     const pendingByKey = new Map(
       pending.filter((item) => item && item.key).map((item) => [item.key, item])
     );
-    const items = keys
-      .map((key) => pendingByKey.get(key))
-      .filter(Boolean)
-      .map((item) => ({
-        item_id: item.out_item_id || item.sku_code,
-        location_code: item.location_code,
-        barcode: item.sku_code,
-        name: item.name,
-        quantity: 1,
-      }))
-      .filter((item) => item.item_id && item.location_code);
+    const items = toOrderItems(keys.map((key) => pendingByKey.get(key)));
     if (!items.length) {
       setStatus(
         "勾选的药品缺少商品编码或库位，无法下单（请确认 CSV 含 out_item_id/sku_code 与 location_code）",
@@ -558,78 +1115,76 @@
     busy = true;
     setStatus("下单中（" + items.length + " 件）...");
     try {
-      await ensureToken();
-      const response = await fetch("/api/order/create", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ items: items, mode: dashboardMode() }),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "下单失败");
+      const data = await createOrder(items);
       const markResponse = await fetch("/api/test-order/mark-ordered", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ keys: keys }),
+        body: JSON.stringify({
+          keys: keys,
+          task_id: data.task_id || "",
+          order_no: (data.request_body && data.request_body.order_no) || "",
+        }),
       });
       const markData = await markResponse.json();
-      if (!markResponse.ok) throw new Error(markData.error || "移动到已下单失败");
-      checkedPending = new Set();
+      if (!markResponse.ok) throw new Error(markData.error || "移动到已下单 SKU 失败");
+      checkedPending.clear();
       applyState(markData);
-      setStatus("下单成功，已移入已下单 · task " + (data.task_id || "-"));
-      if (global.KsqDashboard && global.KsqDashboard.openAfterOrder) {
-        const requestBody = data.request_body || {};
-        global.KsqDashboard.openAfterOrder(
-          data.order_session || {
-            task_id: data.task_id || "",
-            order_no: requestBody.order_no || "",
-            platform_order_no: requestBody.platform_order_no || "",
-            items: items.map((item) => ({
-              item_id: item.item_id,
-              barcode: item.barcode || item.item_id,
-              name: item.name || "",
-              location_code: item.location_code,
-              quantity: item.quantity || 1,
-            })),
-            source: "test-order",
-          }
-        );
-      } else if (global.KsqShell && global.KsqShell.showView) {
-        global.KsqShell.showView("dashboard");
-      }
+      const queued = !!(
+        data.order_session && Number(data.order_session.queue_position) > 0
+      );
+      setStatus(
+        (queued ? "下一单已进入等待队列：" : "下单成功：") +
+          "本订单 " +
+          keys.length +
+          " 个 SKU · 累计订单 " +
+          (markData.order_count || 0) +
+          " · task " +
+          (data.task_id || "-")
+      );
+      openDashboardAfterOrder(data, items);
     } catch (error) {
-      setStatus(error.message || String(error), true);
+      if (!error.orderApiReported) {
+        setStatus(error.message || String(error), true);
+      }
     } finally {
       busy = false;
     }
   }
 
-  async function restoreChecked() {
+  // 已下单列表再次下单：只创建新订单，不改动两个列表的内容
+  async function reorderKeys(keys) {
     if (busy) return;
-    syncCheckedFromDom(
-      "test-order-ordered-body",
-      checkedOrdered,
-      "ordered-check"
-    );
-    const keys = Array.from(checkedOrdered);
     if (!keys.length) {
-      setStatus("请先勾选「已下单」列表中的药品", true);
+      setStatus("请先勾选「已下单 SKU」列表中的药品或组合", true);
+      return;
+    }
+    const orderedByKey = new Map(
+      ordered.filter((item) => item && item.key).map((item) => [item.key, item])
+    );
+    const items = toOrderItems(keys.map((key) => orderedByKey.get(key)));
+    if (!items.length) {
+      setStatus("所选药品缺少商品编码或库位，无法下单", true);
       return;
     }
     busy = true;
-    setStatus("恢复到未下单...");
+    setStatus("再次下单中（" + items.length + " 件）...");
     try {
-      const response = await fetch("/api/test-order/restore", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ keys: keys }),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "恢复失败");
-      checkedOrdered = new Set();
-      applyState(data);
-      setStatus("已恢复 " + keys.length + " 条到未下单");
+      const data = await createOrder(items);
+      const queued = !!(
+        data.order_session && Number(data.order_session.queue_position) > 0
+      );
+      setStatus(
+        (queued ? "下一单已进入等待队列：" : "再次下单成功：") +
+          "本订单 " +
+          items.length +
+          " 个 SKU · task " +
+          (data.task_id || "-")
+      );
+      openDashboardAfterOrder(data, items);
     } catch (error) {
-      setStatus(error.message || String(error), true);
+      if (!error.orderApiReported) {
+        setStatus(error.message || String(error), true);
+      }
     } finally {
       busy = false;
     }
@@ -652,18 +1207,43 @@
       });
   }
 
+  function toggleGroup(checkedSet, prefix, groupId, checked) {
+    const rows = prefix === "pending" ? visiblePending() : visibleOrdered();
+    rows.forEach((item) => {
+      if (!item || !item.key) return;
+      if (groupKey(item) !== groupId) return;
+      if (checked) checkedSet.add(item.key);
+      else checkedSet.delete(item.key);
+    });
+  }
+
   function bindTable(bodyId, checkedSet, roleName) {
+    const prefix = roleName === "ordered-check" ? "ordered" : "pending";
     const body = el(bodyId);
     if (!body) return;
     const syncOne = (target) => {
       if (!(target instanceof HTMLInputElement)) return;
-      if (target.getAttribute("data-role") !== roleName) return;
+      const role = target.getAttribute("data-role") || "";
+      if (role === prefix + "-group-check") {
+        const gid = String(target.getAttribute("data-group") || "");
+        toggleGroup(checkedSet, prefix, gid, target.checked);
+        renderTables();
+        return;
+      }
+      if (role !== roleName) return;
       const key = String(
         target.getAttribute("data-key") || target.dataset.key || ""
       ).trim();
       if (!key) return;
       if (target.checked) checkedSet.add(key);
       else checkedSet.delete(key);
+      // 单项勾选变化后同步组勾选框的半选状态
+      syncGroupChecks(
+        body,
+        prefix === "pending" ? visiblePending() : visibleOrdered(),
+        checkedSet,
+        prefix
+      );
     };
     body.addEventListener("change", (event) => {
       syncOne(event.target);
@@ -671,11 +1251,23 @@
     });
     body.addEventListener("click", (event) => {
       const target = event.target;
-      if (!(target instanceof HTMLInputElement)) return;
-      window.setTimeout(() => {
-        syncOne(target);
-        syncSelectAllButtons();
-      }, 0);
+      if (target instanceof HTMLInputElement) {
+        window.setTimeout(() => {
+          syncOne(target);
+          syncSelectAllButtons();
+        }, 0);
+        return;
+      }
+      // 已下单列表行内「下单」按钮
+      if (
+        prefix === "ordered" &&
+        target instanceof HTMLElement &&
+        target.closest('[data-role="ordered-order-one"]')
+      ) {
+        const button = target.closest('[data-role="ordered-order-one"]');
+        const key = String(button.getAttribute("data-key") || "").trim();
+        if (key) reorderKeys([key]);
+      }
     });
   }
 
@@ -748,9 +1340,34 @@
       importFile.addEventListener("change", async () => {
         const file = importFile.files && importFile.files[0];
         try {
-          await importCsvFile(file);
+          await onImportFileChosen(file);
         } finally {
           importFile.value = "";
+        }
+      });
+    }
+    // 导入对话框：方式单选联动组合字段、确认/取消、遮罩与 Esc 关闭
+    const importDialog = el("test-order-import-dialog");
+    if (importDialog) {
+      importDialog
+        .querySelectorAll('input[name="test-order-import-mode"]')
+        .forEach((radio) => {
+          radio.addEventListener("change", syncImportDialog);
+        });
+      const cancelBtn = el("test-order-import-cancel");
+      if (cancelBtn) {
+        cancelBtn.addEventListener("click", closeImportDialog);
+      }
+      const confirmBtn = el("test-order-import-confirm");
+      if (confirmBtn) {
+        confirmBtn.addEventListener("click", importCsv);
+      }
+      importDialog.addEventListener("click", (event) => {
+        if (event.target === importDialog) closeImportDialog();
+      });
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && !importDialog.hidden) {
+          closeImportDialog();
         }
       });
     }
@@ -760,7 +1377,6 @@
       exportOrdered.addEventListener("click", exportOrderedCsv);
     }
     el("test-order-submit").addEventListener("click", submitChecked);
-    el("test-order-restore").addEventListener("click", restoreChecked);
     el("test-order-select-all-pending").addEventListener("click", () => {
       toggleSelectAll(
         visiblePending(),
@@ -784,8 +1400,14 @@
     if (clearOrdered) {
       clearOrdered.addEventListener("click", () => clearList("ordered"));
     }
-    document.querySelectorAll("#view-test-order .th-sort").forEach((button) => {
-      button.addEventListener("click", () => {
+    // 表头随列方案动态渲染，排序点击用事件委托
+    const viewRoot = document.getElementById("view-test-order");
+    if (viewRoot) {
+      viewRoot.addEventListener("click", (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        const button = target.closest(".th-sort");
+        if (!button || !viewRoot.contains(button)) return;
         const table = button.closest("table[data-test-order-table]");
         const tableName = table ? table.getAttribute("data-test-order-table") : "";
         const key = button.getAttribute("data-sort-key") || "";
@@ -797,7 +1419,7 @@
         }
         renderTables();
       });
-    });
+    }
     const pendingSearch = el("test-order-pending-search");
     if (pendingSearch) {
       pendingSearch.addEventListener("input", () => {

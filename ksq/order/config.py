@@ -21,6 +21,11 @@ ORDER_SOURCES = [
 ]
 
 CUSTOMER_DEFAULTS: Dict[str, Dict[str, object]] = {
+    "": {
+        "order_source": "",
+        "need_image_upload": False,
+        "business_mode_code": "",
+    },
     "dashenlin": {
         "order_source": "meituan",
         "need_image_upload": False,
@@ -30,6 +35,11 @@ CUSTOMER_DEFAULTS: Dict[str, Dict[str, object]] = {
         "order_source": "meituan",
         "need_image_upload": True,
         "business_mode_code": "MODE_PICK",
+    },
+    "shuyu": {
+        "order_source": "meituan",
+        "need_image_upload": False,
+        "business_mode_code": "MODE_PICK_WAIT_PACK",
     },
 }
 
@@ -43,16 +53,16 @@ MANUAL_CONFIG_KEYS = (
 )
 
 DEFAULT_ORDER_CONFIG: Dict[str, object] = {
-    "server": "http://localhost:8000",
+    "server": "",
     "client_id": "",
     "client_secret": "",
-    "customer": "dashenlin",
+    "customer": "",
     "store_id": "",
     "store_name": "",
-    "order_source": "meituan",
+    "order_source": "",
     "order_time_timezone": "Asia/Shanghai",
     "need_image_upload": False,
-    "business_mode_code": "MODE_PICK_WAIT_PACK",
+    "business_mode_code": "",
 }
 
 
@@ -61,12 +71,13 @@ def default_order_config() -> Dict[str, object]:
 
 
 def apply_customer_defaults(config: Dict[str, object]) -> Dict[str, object]:
-    customer = str(config.get("customer") or "dashenlin").strip() or "dashenlin"
-    defaults = CUSTOMER_DEFAULTS.get(customer, CUSTOMER_DEFAULTS["dashenlin"])
+    customer = str(config.get("customer") or "").strip()
+    defaults = CUSTOMER_DEFAULTS.get(customer)
     merged = deepcopy(config)
     merged["customer"] = customer
-    for key, value in defaults.items():
-        merged[key] = value
+    if defaults is not None:
+        for key, value in defaults.items():
+            merged[key] = value
     return merged
 
 
@@ -109,18 +120,20 @@ def validate_order_config(config: Dict[str, object]) -> None:
 def public_order_config(config: Dict[str, object]) -> Dict[str, object]:
     public = {
         "server": config.get("server", ""),
-        "customer": config.get("customer", "dashenlin"),
+        "customer": config.get("customer", ""),
         "client_id": config.get("client_id", ""),
         "client_secret": "",
         "store_id": config.get("store_id", ""),
         "store_name": config.get("store_name", ""),
         "has_client_secret": bool(str(config.get("client_secret") or "").strip()),
-        "order_source": config.get("order_source", "meituan"),
+        "order_source": config.get("order_source", ""),
         "need_image_upload": bool(config.get("need_image_upload")),
         "business_mode_code": config.get("business_mode_code", ""),
         "customers": [
+            {"value": "", "cn": "—"},
             {"value": "dashenlin", "cn": "大参林"},
             {"value": "yaoshibang", "cn": "药师帮"},
+            {"value": "shuyu", "cn": "漱玉"},
         ],
     }
     return public

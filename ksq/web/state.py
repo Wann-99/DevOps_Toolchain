@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Dict, FrozenSet, Optional
 
+from ksq import config_pnp
 from ksq.constants import (
     DEFAULT_KNOWLEDGE,
     DEFAULT_PICK_STRATEGY,
@@ -29,6 +30,11 @@ configured_shelves: Path = DEFAULT_SHELVES
 configured_unavailable: Optional[Path] = DEFAULT_UNAVAILABLE
 configured_tool_mapping: Optional[Path] = DEFAULT_TOOL_MAPPING
 configured_pick_strategy: Optional[Path] = DEFAULT_PICK_STRATEGY
+configured_config_pnp: Optional[Path] = None
+# Keys whose path was explicitly set via CLI --shelves / --unavailable /
+# --tool-mapping / --pick-strategy.  reload_config_pnp_paths() preserves
+# these so config.py never overrides an explicit CLI argument.
+_explicit_config_keys: FrozenSet[str] = frozenset()
 data_source_ready: bool = False
 # paths = full features; bundle = package preview (query only)
 data_load_method: str = "none"
@@ -64,3 +70,35 @@ def require_full_data_source(action: str = "该操作") -> None:
     if data_load_method == "bundle":
         raise ValueError(f"{action}不支持。{BUNDLE_CAPABILITY_MESSAGE}")
     raise ValueError("尚未加载数据，请先返回首页加载。")
+
+
+def reload_config_pnp_paths(
+    skip_keys: Optional[FrozenSet[str]] = None,
+) -> None:
+    """Re-parse ``config_pnp/config.py`` and update configured_* paths.
+
+    Only fields present in config.py are updated; absent fields keep their
+    current value.  Fields listed in *skip_keys* (or, when *skip_keys* is
+    ``None``, the module-level ``_explicit_config_keys`` set) are preserved so
+    that explicit CLI arguments always take priority over config.py.
+
+    The caller must hold ``DATASET_LOCK`` when concurrency is possible
+    (consistent with ``bump_data_revision``).
+    """
+    global configured_shelves, configured_unavailable
+    global configured_tool_mapping, configured_pick_strategy
+
+    if configured_config_pnp is None:
+        return
+
+    parsed = config_pnp.load_config_pnp_paths(configured_config_pnp)
+    skip = skip_keys if skip_keys is not None else _explicit_config_keys
+
+    if "shelves" in parsed and "shelves" not in skip:
+        configured_shelves = parsed["shelves"]
+    if "unavailable" in parsed and "unavailable" not in skip:
+        configured_unavailable = parsed["unavailable"]
+    if "tool_mapping" in parsed and "tool_mapping" not in skip:
+        configured_tool_mapping = parsed["tool_mapping"]
+    if "pick_strategy" in parsed and "pick_strategy" not in skip:
+        configured_pick_strategy = parsed["pick_strategy"]
