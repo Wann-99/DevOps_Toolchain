@@ -41,6 +41,8 @@ CONTEXT_LINES = 20
 _FONT_CANDIDATES = (
     "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    # 运行镜像 v1.1.1 起内置文泉驿正黑（slim 基础镜像原本没有任何字体）
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
 )
 
@@ -85,8 +87,10 @@ def find_error_anchor_index(lines: Sequence[str], hint: object) -> int:
 
 
 def extract_log_window(
-    raw_logs: str, hint: object, context_lines: int
+    raw_logs: str, hint: object, context_lines: int, after_lines: Optional[int] = None
 ) -> Tuple[List[str], int, str]:
+    """Lines around the error anchor. after_lines 不给就前后对称，内置工单表照旧。"""
+    after = context_lines if after_lines is None else after_lines
     lines = _split_log_lines(raw_logs)
     if not lines:
         return [], -1, ""
@@ -94,9 +98,15 @@ def extract_log_window(
     if anchor < 0:
         return [], -1, ""
     start = max(0, anchor - context_lines)
-    end = min(len(lines), anchor + context_lines + 1)
+    end = min(len(lines), anchor + after + 1)
     window = list(lines[start:end])
     return window, anchor - start, lines[anchor]
+
+
+def window_caption(before: int, after: Optional[int] = None) -> str:
+    """「前后各 20 行」/「前 400 后 200 行」—— 对称时的文案必须逐字不变。"""
+    tail = before if after is None else after
+    return "前后各 %d 行" % before if tail == before else "前 %d 后 %d 行" % (before, tail)
 
 
 def build_problem_description(
@@ -105,6 +115,8 @@ def build_problem_description(
     outcome: str,
     error_line: str,
     await_kind: object,
+    before: int = CONTEXT_LINES,
+    after: Optional[int] = None,
 ) -> str:
     order_no = str(order.get("order_no") or "").strip() or "—"
     task_id = str(order.get("task_id") or "").strip() or "—"
@@ -141,8 +153,8 @@ def build_problem_description(
     if error_line:
         parts.append("报错行：%s" % error_line[:300])
     parts.append(
-        "已从 robot_workspace_move_test 截取报错行前后各 %d 行日志，见「问题截图/视频」附件。"
-        % CONTEXT_LINES
+        "已从 robot_workspace_move_test 截取报错行%s日志，见「问题截图/视频」附件。"
+        % window_caption(before, after)
     )
     return "\n".join(parts)
 
@@ -155,7 +167,12 @@ def _measure_text(draw, text, font) -> Tuple[int, int]:
     return int(width), int(height)
 
 
-def render_log_screenshot_png(window_lines: Sequence[str], anchor_offset: int) -> bytes:
+def render_log_screenshot_png(
+    window_lines: Sequence[str],
+    anchor_offset: int,
+    before: int = CONTEXT_LINES,
+    after: Optional[int] = None,
+) -> bytes:
     if not _HAS_PIL:
         return b""
     font = _load_log_font()
@@ -176,7 +193,10 @@ def render_log_screenshot_png(window_lines: Sequence[str], anchor_offset: int) -
         line_height = 16
     padding = 16
     gap = 6
-    title = "robot_workspace_move_test · 报错上下文（前后各20行）"
+    # 标题里历来没空格，去掉 window_caption 的空格保持内置工单表的截图逐字不变。
+    title = "robot_workspace_move_test · 报错上下文（%s）" % window_caption(
+        before, after
+    ).replace(" ", "")
     title_w, title_h = _measure_text(probe_draw, title, font)
     img_w = max(900, max(max_width, title_w) + padding * 2)
     img_h = padding * 2 + title_h + 12 + len(line_sizes) * (line_height + gap)
@@ -207,6 +227,8 @@ def collect_failure_evidence(
     raw_logs: str,
     await_kind: object,
     await_line: object,
+    before: int = CONTEXT_LINES,
+    after: Optional[int] = None,
 ) -> Optional[Dict[str, object]]:
     if outcome != OUTCOME_FAILED:
         return None
@@ -219,17 +241,17 @@ def collect_failure_evidence(
                 if hint:
                     break
     window, anchor_offset, error_line = extract_log_window(
-        raw_logs, hint, CONTEXT_LINES
+        raw_logs, hint, before, after
     )
     description = build_problem_description(
-        order, tasks, outcome, error_line, await_kind
+        order, tasks, outcome, error_line, await_kind, before, after
     )
     png_bytes = b""
     txt_body = ""
     if window:
         txt_body = "\n".join(window) + "\n"
         try:
-            png_bytes = render_log_screenshot_png(window, anchor_offset)
+            png_bytes = render_log_screenshot_png(window, anchor_offset, before, after)
         except (OSError, RuntimeError, UnicodeEncodeError, ValueError, TypeError):
             png_bytes = b""
     else:
@@ -244,3 +266,32 @@ def collect_failure_evidence(
         "png_name": "robot_error_%s.png" % order_no,
         "txt_name": "robot_error_%s.txt" % order_no,
     }
+
+
+def _demo() -> None:
+    """默认对称、显式不对称；内置工单表走默认分支，产出必须一字不变。"""
+    logs = "\n".join("line%d" % index for index in range(1000))
+    logs = logs.replace("line500", "line500 报错，请求人工处理")
+
+    window, offset, error_line = extract_log_window(logs, "", 20)
+    assert len(window) == 41 and offset == 20, (len(window), offset)
+    assert "报错，请求人工处理" in error_line
+    assert window_caption(20) == "前后各 20 行"
+
+    window, offset, _ = extract_log_window(logs, "", 400, 200)
+    assert len(window) == 601 and offset == 400, (len(window), offset)
+    assert window_caption(400, 200) == "前 400 后 200 行"
+
+    # 前面行数不够时窗口自然截断，锚点偏移跟着缩，不能越界。
+    window, offset, _ = extract_log_window("报错，请求人工处理\na\nb", "", 400, 200)
+    assert (len(window), offset) == (3, 0), (len(window), offset)
+
+    text = build_problem_description({}, [], "失败", "boom", "error")
+    assert "截取报错行前后各 20 行日志" in text, text
+    text = build_problem_description({}, [], "失败", "boom", "error", 400, 200)
+    assert "截取报错行前 400 后 200 行日志" in text, text
+    print("failure_evidence self-check ok")
+
+
+if __name__ == "__main__":
+    _demo()

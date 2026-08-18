@@ -22,12 +22,20 @@
     awaiting_pack: "等待打包",
     manual_transferred: "人工转单",
     manual_transferred_completed: "人工转单完成",
+    manual_claimed_in_progress: "人工处理中",
+    manual_claimed_completed: "人工处理完成",
   };
   const CANCELABLE_STATUSES = new Set([
     "pending",
     "dispatched",
     "running",
     "awaiting_pack",
+  ]);
+  // 转人工之后 Broker 给的是 manual_claimed_in_progress，「标记完成」要认这个状态。
+  // 与后端 order_api._MANUAL_COMPLETABLE_STATUSES 保持一致。
+  const COMPLETABLE_STATUSES = new Set([
+    "manual_claimed_in_progress",
+    "manual_transferred",
   ]);
   const el = (id) => document.getElementById(id);
 
@@ -45,7 +53,6 @@
   let currentOrderNo = "";
   let currentBrokerStatus = "";
   let currentDashboardMode = "test";
-  let orderActionBusy = false;
   let taskActionBusy = false;
   let orderListBusy = false;
   let orderListPage = 1;
@@ -393,7 +400,6 @@
       currentOrderNo = "";
       currentBrokerStatus = "";
       currentDashboardMode = String(data.dashboard_mode || "test");
-      renderOrderActions();
       if (
         (hadCurrentTask || previousIdleMode !== currentDashboardMode) &&
         lastOrderListData
@@ -498,7 +504,6 @@
       const pct = total > 0 ? Math.round((finished / total) * 100) : 0;
       bar.style.width = pct + "%";
     }
-    renderOrderActions();
     if (
       (previousTaskId !== currentOrderTaskId ||
         previousMode !== currentDashboardMode) &&
@@ -506,30 +511,6 @@
     ) {
       renderOrderList(lastOrderListData);
     }
-  }
-
-  function renderOrderActions() {
-    const wrap = el("dash-order-actions");
-    const cancel = el("dash-order-cancel");
-    const claim = el("dash-order-manual-claim");
-    const complete = el("dash-order-manual-complete");
-    const writable = currentDashboardMode === "test" && !!currentOrderTaskId;
-    const showCancel = writable && CANCELABLE_STATUSES.has(currentBrokerStatus);
-    const showClaim = writable && currentBrokerStatus === "running";
-    const showComplete = writable && currentBrokerStatus === "manual_transferred";
-    if (cancel) {
-      cancel.hidden = !showCancel;
-      cancel.disabled = orderActionBusy;
-    }
-    if (claim) {
-      claim.hidden = !showClaim;
-      claim.disabled = orderActionBusy;
-    }
-    if (complete) {
-      complete.hidden = !showComplete;
-      complete.disabled = orderActionBusy;
-    }
-    if (wrap) wrap.hidden = !(showCancel || showClaim || showComplete);
   }
 
   function taskDetailNode(task) {
@@ -570,7 +551,7 @@
           ">转人工处理</button>"
       );
     }
-    if (status === "manual_transferred") {
+    if (COMPLETABLE_STATUSES.has(status)) {
       buttons.push(
         '<button class="primary dash-order-task-action" type="button" data-action="manual_complete"' +
           attrs +
@@ -699,72 +680,6 @@
       });
     } catch (error) {
       setDetail(error.message || String(error), true);
-    }
-  }
-
-  async function runCurrentOrderAction(action) {
-    if (orderActionBusy || !currentOrderTaskId) return;
-    const labels = {
-      cancel: "取消任务",
-      manual_claim: "转人工处理",
-      manual_complete: "标记完成",
-    };
-    let reason = "";
-    if (action === "cancel") {
-      reason = await global.KsqDialog.prompt({
-        title: "取消当前任务",
-        message: "当前订单 " + (currentOrderNo || "—") + "，请填写取消原因。",
-        fieldLabel: "取消原因",
-        defaultValue: "手动取消",
-        confirmText: "确认取消",
-        cancelText: "返回",
-      });
-      if (reason == null || !String(reason).trim()) return;
-    } else {
-      const confirmed = await global.KsqDialog.confirm({
-        title: labels[action],
-        message:
-          "确认对当前订单 " +
-          (currentOrderNo || "—") +
-          (action === "manual_claim"
-            ? " 执行转人工？机器人将停止处理该订单。"
-            : " 标记人工处理完成并恢复流程？"),
-        confirmText: "确认" + labels[action],
-        cancelText: "返回",
-      });
-      if (!confirmed) return;
-    }
-    orderActionBusy = true;
-    renderOrderActions();
-    const path = action === "cancel" ? "cancel" : action.replace("_", "-");
-    try {
-      const response = await fetch("/api/order/current/" + path, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(action === "cancel" ? { cancel_reason: String(reason).trim() } : {}),
-      });
-      const data = await readJson(response);
-      if (!response.ok) {
-        await global.KsqDialog.apiError({
-          title: labels[action] + "失败",
-          payload: data,
-          httpStatus: response.status,
-        });
-        return;
-      }
-      await refresh();
-      await refreshOrderList(true);
-      await global.KsqDialog.notice({
-        title: labels[action] + "成功",
-        message: "当前订单操作已提交，状态已刷新。",
-        details: data,
-        confirmText: "关闭",
-      });
-    } catch (error) {
-      setDetail(error.message || String(error), true);
-    } finally {
-      orderActionBusy = false;
-      renderOrderActions();
     }
   }
 
@@ -1215,12 +1130,6 @@
         }
       });
     }
-    const cancelOrder = el("dash-order-cancel");
-    if (cancelOrder) cancelOrder.addEventListener("click", () => runCurrentOrderAction("cancel"));
-    const claimOrder = el("dash-order-manual-claim");
-    if (claimOrder) claimOrder.addEventListener("click", () => runCurrentOrderAction("manual_claim"));
-    const completeOrder = el("dash-order-manual-complete");
-    if (completeOrder) completeOrder.addEventListener("click", () => runCurrentOrderAction("manual_complete"));
     const listRefresh = el("dash-order-list-refresh");
     if (listRefresh) listRefresh.addEventListener("click", () => refreshOrderList(true));
     const listStatus = el("dash-order-list-status");

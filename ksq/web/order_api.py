@@ -47,12 +47,19 @@ _KNOWN_TASK_STATUSES = frozenset(
         "error",
         "cancel",
         "awaiting_pack",
+        "manual_claimed_in_progress",
+        "manual_claimed_completed",
         "manual_transferred",
         "manual_transferred_completed",
     }
 )
 _CANCELABLE_TASK_STATUSES = frozenset(
     {"pending", "dispatched", "running", "awaiting_pack"}
+)
+# 转人工之后 Broker 实际给的是 manual_claimed_in_progress，不是 manual_transferred。
+# 两个都收：manual_transferred 仍在状态表里，来源不明，不确定就别删。
+_MANUAL_COMPLETABLE_STATUSES = frozenset(
+    {"manual_claimed_in_progress", "manual_transferred"}
 )
 _TASK_LIST_CACHE_SECONDS = 30.0
 _TASK_LIST_UPSTREAM_PAGE_SIZE = 50
@@ -559,9 +566,10 @@ def operate_current_order(action: str, cancel_reason: object = "") -> Dict[str, 
             ),
         )
     else:
-        if task_status != "manual_transferred":
+        if task_status not in _MANUAL_COMPLETABLE_STATUSES:
             raise CurrentOrderConflict(
-                f"当前工单状态 {task_status or '未知'} 不允许人工完成。"
+                f"当前工单状态 {task_status or '未知'} 不允许人工完成，"
+                f"需要 {'/'.join(sorted(_MANUAL_COMPLETABLE_STATUSES))}。"
             )
         status_code, data = _request_with_token_retry(
             config,
@@ -644,9 +652,10 @@ def operate_task(
             ),
         )
     else:
-        if task_status != "manual_transferred":
+        if task_status not in _MANUAL_COMPLETABLE_STATUSES:
             raise TaskOperationConflict(
-                f"任务状态 {task_status or '未知'} 不允许人工完成。"
+                f"任务状态 {task_status or '未知'} 不允许人工完成，"
+                f"需要 {'/'.join(sorted(_MANUAL_COMPLETABLE_STATUSES))}。"
             )
         if not order_no:
             raise TaskOperationConflict("任务缺少 order_no。")

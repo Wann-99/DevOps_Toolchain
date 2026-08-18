@@ -149,6 +149,39 @@
         ? "已保存，留空不改"
         : "请输入 App Secret";
     }
+    const list = Array.isArray(cfg.forms) ? cfg.forms : [];
+    const forms = el("settings-feishu-forms");
+    if (forms) {
+      forms.value = list
+        .map((form) => [form.name, form.app_token, form.table_id].join("|"))
+        .join("\n");
+      forms.oninput = () => fillAutoFormSelect(parseFeishuForms(forms.value), "");
+    }
+    fillAutoFormSelect(list, String(cfg.auto_form || ""));
+  }
+
+  function fillAutoFormSelect(list, selected) {
+    const select = el("settings-feishu-auto-form");
+    if (!select) return;
+    const keep = selected || String(select.value || "");
+    select.textContent = "";
+    select.appendChild(new Option("工单表（内置）", ""));
+    list.forEach((form) => select.appendChild(new Option(form.name, form.id)));
+    select.value = list.some((form) => form.id === keep) ? keep : "";
+  }
+
+  // ponytail: 一行一个表单的文本框；表单多到需要增删排序再换成行编辑器。
+  function parseFeishuForms(text) {
+    return String(text || "")
+      .split("\n")
+      .map((line) => line.split("|").map((part) => part.trim()))
+      .filter((parts) => parts.length >= 3 && parts[0] && parts[1] && parts[2])
+      .map((parts) => ({
+        id: parts[0],
+        name: parts[0],
+        app_token: parts[1],
+        table_id: parts[2],
+      }));
   }
 
   function collectFeishuSettings() {
@@ -167,6 +200,12 @@
       app_secret: appSecret ? appSecret.value : "",
       app_token: appToken ? appToken.value.trim() : "",
       table_id: tableId ? tableId.value.trim() : "",
+      forms: parseFeishuForms(
+        el("settings-feishu-forms") ? el("settings-feishu-forms").value : ""
+      ),
+      auto_form: el("settings-feishu-auto-form")
+        ? String(el("settings-feishu-auto-form").value || "")
+        : "",
     };
   }
 

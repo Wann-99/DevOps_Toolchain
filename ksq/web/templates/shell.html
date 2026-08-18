@@ -87,6 +87,7 @@
         <div>
           <h1>仪表板 <span class="dash-mode-badge" id="dash-mode-badge">测试</span></h1>
           <p class="dash-subtitle">实时跟踪取药流程</p>
+          <button type="button" class="secondary" data-goto-view="test-order">测试下单</button>
         </div>
         <div class="dash-top-actions">
           <label class="dash-switch" title="识别到确认/报错后自动确认">
@@ -118,14 +119,6 @@
             <p class="dash-order-progress-label" id="dash-order-progress-label">0 / 0</p>
             <div class="dash-order-bar"><span id="dash-order-bar"></span></div>
             <p class="meta compact" id="dash-order-progress-meta">等待任务拆分</p>
-          </div>
-          <div class="dash-order-actions" id="dash-order-actions" hidden>
-            <p class="meta compact">当前工单操作</p>
-            <div class="actions">
-              <button id="dash-order-cancel" class="secondary" type="button" hidden>取消任务</button>
-              <button id="dash-order-manual-claim" class="danger" type="button" hidden>转人工处理</button>
-              <button id="dash-order-manual-complete" class="primary" type="button" hidden>标记完成</button>
-            </div>
           </div>
         </div>
       </div>
@@ -443,7 +436,6 @@
       <div class="card" data-catalog data-mode="order">
         <div class="actions toolbar">
           <div class="toolbar-left">
-            <button type="button" class="secondary" data-goto-view="settings">下单配置</button>
             <button type="button" class="secondary" data-goto-view="test-order">测试下单</button>
             <button data-role="reload-data" class="primary" type="button">重新加载</button>
           </div>
@@ -768,6 +760,16 @@
             <label class="path-field"><span>多维表格 app_token</span><input id="settings-feishu-app-token" placeholder="bascn..."></label>
             <label class="path-field"><span>数据表 table_id</span><input id="settings-feishu-table-id" placeholder="tbl..."></label>
           </div>
+          <label class="path-field">
+            <span>其他表单（每行一个：名称|app_token|table_id）</span>
+            <textarea id="settings-feishu-forms" rows="3" placeholder="药房功能测试|bascn...|tbl..."></textarea>
+          </label>
+          <label class="path-field">
+            <span>自动提交到（工单内容写入哪张表）</span>
+            <select id="settings-feishu-auto-form">
+              <option value="">工单表（内置）</option>
+            </select>
+          </label>
           <div class="actions">
             <button id="settings-feishu-sync-sites" class="secondary" type="button">同步场地</button>
             <button id="settings-feishu-submit" class="secondary" type="button">提交当前工单</button>

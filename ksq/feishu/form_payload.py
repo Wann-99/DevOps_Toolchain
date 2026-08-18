@@ -94,6 +94,8 @@ def classify_order_outcome(
         "cancel",
         "cancelled",
         "canceled",
+        "manual_claimed_in_progress",
+        "manual_claimed_completed",
         "manual_transferred",
         "manual_transferred_completed",
     }

@@ -242,6 +242,9 @@ class QueryHandler(BaseHTTPRequestHandler):
                     {"error": str(error)},
                 )
             return
+        if path == "/api/dashboard/feishu/forms":
+            self._send_json(HTTPStatus.OK, dashboard_api.list_feishu_forms())
+            return
         if path == "/api/dashboard/feishu/site-options":
             try:
                 self._send_json(
@@ -1071,6 +1074,36 @@ class QueryHandler(BaseHTTPRequestHandler):
                     self._send_json(
                         HTTPStatus(error.status_code),
                         {"error": str(error)},
+                    )
+                    return
+                except ValueError as error:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path in (
+                "/api/dashboard/feishu/form",
+                "/api/dashboard/feishu/form/submit",
+            ):
+                payload = read_json_body(self)
+                form_id = str(payload.get("id") or "").strip()
+                try:
+                    if path.endswith("/submit"):
+                        result = dashboard_api.submit_feishu_form_by_id(
+                            form_id, payload.get("values") or {}
+                        )
+                    else:
+                        result = dashboard_api.describe_feishu_form_by_id(form_id)
+                except FeishuApiError as error:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST
+                        if error.status_code < 500
+                        else HTTPStatus.BAD_GATEWAY,
+                        {
+                            "error": str(error),
+                            "status_code": error.status_code,
+                            "body": error.body,
+                        },
                     )
                     return
                 except ValueError as error:

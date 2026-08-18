@@ -38,7 +38,7 @@ DevOps Toolchain 是面向药房自动化现场的数据查询与运维工具，
 
 | 交付物 | 内容 | 更新时机 |
 | --- | --- | --- |
-| `knowledge_shelf_query_runtime:v1.1.0` | ARM64 Python 3.12、Docker CLI、Docker Compose | 运行环境变化时 |
+| `knowledge_shelf_query_runtime:v1.1.1` | ARM64 Python 3.12、Pillow（失败日志截图渲染）、Docker CLI、Docker Compose | 运行环境变化时 |
 | `knowledge_shelf_query_<版本>.bin` | Python 源码、页面模板和静态资源 | 源码变化时 |
 
 日常更新只替换约 200 KiB 的 `.bin` 文件，无需重新构建或拉取运行镜像。
@@ -90,7 +90,7 @@ bash deploy/make_package.sh v1.3.1
 运行镜像：
 
 ```text
-hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime:v1.1.0
+hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime:v1.1.1
 ```
 
 首次部署：

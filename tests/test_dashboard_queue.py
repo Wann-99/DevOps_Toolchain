@@ -247,6 +247,36 @@ class DashboardTerminalTimerTests(unittest.TestCase):
         self.assertEqual(lifecycle["end_reason"], "broker_manual_completed")
         self.assertEqual(lifecycle["label"], "人工处理已完成")
 
+    def test_manual_flow_keeps_robot_error_prompt_clickable(self) -> None:
+        """标记完成之后机器人仍卡在自己的报错上，「确认处理」必须还能按。"""
+        for status in ("manual_claimed_in_progress", "manual_claimed_completed"):
+            with self.subTest(status=status):
+                order, task = lifecycle_input(status)
+                task["status"] = "await_error"
+                task["status_label"] = "报错·请求人工处理"
+                task["needs_confirm"] = True
+                broker = {
+                    "ok": True,
+                    "status": status,
+                    "status_label": status,
+                    "ended": status in dashboard_api._BROKER_ORDER_ENDED,
+                    "terminal": status in dashboard_api._BROKER_ORDER_TERMINAL,
+                }
+                with (
+                    patch.object(dashboard_api, "_ACTIVE_ORDER", order),
+                    patch.object(dashboard_api, "_save_active_order_unlocked"),
+                ):
+                    lifecycle, tasks, _aggregate = dashboard_api._apply_order_lifecycle(
+                        order,
+                        {"human_confirm_seen": True, "human_confirm_kind": "error"},
+                        broker,
+                        [task],
+                    )
+
+                self.assertTrue(tasks[0]["needs_confirm"])
+                self.assertFalse(tasks[0]["active"])
+                self.assertNotEqual(lifecycle["label"], "待确认报错")
+
 
 class TwoOrderQueueTests(unittest.TestCase):
     def setUp(self) -> None:

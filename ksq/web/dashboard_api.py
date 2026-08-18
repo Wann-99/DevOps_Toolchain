@@ -26,11 +26,13 @@ from ksq.constants import (
 from ksq.safe_io import safe_write_text
 from ksq.feishu.form_payload import DEFAULT_SITE
 from ksq.feishu.submit import (
+    describe_feishu_form,
     fetch_feishu_site_options,
     maybe_submit_feishu_form,
     preview_feishu_form,
     should_submit_on_confirm,
     should_submit_on_human_prompt,
+    submit_feishu_form,
 )
 from ksq.web.logs_api import (
     LogServiceError,
@@ -110,6 +112,9 @@ _FAIL_PATTERNS = (
     "pick_up_object failed",
     "object is marked as unavailable",
     "find object and shelf failed",
+    "not found in percept_pusher results",
+    "scan object pipeline failed",
+    "check scan object result failed",
 )
 _START_SPEAK = "开始处理商品"
 
@@ -137,26 +142,26 @@ _BROKER_STATUS_LABELS = {
     "awaiting_pack": "等待打包",
     "manual_transferred_completed": "人工转单完成",
     "manual_transferred": "人工转单",
+    "manual_claimed_in_progress": "人工处理中",
+    "manual_claimed_completed": "人工处理完成",
 }
 
-# Broker statuses that mean the order has ended (or entered end-of-order human phase).
-_BROKER_ORDER_ENDED = frozenset(
-    {
-        "success",
-        "error",
-        "cancel",
-        "awaiting_pack",
-        "manual_transferred_completed",
-        "manual_transferred",
-    }
+# Broker 的人工流有两套命名：claimed_* 是实测在跑的那套，transferred_* 也在状态表里，
+# 来源不明但一并认。持有态 = 机器人已交出订单、等人收尾，还差「标记完成」这一步。
+_BROKER_MANUAL_HELD = frozenset({"manual_claimed_in_progress", "manual_transferred"})
+_BROKER_MANUAL_DONE = frozenset(
+    {"manual_claimed_completed", "manual_transferred_completed"}
 )
-_BROKER_ORDER_TERMINAL = frozenset(
-    {
-        "success",
-        "error",
-        "cancel",
-        "manual_transferred_completed",
-    }
+
+# Broker statuses that mean the order has ended (or entered end-of-order human phase).
+_BROKER_ORDER_ENDED = (
+    frozenset({"success", "error", "cancel", "awaiting_pack"})
+    | _BROKER_MANUAL_HELD
+    | _BROKER_MANUAL_DONE
+)
+# 人工持有态不算 terminal：后面还有「标记完成」一步。
+_BROKER_ORDER_TERMINAL = (
+    frozenset({"success", "error", "cancel"}) | _BROKER_MANUAL_DONE
 )
 
 _ACTIVE_ORDER_LOCK = Lock()
@@ -395,17 +400,21 @@ def _refresh_live_elapsed(
         task["status_label"] = _STATUS_LABELS.get(status, status)
 
 
-def _discover_log_tasks(raw_logs: str) -> Tuple[str, Dict[str, List[str]]]:
-    """Return (latest_task_id, task_id -> ordered unique codes) from robot logs."""
+def _discover_log_tasks(
+    raw_logs: str,
+) -> Tuple[str, Dict[str, List[str]], Dict[str, datetime]]:
+    """Return (latest_task_id, task_id -> codes, task_id -> last timestamp)."""
     text = _strip_ansi(raw_logs)
     latest_task_id = ""
     codes_by_task: Dict[str, List[str]] = {}
     seen_by_task: Dict[str, set] = {}
+    last_seen_by_task: Dict[str, datetime] = {}
     for line in text.splitlines():
         if not line.strip():
             continue
         match = _TS_RE.match(line)
         body = match.group("body") if match is not None else line
+        line_ts = _parse_ts(match.group("ts")) if match is not None else None
         item_task = _ITEM_TASK_RE.search(body or "")
         parent = ""
         code = ""
@@ -421,12 +430,49 @@ def _discover_log_tasks(raw_logs: str) -> Tuple[str, Dict[str, List[str]]]:
         if not parent or not code:
             continue
         latest_task_id = parent
+        if line_ts is not None:
+            if line_ts.tzinfo is None:
+                line_ts = line_ts.replace(tzinfo=timezone.utc)
+            previous_seen = last_seen_by_task.get(parent)
+            if previous_seen is None or line_ts > previous_seen:
+                last_seen_by_task[parent] = line_ts
         bucket = codes_by_task.setdefault(parent, [])
         seen = seen_by_task.setdefault(parent, set())
         if code not in seen:
             seen.add(code)
             bucket.append(code)
-    return latest_task_id, codes_by_task
+    return latest_task_id, codes_by_task, last_seen_by_task
+
+
+def _stale_log_tasks(
+    order: Optional[Dict[str, object]],
+    last_seen_by_task: Optional[Dict[str, datetime]],
+) -> frozenset:
+    """Log tasks whose activity stopped before the current order was registered.
+
+    Re-ordering the same SKUs (e.g. 测试下单「已下单」再次下单) creates a new
+    Broker task while the previous order's robot task lines are still in the
+    log tail.  Those stale tasks must not serve as the new order's log scope.
+    Tasks without timestamp information keep legacy behaviour (never stale).
+    """
+    if order is None or not last_seen_by_task:
+        return frozenset()
+    registered_at = _parse_ts(str(order.get("registered_at") or ""))
+    if registered_at is None:
+        return frozenset()
+    if registered_at.tzinfo is None:
+        registered_at = registered_at.replace(tzinfo=timezone.utc)
+    active = str(order.get("task_id") or "").strip()
+    stale = set()
+    for task_id, seen in last_seen_by_task.items():
+        if not task_id or task_id == active or seen is None:
+            continue
+        seen_dt = (
+            seen if seen.tzinfo is not None else seen.replace(tzinfo=timezone.utc)
+        )
+        if seen_dt < registered_at:
+            stale.add(task_id)
+    return frozenset(stale)
 
 
 def _build_order_from_log_task(
@@ -515,7 +561,7 @@ def _resolve_active_order(
     Keep showing the current order until the next order starts, then refresh.
     Same task_id may gain more SKUs over time — those are expanded separately.
     """
-    latest_task_id, codes_by_task = _discover_log_tasks(raw_logs)
+    latest_task_id, codes_by_task, last_seen_by_task = _discover_log_tasks(raw_logs)
     if order is None:
         if not latest_task_id:
             return None
@@ -527,7 +573,9 @@ def _resolve_active_order(
     lifecycle = order.get("lifecycle") if isinstance(order.get("lifecycle"), dict) else {}
     source = str(order.get("source") or "").strip()
     ended = bool(lifecycle.get("ended") or lifecycle.get("closed"))
-    matched = _match_log_task_for_order(order, codes_by_task, latest_task_id)
+    matched = _match_log_task_for_order(
+        order, codes_by_task, latest_task_id, last_seen_by_task
+    )
 
     if latest_task_id and active_task_id and latest_task_id != active_task_id:
         # Same order barcodes may continue under a remapped robot task_id.
@@ -572,13 +620,19 @@ def _match_log_task_for_order(
     order: Optional[Dict[str, object]],
     codes_by_task: Dict[str, List[str]],
     latest_task_id: str,
+    last_seen_by_task: Optional[Dict[str, datetime]] = None,
 ) -> str:
-    """Map UI/broker task_id to the robot log task_id that actually handles the SKUs."""
+    """Map UI/broker task_id to the robot log task_id that actually handles the SKUs.
+
+    Tasks that went silent before this order was registered belong to a
+    previous order (same SKUs re-ordered) and are never matched.
+    """
     if order is None:
         return latest_task_id
     active = str(order.get("task_id") or "").strip()
     order_codes = _order_item_codes(order)
-    if latest_task_id and order_codes:
+    stale = _stale_log_tasks(order, last_seen_by_task)
+    if latest_task_id and order_codes and latest_task_id not in stale:
         latest_codes = set(codes_by_task.get(latest_task_id, []))
         if order_codes & latest_codes:
             return latest_task_id
@@ -587,6 +641,8 @@ def _match_log_task_for_order(
     best = ""
     best_n = 0
     for task_id, codes in codes_by_task.items():
+        if task_id in stale:
+            continue
         overlap = len(order_codes & set(codes))
         if overlap > best_n:
             best_n = overlap
@@ -600,14 +656,16 @@ def parse_robot_log_text(
     raw_logs: str,
     focus_task_id: str = "",
     extra_allowed_codes: Optional[set] = None,
+    stale_task_ids: Optional[frozenset] = None,
 ) -> Dict[str, object]:
     text = _strip_ansi(raw_logs)
     lines = [line for line in text.splitlines() if line.strip()]
     focus_task_id = str(focus_task_id or "").strip()
-    _latest_task_id, codes_by_task = _discover_log_tasks(raw_logs)
+    _latest_task_id, codes_by_task, _last_seen = _discover_log_tasks(raw_logs)
     allowed_codes = set(codes_by_task.get(focus_task_id, [])) if focus_task_id else set()
     if extra_allowed_codes:
         allowed_codes.update(str(code).strip() for code in extra_allowed_codes if str(code).strip())
+    stale_tasks = frozenset(stale_task_ids or ())
     items: Dict[str, Dict[str, object]] = {}
     events: List[Dict[str, object]] = []
     parent_task_id = focus_task_id
@@ -615,6 +673,11 @@ def parse_robot_log_text(
     scope_task_id = ""
     saw_any_task = False
     in_focus_scope = not bool(focus_task_id)
+    # Codes seen on stale (previous-order) / fresh task marker lines.  Lines
+    # about a code that only appears under a stale task belong to the previous
+    # order and must not update the new order's state.
+    stale_marker_codes: set = set()
+    fresh_marker_codes: set = set()
     order_events: List[Dict[str, object]] = []
     human_confirm_seen = False
     human_confirm_kind = ""
@@ -641,6 +704,8 @@ def parse_robot_log_text(
         if not code:
             return False
         if code in allowed_codes:
+            if code in stale_marker_codes and code not in fresh_marker_codes:
+                return False
             return True
         if not focus_task_id:
             return True
@@ -665,10 +730,16 @@ def parse_robot_log_text(
             seq_id = item_task.group(3).strip()
             saw_any_task = True
             scope_task_id = parent or scope_task_id
-            in_focus_scope = _in_scope(parent) or code in allowed_codes
+            marker_stale = bool(parent) and parent in stale_tasks
+            in_focus_scope = _in_scope(parent) or (
+                code in allowed_codes and not marker_stale
+            )
             if not in_focus_scope:
+                if marker_stale and code:
+                    stale_marker_codes.add(code)
                 current_code = ""
                 continue
+            fresh_marker_codes.add(code)
             parent_task_id = parent or parent_task_id
             item = _ensure_item(items, code)
             item["parent_task_id"] = parent
@@ -682,10 +753,16 @@ def parse_robot_log_text(
             seq_id = seq_match.group("seq")
             saw_any_task = True
             scope_task_id = parent or scope_task_id
-            in_focus_scope = _in_scope(parent) or code in allowed_codes
+            marker_stale = bool(parent) and parent in stale_tasks
+            in_focus_scope = _in_scope(parent) or (
+                code in allowed_codes and not marker_stale
+            )
             if not in_focus_scope:
+                if marker_stale and code:
+                    stale_marker_codes.add(code)
                 current_code = ""
                 continue
+            fresh_marker_codes.add(code)
             parent_task_id = parent or parent_task_id
             item = _ensure_item(items, code)
             item["parent_task_id"] = parent
@@ -847,6 +924,10 @@ def parse_robot_log_text(
         error_hit = _match_any(body, _ERROR_CONFIRM_PATTERNS)
         pack_hit = _match_any(body, _PACK_CONFIRM_PATTERNS)
         if confirm_hit or error_hit:
+            if stale_marker_codes and not fresh_marker_codes:
+                # Only a previous order's execution is visible in the tail; its
+                # confirm/pack prompts must not surface on the new order.
+                continue
             # Human confirm / key-wait must always surface, even when broker task_id
             # differs from the robot log task_id (manual transfer, etc.).
             text = body.strip()[:240]
@@ -1795,6 +1876,18 @@ def _merge_item_state(
     """Keep the stronger state so completed items are not lost when logs roll off."""
     if remembered is None:
         return deepcopy(fresh)
+    remembered_parent = str(remembered.get("parent_task_id") or "").strip()
+    fresh_parent = str(fresh.get("parent_task_id") or "").strip()
+    if (
+        remembered_parent
+        and fresh_parent
+        and remembered_parent != fresh_parent
+        and str(remembered.get("status") or "") in {"success", "failed"}
+    ):
+        # Same SKU executed again under a different task (re-order): the fresh
+        # state is a new execution and must override the remembered terminal
+        # state of the previous order.
+        return deepcopy(fresh)
     merged = deepcopy(remembered)
     fresh_status = str(fresh.get("status") or "pending")
     old_status = str(merged.get("status") or "pending")
@@ -1920,6 +2013,41 @@ def _persist_item_states(order: Optional[Dict[str, object]], tasks: List[Dict[st
         _save_active_order_unlocked()
 
 
+def _prune_stale_item_states(
+    order: Optional[Dict[str, object]], stale_task_ids: frozenset
+) -> None:
+    """Drop remembered item states produced by a previous order's task.
+
+    Re-ordered SKUs share codes with the previous order; states remembered
+    from that stale task would otherwise pin the new order's items to the old
+    terminal states forever (the never-downgrade merge rule).
+    """
+    if order is None or not stale_task_ids:
+        return
+    task_id = str(order.get("task_id") or "").strip()
+    with _ACTIVE_ORDER_LOCK:
+        global _ACTIVE_ORDER
+        if _ACTIVE_ORDER is None:
+            return
+        active_id = str(_ACTIVE_ORDER.get("task_id") or "").strip()
+        if task_id and active_id and active_id != task_id:
+            return
+        memory = _ACTIVE_ORDER.get("item_states")
+        if not isinstance(memory, dict):
+            return
+        stale_keys = [
+            key
+            for key, value in memory.items()
+            if isinstance(value, dict)
+            and str(value.get("parent_task_id") or "").strip() in stale_task_ids
+        ]
+        if not stale_keys:
+            return
+        for key in stale_keys:
+            memory.pop(key, None)
+        _save_active_order_unlocked()
+
+
 def _apply_order_lifecycle(
     order: Optional[Dict[str, object]],
     parsed: Dict[str, object],
@@ -1984,7 +2112,7 @@ def _apply_order_lifecycle(
         or (needs_confirm and human_kind == "error")
         or (order_await and human_kind == "error")
     )
-    broker_owns_human_state = broker_terminal or broker_status == "manual_transferred"
+    broker_owns_human_state = broker_terminal or broker_status in _BROKER_MANUAL_HELD
     if broker_owns_human_state:
         # Broker terminal/manual ownership wins over stale prompt lines in the log tail.
         order_await = False
@@ -2056,9 +2184,9 @@ def _apply_order_lifecycle(
             lifecycle["end_reason"] = lifecycle.get("end_reason") or "broker_cancel"
         elif broker_status == "awaiting_pack":
             lifecycle["end_reason"] = lifecycle.get("end_reason") or "broker_awaiting_pack"
-        elif broker_status == "manual_transferred_completed":
+        elif broker_status in _BROKER_MANUAL_DONE:
             lifecycle["end_reason"] = "broker_manual_completed"
-        elif broker_status == "manual_transferred":
+        elif broker_status in _BROKER_MANUAL_HELD:
             lifecycle["end_reason"] = (
                 lifecycle.get("end_reason") or "broker_transferred"
             )
@@ -2279,7 +2407,7 @@ def _apply_order_lifecycle(
     elif lifecycle["ended"] or stopped_on_failure:
         if lifecycle.get("end_reason") in failure_reasons or has_failure:
             lifecycle["label"] = "工单失败 · 已停止"
-        elif broker_status == "manual_transferred":
+        elif broker_status in _BROKER_MANUAL_HELD:
             lifecycle["label"] = "已转人工 · 等待人工完成"
         else:
             lifecycle["label"] = "取货完成 · 待收尾"
@@ -2325,10 +2453,14 @@ def _apply_order_lifecycle(
 
     # An ended Broker state always stops stale robot activity. Only terminal or
     # manually-owned states clear prompts; awaiting_pack is itself a live prompt.
+    # 人工流例外：转人工之后机器人还会自己报错并停在「请求人工处理」上，工单归人管了
+    # 不代表机器人不用放行。这里留着 needs_confirm，「确认处理」才按得下去；标签、计时器
+    # 用的是上面那个已被 broker_owns_human_state 清掉的局部变量，不受影响。
+    manual_flow = broker_status in (_BROKER_MANUAL_HELD | _BROKER_MANUAL_DONE)
     if broker_ended:
         for task in tasks:
             task["active"] = False
-            if broker_owns_human_state:
+            if broker_owns_human_state and not manual_flow:
                 task["needs_confirm"] = False
 
     if order is not None:
@@ -2657,13 +2789,19 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
         # After log discovery, try cloud enrich again for order_no / names.
         order, etm_status = _sync_order_from_etm(order, settings)
         payload["etm"] = etm_status
-    latest_task_id, codes_by_task = _discover_log_tasks(raw_logs)
+    latest_task_id, codes_by_task, last_seen_by_task = _discover_log_tasks(raw_logs)
     order_codes = _order_item_codes(order)
-    focus_task_id = _match_log_task_for_order(order, codes_by_task, latest_task_id)
+    focus_task_id = _match_log_task_for_order(
+        order, codes_by_task, latest_task_id, last_seen_by_task
+    )
+    stale_task_ids = _stale_log_tasks(order, last_seen_by_task)
+    if stale_task_ids:
+        _prune_stale_item_states(order, stale_task_ids)
     parsed = parse_robot_log_text(
         raw_logs,
         focus_task_id=focus_task_id,
         extra_allowed_codes=order_codes,
+        stale_task_ids=stale_task_ids,
     )
     if order is None and focus_task_id:
         order = _resolve_active_order(None, raw_logs)
@@ -2775,7 +2913,7 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
     if broker_waiting_pack:
         order_await = True
         human_kind = "pack"
-    elif bool(broker.get("terminal")) or broker_status == "manual_transferred":
+    elif bool(broker.get("terminal")) or broker_status in _BROKER_MANUAL_HELD:
         order_await = False
     has_robot_running = any(
         str(task.get("status") or "")
@@ -3076,7 +3214,34 @@ def _default_feishu_settings() -> Dict[str, object]:
         "tester": "",
         "site": DEFAULT_SITE,
         "field_names": {},
+        "forms": [],
+        "auto_form": "",
     }
+
+
+def _normalize_feishu_forms(raw: object) -> List[Dict[str, str]]:
+    """Extra hand-filled forms: {id, name, app_token, table_id}, id unique."""
+    forms: List[Dict[str, str]] = []
+    seen = set()
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        app_token = str(entry.get("app_token") or "").strip()
+        table_id = str(entry.get("table_id") or "").strip()
+        name = str(entry.get("name") or "").strip()
+        form_id = str(entry.get("id") or "").strip() or name
+        if not form_id or not app_token or not table_id or form_id in seen:
+            continue
+        seen.add(form_id)
+        forms.append(
+            {
+                "id": form_id,
+                "name": name or form_id,
+                "app_token": app_token,
+                "table_id": table_id,
+            }
+        )
+    return forms
 
 
 def _normalize_feishu_settings(
@@ -3108,6 +3273,16 @@ def _normalize_feishu_settings(
             if text:
                 names[str(key)] = text
         current["field_names"] = names
+    if "forms" in raw:
+        current["forms"] = _normalize_feishu_forms(raw.get("forms"))
+    else:
+        current["forms"] = _normalize_feishu_forms(current.get("forms"))
+    if "auto_form" in raw:
+        current["auto_form"] = str(raw.get("auto_form") or "").strip()
+    known = {str(form.get("id") or "") for form in current["forms"]}
+    if str(current.get("auto_form") or "") not in known:
+        # 指向已删除的表单时退回内置工单表，不会静默提交到不存在的表。
+        current["auto_form"] = ""
     return current
 
 
@@ -3122,6 +3297,8 @@ def _public_feishu_settings(feishu: Mapping[str, object]) -> Dict[str, object]:
         "site": site,
         "has_app_secret": bool(str(feishu.get("app_secret") or "").strip()),
         "field_names": deepcopy(feishu.get("field_names") or {}),
+        "forms": deepcopy(feishu.get("forms") or []),
+        "auto_form": str(feishu.get("auto_form") or ""),
     }
 
 
@@ -3468,6 +3645,34 @@ def preview_feishu_submission() -> Dict[str, object]:
 def list_feishu_site_options() -> Dict[str, object]:
     settings = load_dashboard_settings()
     return fetch_feishu_site_options(settings)
+
+
+def list_feishu_forms() -> Dict[str, object]:
+    """Extra forms configured in 设置; adding one needs no code change."""
+    settings = load_dashboard_settings()
+    feishu = settings.get("feishu")
+    forms = feishu.get("forms") if isinstance(feishu, dict) else []
+    return {
+        "ok": True,
+        "forms": [
+            {"id": form.get("id", ""), "name": form.get("name", "")}
+            for form in forms if isinstance(form, dict)
+        ],
+    }
+
+
+def describe_feishu_form_by_id(form_id: str) -> Dict[str, object]:
+    settings = load_dashboard_settings()
+    return describe_feishu_form(settings, form_id, get_active_order(), [])
+
+
+def submit_feishu_form_by_id(
+    form_id: str, values: Mapping[str, object]
+) -> Dict[str, object]:
+    settings = load_dashboard_settings()
+    if not isinstance(values, Mapping):
+        raise ValueError("表单内容格式无效。")
+    return submit_feishu_form(settings, form_id, values, get_active_order())
 
 
 def submit_feishu_manual() -> Dict[str, object]:

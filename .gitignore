@@ -22,6 +22,7 @@ venv/
 /deploy/dist/
 /dashboard_active_order.json
 /dashboard_settings.json
+/users.json
 /order_config.json
 /order_config.prod.json
 /test_order_state.json

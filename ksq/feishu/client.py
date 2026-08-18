@@ -235,28 +235,24 @@ def upload_bitable_media(
     return file_token
 
 
-def list_bitable_select_options(
+def list_bitable_fields(
     app_id: str,
     app_secret: str,
     app_token: str,
     table_id: str,
-    field_name: str,
-) -> List[str]:
-    """Return single-select option names for a bitable field."""
+) -> List[Dict[str, object]]:
+    """Return the raw field descriptors of a bitable table (name/type/property)."""
     app_token_text = str(app_token or "").strip()
     table_id_text = str(table_id or "").strip()
-    field_name_text = str(field_name or "").strip()
     if not app_token_text or not table_id_text:
         raise FeishuApiError(
-            "飞书 app_token / table_id 未配置，无法读取字段选项。",
+            "飞书 app_token / table_id 未配置，无法读取字段。",
             400,
             {"app_token": app_token_text, "table_id": table_id_text},
         )
-    if not field_name_text:
-        raise FeishuApiError("字段名为空，无法读取选项。", 400, {})
     token = get_tenant_access_token(app_id, app_secret)
     url = (
-        "https://open.feishu.cn/open-apis/bitable/v1/apps/%s/tables/%s/fields"
+        "https://open.feishu.cn/open-apis/bitable/v1/apps/%s/tables/%s/fields?page_size=200"
         % (app_token_text, table_id_text)
     )
     status, body = _request_json("GET", url, None, token)
@@ -265,6 +261,138 @@ def list_bitable_select_options(
     items = data.get("items") if isinstance(data, dict) else None
     if not isinstance(items, list):
         raise FeishuApiError("读取字段响应缺少 items。", status, payload)
+    return [item for item in items if isinstance(item, dict)]
+
+
+def list_bitable_form_fields(
+    app_id: str,
+    app_secret: str,
+    app_token: str,
+    table_id: str,
+) -> List[Dict[str, object]]:
+    """Return the *form view*'s own field list: {field_id, title, description, required, visible}.
+
+    整表结构（list_bitable_fields）里什么都有 —— 副本列、研发才填的列、只读列。
+    表单视图才是测试人员真正看到的那一份：字段范围、顺序、必填、帮助文案都由它定。
+    表里没有表单视图就返回 []，调用方回退到整表结构，不是错误。
+    """
+    app_token_text = str(app_token or "").strip()
+    table_id_text = str(table_id or "").strip()
+    if not app_token_text or not table_id_text:
+        return []
+    token = get_tenant_access_token(app_id, app_secret)
+    base = "https://open.feishu.cn/open-apis/bitable/v1/apps/%s/tables/%s" % (
+        app_token_text,
+        table_id_text,
+    )
+    status, body = _request_json("GET", base + "/views?page_size=100", None, token)
+    payload = _ensure_ok(status, body, "读取飞书多维表格视图")
+    data = payload.get("data")
+    views = data.get("items") if isinstance(data, dict) else None
+    form_id = ""
+    for view in views if isinstance(views, list) else []:
+        if isinstance(view, dict) and str(view.get("view_type") or "") == "form":
+            form_id = str(view.get("view_id") or "").strip()
+            if form_id:
+                break
+    if not form_id:
+        return []
+    status, body = _request_json(
+        "GET", "%s/forms/%s/fields?page_size=100" % (base, form_id), None, token
+    )
+    payload = _ensure_ok(status, body, "读取飞书表单视图字段")
+    data = payload.get("data")
+    items = data.get("items") if isinstance(data, dict) else None
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def list_bitable_records(
+    app_id: str,
+    app_secret: str,
+    app_token: str,
+    table_id: str,
+) -> List[Dict[str, object]]:
+    """Return {record_id, label} for a table, label = first non-empty text field.
+
+    ponytail: 只取首页 500 条；被关联表超量再加分页。
+    """
+    app_token_text = str(app_token or "").strip()
+    table_id_text = str(table_id or "").strip()
+    if not app_token_text or not table_id_text:
+        raise FeishuApiError(
+            "飞书 app_token / table_id 未配置，无法读取记录。",
+            400,
+            {"app_token": app_token_text, "table_id": table_id_text},
+        )
+    token = get_tenant_access_token(app_id, app_secret)
+    url = (
+        "https://open.feishu.cn/open-apis/bitable/v1/apps/%s/tables/%s/records?page_size=500"
+        % (app_token_text, table_id_text)
+    )
+    status, body = _request_json("GET", url, None, token)
+    payload = _ensure_ok(status, body, "读取飞书多维表格记录")
+    data = payload.get("data")
+    items = data.get("items") if isinstance(data, dict) else None
+    # 记录名认主字段（/fields 的第一条）。_record_label 那套「第一个非空字段」会撞上
+    # 自动编号/公式列，读回来是个 0，下拉框里看不出是哪条，同名匹配也会失手。
+    try:
+        table_fields = list_bitable_fields(app_id, app_secret, app_token, table_id_text)
+        primary = str((table_fields or [{}])[0].get("field_name") or "")
+    except FeishuApiError:
+        primary = ""
+    records: List[Dict[str, object]] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        record_id = str(item.get("record_id") or "").strip()
+        if not record_id:
+            continue
+        fields = item.get("fields")
+        label = ""
+        if primary and isinstance(fields, dict):
+            label = _flatten_text(fields.get(primary))
+        records.append(
+            {"record_id": record_id, "label": label or _record_label(fields) or record_id}
+        )
+    return records
+
+
+def _record_label(fields: object) -> str:
+    """Best-effort primary-field text of a bitable record."""
+    if not isinstance(fields, dict):
+        return ""
+    for value in fields.values():
+        text = _flatten_text(value)
+        if text:
+            return text
+    return ""
+
+
+def _flatten_text(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        return str(value.get("text") or value.get("name") or "").strip()
+    if isinstance(value, list):
+        parts = [_flatten_text(entry) for entry in value]
+        return " ".join(part for part in parts if part).strip()
+    return ""
+
+
+def list_bitable_select_options(
+    app_id: str,
+    app_secret: str,
+    app_token: str,
+    table_id: str,
+    field_name: str,
+) -> List[str]:
+    """Return single-select option names for a bitable field."""
+    field_name_text = str(field_name or "").strip()
+    if not field_name_text:
+        raise FeishuApiError("字段名为空，无法读取选项。", 400, {})
+    items = list_bitable_fields(app_id, app_secret, app_token, table_id)
     for item in items:
         if not isinstance(item, dict):
             continue

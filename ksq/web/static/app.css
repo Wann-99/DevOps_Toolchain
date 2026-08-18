@@ -864,17 +864,6 @@ table.data-table { width:max-content; min-width:100%; border-collapse:collapse; 
   font-weight: 750;
   font-variant-numeric: tabular-nums;
 }
-.dash-order-actions {
-  grid-column: 1 / -1;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--line);
-}
-.dash-order-actions[hidden] { display: none !important; }
-.dash-order-actions .actions { margin: 0; }
 .dash-order-list-head {
   display: flex;
   align-items: flex-end;

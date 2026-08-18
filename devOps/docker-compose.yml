@@ -6,7 +6,7 @@
 
 services:
   knowledge_shelf_query:
-    image: ${RUNTIME_IMAGE:-hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime:v1.1.0}
+    image: ${RUNTIME_IMAGE:-hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime:v1.1.1}
     container_name: knowledge_shelf_query
     network_mode: host
     working_dir: /app
