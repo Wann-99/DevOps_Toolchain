@@ -26,6 +26,8 @@ venv/
 /order_config.json
 /order_config.prod.json
 /test_order_state.json
+/robot_map_settings.json
+/robot_map_pois_cache.json
 /devOps/robot_keyboard.env
 *.bak*
 .backup/

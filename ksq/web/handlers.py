@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import cgi
 import json
+import math
 import mimetypes
 import time
 from http import HTTPStatus
@@ -22,9 +23,11 @@ from ksq.web import (
     edit_workspace,
     logs_api,
     order_api,
+    robot_map_api,
     state,
     test_order_api,
 )
+from ksq.web.robot_map_api import RobotApiError
 from ksq.web.import_api import import_uploaded_files
 from ksq.web.loader import (
     apply_configured_paths_reload,
@@ -47,14 +50,68 @@ from ksq.web.pages import (
 
 
 def read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, object]:
-    content_length = int(handler.headers.get("Content-Length", "0"))
+    content_length = _request_content_length(handler)
     raw_body = handler.rfile.read(content_length)
+    _mark_request_body_consumed(handler, len(raw_body))
     if not raw_body:
         raise ValueError("请求体为空。")
     payload = json.loads(raw_body.decode("utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("请求体必须是 JSON 对象。")
     return payload
+
+
+def _parse_finite_float(value: object, field: str) -> float:
+    """Parse a finite numeric request field at the HTTP trust boundary."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field} 必须是数字。")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field} 必须是数字。") from error
+    if not math.isfinite(number):
+        raise ValueError(f"{field} 必须是有限数字。")
+    return number
+
+
+def _mark_request_body_consumed(
+    handler: BaseHTTPRequestHandler, amount: int
+) -> None:
+    consumed = getattr(handler, "_ksq_request_body_consumed", 0)
+    try:
+        consumed = max(0, int(consumed))
+    except (TypeError, ValueError):
+        consumed = 0
+    try:
+        amount = max(0, int(amount))
+    except (TypeError, ValueError):
+        amount = 0
+    setattr(handler, "_ksq_request_body_consumed", consumed + amount)
+
+
+def _request_content_length(handler: BaseHTTPRequestHandler) -> int:
+    try:
+        return max(0, int(handler.headers.get("Content-Length", "0")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _drain_request_body(handler: BaseHTTPRequestHandler) -> None:
+    """Consume only the unread part of the current HTTP request body."""
+    content_length = _request_content_length(handler)
+    consumed = getattr(handler, "_ksq_request_body_consumed", 0)
+    try:
+        consumed = min(content_length, max(0, int(consumed)))
+    except (TypeError, ValueError):
+        consumed = 0
+    remaining = content_length - consumed
+    while remaining > 0:
+        chunk = handler.rfile.read(min(65536, remaining))
+        if not chunk:
+            break
+        consumed += len(chunk)
+        remaining -= len(chunk)
+    setattr(handler, "_ksq_request_body_consumed", consumed)
 
 
 class QueryHandler(BaseHTTPRequestHandler):
@@ -486,12 +543,115 @@ class QueryHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(HTTPStatus.OK, {"status": status, "data": data})
             return
+        if path == "/api/map/settings":
+            self._send_json(HTTPStatus.OK, robot_map_api.load_settings())
+            return
+        if path == "/api/map/robot-info":
+            try:
+                self._send_json(HTTPStatus.OK, robot_map_api.get_robot_info())
+            except RobotApiError as error:
+                self._send_json(
+                    HTTPStatus(error.status_code)
+                    if 400 <= error.status_code < 600
+                    else HTTPStatus.BAD_GATEWAY,
+                    {"error": str(error)},
+                )
+            return
+        if path == "/api/map/power":
+            try:
+                self._send_json(HTTPStatus.OK, robot_map_api.get_power_status())
+            except RobotApiError as error:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
+        if path == "/api/map/pois":
+            try:
+                self._send_json(HTTPStatus.OK, {"pois": robot_map_api.list_pois()})
+            except RobotApiError as error:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
+        if path == "/api/map/pose":
+            try:
+                self._send_json(HTTPStatus.OK, robot_map_api.get_current_pose())
+            except RobotApiError as error:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
+        if path == "/api/map/telemetry":
+            try:
+                self._send_json(
+                    HTTPStatus.OK, robot_map_api.get_telemetry_snapshot()
+                )
+            except RobotApiError as error:
+                self._send_json(
+                    HTTPStatus(error.status_code)
+                    if 400 <= error.status_code < 600
+                    else HTTPStatus.BAD_GATEWAY,
+                    {"error": str(error)},
+                )
+            return
+        if path == "/api/map/image":
+            try:
+                png_bytes, meta = robot_map_api.get_map_image()
+            except RobotApiError as error:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(png_bytes)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Map-Origin-X", str(meta["origin_x"]))
+            self.send_header("X-Map-Origin-Y", str(meta["origin_y"]))
+            self.send_header("X-Map-Resolution", str(meta["resolution"]))
+            self.send_header("X-Map-Width", str(meta["width"]))
+            self.send_header("X-Map-Height", str(meta["height"]))
+            self.end_headers()
+            self.wfile.write(png_bytes)
+            return
+        if path == "/api/map/zones":
+            try:
+                self._send_json(HTTPStatus.OK, robot_map_api.get_zones())
+            except RobotApiError as error:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
+        if path == "/api/map/events":
+            try:
+                self._send_json(HTTPStatus.OK, {"events": robot_map_api.get_events()})
+            except RobotApiError as error:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
+        if path == "/api/map/current-action":
+            try:
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"active": True, "action": robot_map_api.get_current_action()},
+                )
+            except RobotApiError as error:
+                if error.status_code == 404:
+                    self._send_json(
+                        HTTPStatus.OK, {"active": False, "action": None}
+                    )
+                else:
+                    self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
+        if path.startswith("/api/map/actions/"):
+            action_id = unquote(path[len("/api/map/actions/") :]).strip()
+            if not action_id or "/" in action_id:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "action_id 无效。"})
+                return
+            try:
+                self._send_json(
+                    HTTPStatus.OK, robot_map_api.get_action_status(action_id)
+                )
+            except RobotApiError as error:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
         self.send_error(HTTPStatus.NOT_FOUND, "Page not found")
 
     def do_PUT(self) -> None:
+        self._ksq_request_body_consumed = 0
         path = urlparse(self.path).path
         session = self._require_session(path)
         if session is None or not self._require_admin(session):
+            _drain_request_body(self)
             return
         try:
             if path == "/api/order/config":
@@ -504,19 +664,26 @@ class QueryHandler(BaseHTTPRequestHandler):
                 config = order_api.update_config(payload, mode)
                 self._send_json(HTTPStatus.OK, config)
                 return
+            if path == "/api/map/settings":
+                payload = read_json_body(self)
+                self._send_json(HTTPStatus.OK, robot_map_api.save_settings(payload))
+                return
             self.send_error(HTTPStatus.NOT_FOUND, "Endpoint not found")
         except (LookupError, ValueError, FileNotFoundError, json.JSONDecodeError, OSError) as error:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
 
     def do_POST(self) -> None:
+        self._ksq_request_body_consumed = 0
         path = urlparse(self.path).path
         if path == "/api/auth/login":
             self._handle_login()
             return
         session = self._require_session(path)
         if session is None:
+            _drain_request_body(self)
             return
         if path == "/api/auth/logout":
+            _drain_request_body(self)
             self._handle_logout()
             return
         # 普通用户仅拦截少数编辑类端点，其余操作一律放行。
@@ -524,6 +691,7 @@ class QueryHandler(BaseHTTPRequestHandler):
             session.get("role") != auth.ROLE_ADMIN
             and path in auth.VIEWER_FORBIDDEN_POST_PATHS
         ):
+            _drain_request_body(self)
             self._require_admin(session)
             return
         try:
@@ -1139,6 +1307,94 @@ class QueryHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self._send_json(HTTPStatus.OK, result)
+                return
+            if path == "/api/map/navigate":
+                payload = read_json_body(self)
+                try:
+                    x = _parse_finite_float(payload["x"], "x")
+                    y = _parse_finite_float(payload["y"], "y")
+                except (KeyError, TypeError, ValueError):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "x/y 必须是数字。"})
+                    return
+                yaw = payload.get("yaw")
+                if yaw is not None:
+                    yaw = _parse_finite_float(yaw, "yaw")
+                speed_ratio = _parse_finite_float(
+                    payload.get("speed_ratio", 0.8), "speed_ratio"
+                )
+                if speed_ratio < 0.1 or speed_ratio > 1:
+                    raise ValueError("speed_ratio 必须在 0.1~1 之间。")
+                try:
+                    result = robot_map_api.move_to(
+                        x,
+                        y,
+                        yaw=yaw,
+                        precise=bool(payload.get("precise", True)),
+                        speed_ratio=speed_ratio,
+                    )
+                except RobotApiError as error:
+                    self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path == "/api/map/actions/cancel":
+                _drain_request_body(self)
+                try:
+                    robot_map_api.cancel_current_action()
+                except RobotApiError as error:
+                    self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True})
+                return
+            if path == "/api/map/gohome":
+                _drain_request_body(self)
+                try:
+                    result = robot_map_api.go_home()
+                except RobotApiError as error:
+                    self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path == "/api/map/relocate":
+                _drain_request_body(self)
+                try:
+                    result = robot_map_api.recover_localization()
+                except RobotApiError as error:
+                    self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path == "/api/map/pois":
+                payload = read_json_body(self)
+                name = str(payload.get("name") or "").strip()
+                if not name:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "停留点名称不能为空。"})
+                    return
+                try:
+                    x = _parse_finite_float(payload["x"], "x")
+                    y = _parse_finite_float(payload["y"], "y")
+                except (KeyError, TypeError, ValueError):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "x/y 必须是数字。"})
+                    return
+                try:
+                    result = robot_map_api.create_poi(name, x, y)
+                except RobotApiError as error:
+                    self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path == "/api/map/pois/delete":
+                payload = read_json_body(self)
+                poi_id = str(payload.get("id") or "").strip()
+                if not poi_id:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "id 不能为空。"})
+                    return
+                try:
+                    robot_map_api.delete_poi(poi_id)
+                except RobotApiError as error:
+                    self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True})
                 return
             if path == "/api/reload":
                 with state.DATASET_LOCK:

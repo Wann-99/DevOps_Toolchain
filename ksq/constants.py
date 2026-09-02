@@ -59,6 +59,11 @@ DEFAULT_ETM_BASE_URL: Final[str] = "http://127.0.0.1:12005"
 # Host-mounted path inside knowledge_shelf_query for robot keyboard env sync.
 ROBOT_KEYBOARD_ENV_FILE: Final[Path] = Path("/data/robot_keyboard.env")
 
+# Slamware chassis connection and locally persisted map navigation state.
+DEFAULT_ROBOT_BASE_URL: Final[str] = "http://192.168.11.1:1448"
+ROBOT_MAP_SETTINGS_FILE: Final[Path] = APP_DIRECTORY / "robot_map_settings.json"
+ROBOT_MAP_POIS_FILE: Final[Path] = APP_DIRECTORY / "robot_map_pois_cache.json"
+
 PACKAGE_VERSION: Final[int] = 3
 PACKAGE_SUFFIX: Final[str] = ".kpkg"
 DEFAULT_TOOL_NAME: Final[str] = "double_vacuum_gripper"

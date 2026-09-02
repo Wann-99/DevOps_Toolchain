@@ -34,6 +34,10 @@
         <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="9.5" cy="19.5" r="1.4"/><circle cx="16.5" cy="19.5" r="1.4"/><path d="M3.5 4.5h2l2.3 10.6a1.2 1.2 0 0 0 1.2.9h7.6a1.2 1.2 0 0 0 1.2-.9l1.6-7.1H6"/></svg>
         <span class="nav-label">药品下单</span>
       </button>
+      <button type="button" class="nav-item" data-view="map" title="地图导航">
+        <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-7-6.1-7-11.5A7 7 0 0 1 19 9.5C19 14.9 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.4"/></svg>
+        <span class="nav-label">地图导航</span>
+      </button>
       <button type="button" class="nav-item" data-view="logs" title="日志查询">
         <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 3.5h-7v17h11v-13z"/><path d="M13.5 3.5v4h4"/><path d="M9.5 12.5h5m-5 3.5h5"/></svg>
         <span class="nav-label">日志查询</span>
@@ -780,6 +784,171 @@
       </div>
     </section>
 
+    <section id="view-map" class="view map-view" hidden>
+      <h1>地图导航</h1>
+
+      <div class="map-layout-grid">
+        <aside class="map-events-rail">
+          <div class="card map-events-card">
+            <p class="section-title">事件记录</p>
+            <div class="event-log" id="map-event-log"></div>
+          </div>
+        </aside>
+
+        <div class="map-column-resizer" data-resize-target="events" role="separator" tabindex="0"
+             aria-orientation="vertical" aria-valuemin="220" aria-valuemax="900" aria-valuenow="220"
+             aria-label="调整事件记录区域宽度" title="拖动调整事件记录区域宽度"></div>
+
+        <div class="map-center-column">
+          <div class="card map-display-card">
+            <div class="map-toolbar">
+              <div class="map-title-group">
+                <span class="section-title map-title">地图</span>
+              </div>
+              <div class="map-toolbar-actions">
+                <div class="zoom-controls">
+                  <button type="button" id="map-btn-zoom-out" title="缩小">－</button>
+                  <span id="map-zoom-level">100%</span>
+                  <button type="button" id="map-btn-zoom-in" title="放大">＋</button>
+                </div>
+                <button class="secondary" id="map-btn-zoom-reset">重置视图</button>
+                <button class="secondary" id="map-btn-refresh">刷新</button>
+                <label class="map-auto-refresh-toggle" title="建图或环境变化时开启">
+                  <input type="checkbox" id="map-auto-refresh-toggle" style="width:auto"><span>自动更新</span>
+                </label>
+              </div>
+            </div>
+            <div class="map-live-toolbar" role="group" aria-label="实时地图图层">
+              <span class="map-live-toolbar-title">实时图层</span>
+              <label class="map-layer-toggle" title="显示当前激光扫描到的有效点">
+                <input type="checkbox" id="map-live-scan-toggle" checked>
+                <span>障碍物</span>
+              </label>
+              <label class="map-layer-toggle" title="显示当前雷达的观测扇区和距离">
+                <input type="checkbox" id="map-radar-toggle" checked>
+                <span>雷达</span>
+              </label>
+              <label class="map-layer-toggle" title="保留最近几帧扫描点，辅助观察移动方向">
+                <input type="checkbox" id="map-trail-toggle">
+                <span>轨迹</span>
+              </label>
+              <label class="map-layer-toggle" title="地图视角跟随底盘当前位置">
+                <input type="checkbox" id="map-follow-toggle" checked>
+                <span>跟随</span>
+              </label>
+              <span class="map-live-spacer"></span>
+              <div class="map-live-stats">
+                <span class="map-telemetry-status" id="map-telemetry-status" aria-live="polite">等待实时数据</span>
+                <span class="map-telemetry-meta" id="map-telemetry-quality">定位质量 —</span>
+                <span class="map-telemetry-meta" id="map-telemetry-range">观测范围 —</span>
+                <span class="map-telemetry-meta map-telemetry-age" id="map-telemetry-age">延迟 <span class="map-telemetry-age-value" id="map-telemetry-age-value">—</span><span> ms</span></span>
+              </div>
+            </div>
+            <div class="map-wrap">
+              <canvas id="map-canvas" width="900" height="620"></canvas>
+              <div class="map-status-overlay" id="map-status-overlay" role="status" aria-live="polite">
+                <div class="status-item"><span class="dot" id="map-status-dot"></span><span id="map-status-text">未连接</span></div>
+                <div class="status-item">🔋 <span id="map-battery-text">—</span></div>
+                <div class="status-item">📍 定位：<span id="map-loc-text">—</span></div>
+                <div class="status-item">🔌 <span id="map-dock-text">—</span></div>
+                <div class="status-item">当前动作：<span id="map-action-text">空闲</span></div>
+              </div>
+              <div class="map-hint" aria-hidden="true">滚轮缩放 · 拖拽平移 · 单击选点（导航 / 存为停留点）</div>
+              <div class="click-popover" id="map-click-popover" hidden>
+                <h4>选中位置</h4>
+                <p class="coord" id="map-popover-coord">x=0.00, y=0.00</p>
+                <div class="actions">
+                  <button class="primary" id="map-btn-go-here">导航过去</button>
+                  <button class="secondary" id="map-btn-save-here">存为停留点</button>
+                  <button class="secondary" id="map-btn-cancel-popover">取消</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="map-column-resizer" data-resize-target="center" role="separator" tabindex="0"
+             aria-orientation="vertical" aria-valuemin="260" aria-valuemax="1200" aria-valuenow="260"
+             aria-label="调整地图区域宽度" title="拖动调整地图与功能区宽度"></div>
+
+        <aside class="map-control-rail">
+          <nav class="map-drawer-tabs" aria-label="地图功能分类" role="tablist">
+            <button type="button" class="map-drawer-tab" role="tab" data-drawer-target="map-connection-card"
+                    aria-controls="map-connection-card" aria-selected="true" aria-expanded="true" title="底盘连接">
+              <span>底盘连接</span>
+            </button>
+            <button type="button" class="map-drawer-tab" role="tab" data-drawer-target="map-chassis-card"
+                    aria-controls="map-chassis-card" aria-selected="false" aria-expanded="false" title="底盘操作">
+              <span>底盘操作</span>
+            </button>
+            <button type="button" class="map-drawer-tab" role="tab" data-drawer-target="map-poi-card"
+                    aria-controls="map-poi-card" aria-selected="false" aria-expanded="false" title="停留点">
+              <span>停留点</span>
+            </button>
+            <button type="button" class="map-drawer-tab" role="tab" data-drawer-target="map-patrol-card"
+                    aria-controls="map-patrol-card" aria-selected="false" aria-expanded="false" title="巡逻任务">
+              <span>巡逻任务</span>
+            </button>
+          </nav>
+          <details class="card map-control-card map-side-section map-connection-section" id="map-connection-card" open>
+            <summary class="map-side-summary">
+              <span class="section-title">底盘连接</span>
+            </summary>
+            <div class="map-side-body">
+              <div class="path-fields order-config-grid">
+                <label class="path-field"><span>底盘地址</span><input id="map-robot-url" type="text" placeholder="http://192.168.11.1:1448"></label>
+              </div>
+              <div class="actions">
+                <button class="secondary" id="map-btn-test-connection">测试连接</button>
+                <button class="primary" id="map-btn-save-connection">保存</button>
+              </div>
+              <p class="meta compact" id="map-connection-status"></p>
+            </div>
+          </details>
+
+          <details class="card map-control-card map-side-section map-chassis-card" id="map-chassis-card">
+            <summary class="map-side-summary">
+              <span class="section-title">底盘操作</span>
+            </summary>
+            <div class="map-side-body">
+              <div class="map-status-actions">
+                <button class="secondary" id="map-btn-gohome">回桩充电</button>
+                <button class="secondary" id="map-btn-relocate" title="定位丢失或漂移时，让机器人原地旋转重新确认自己在地图上的位置">重定位</button>
+              </div>
+            </div>
+          </details>
+
+          <details class="card map-control-card map-side-section map-poi-card" id="map-poi-card">
+            <summary class="map-side-summary">
+              <span class="section-title">停留点</span>
+            </summary>
+            <div class="map-side-body">
+              <div class="poi-list" id="map-poi-list"></div>
+            </div>
+          </details>
+
+          <details class="card map-control-card map-side-section map-patrol-card" id="map-patrol-card">
+            <summary class="map-side-summary">
+              <span class="section-title">巡逻任务</span>
+            </summary>
+            <div class="map-side-body">
+              <div class="patrol-queue" id="map-patrol-queue"></div>
+              <div class="switch-row">
+                <input type="checkbox" id="map-loop-toggle" checked>
+                <label for="map-loop-toggle">循环巡逻</label>
+              </div>
+              <div class="patrol-controls">
+                <button class="primary" id="map-btn-patrol-start">开始巡逻</button>
+                <button class="secondary" id="map-btn-patrol-pause" disabled>暂停</button>
+                <button class="danger" id="map-btn-patrol-stop" disabled>停止</button>
+              </div>
+              <hr class="sep">
+              <p class="meta compact" id="map-patrol-status">尚未开始巡逻</p>
+            </div>
+          </details>
+        </aside>
+      </div>
+    </section>
     <section id="view-logs" class="view" hidden>
       <h1>日志查询</h1>
       <div class="card">
@@ -828,6 +997,7 @@
 <script src="/static/test-order.js"></script>
 <script src="/static/logs.js"></script>
 <script src="/static/dashboard.js"></script>
+<script src="/static/map.js"></script>
 <script src="/static/settings.js"></script>
 <script src="/static/app-init.js"></script>
 </body>

@@ -1,0 +1,2176 @@
+(function (global) {
+  "use strict";
+
+  // ---------------------------------------------------------------------
+  // 地图图片与机器人实时位姿均已接入真实机器人接口（依据机器人固件自带的
+  // OpenAPI 文档 http://<机器人IP>:1448/index.html 核实过）：
+  // - 地图：GET /api/map/image（后端解析 explore 栅格二进制并转成 PNG，
+  //   响应头带 X-Map-Origin-X/Y、X-Map-Resolution、X-Map-Width/Height）。
+  // - 位姿：GET /api/map/pose（每秒轮询一次，持续跟随机器人实际位置，不再
+  //   依赖导航完成后才跳变更新）。
+  // 栅格数据的行扫描方向（第一行对应地图 Y 最小还是最大）沿用了机器人
+  // 主流 SLAM 惯例（第一行 = Y 最小），后端已做垂直翻转让图片"上北下南"；
+  // 如果现场发现地图图片和真实场地方向对不上（比如机器人在图上的移动方向
+  // 和地图明显反了），大概率就是这个扫描方向假设需要调整，去改
+  // ksq/web/robot_map_api.py 的 get_map_image() 里的翻转逻辑即可。
+  // ---------------------------------------------------------------------
+
+  const canvas = document.getElementById("map-canvas");
+  if (!canvas) return; // shell.html 未加载到该 view 时（理论上不会发生）
+  const ctx = canvas.getContext("2d");
+  // W/H 是地图逻辑坐标；实际 backing store 随显示尺寸和 DPR 调整，
+  // 避免宽屏下先画到 900px 再被 CSS 二次放大而变糊。
+  const W = canvas.width;
+  const H = canvas.height;
+  let backingScaleX = 1;
+  let backingScaleY = 1;
+
+  function syncCanvasResolution() {
+    const rect = canvas.getBoundingClientRect();
+    const cssScale = rect.width > 0 ? rect.width / W : 1;
+    const dpr = Math.max(
+      1,
+      Math.min(3, Number(global.devicePixelRatio) || 1)
+    );
+    // 至少保留 0.5 倍逻辑分辨率，避免窄屏产生过小的 backing store。
+    const renderScale = Math.max(0.5, Math.min(3, cssScale * dpr));
+    const backingWidth = Math.max(1, Math.round(W * renderScale));
+    const backingHeight = Math.max(1, Math.round(H * renderScale));
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    if (canvas.width === backingWidth && canvas.height === backingHeight) return;
+    canvas.width = backingWidth;
+    canvas.height = backingHeight;
+    backingScaleX = canvas.width / W;
+    backingScaleY = canvas.height / H;
+  }
+
+  // 初始上下文可能在地图页隐藏时创建；首次显示时由 drawMap/ResizeObserver
+  // 再按可见宽度同步一次。
+  syncCanvasResolution();
+
+  // 状态条由页面壳层预留在地图右下角。兼容旧版壳层时，仅移动状态项本身，
+  // 不移动包含回桩/重定位按钮的整张状态卡，避免改变其它操作入口的位置。
+  function installMapStatusOverlay() {
+    const mapWrap = canvas.closest(".map-wrap");
+    if (!mapWrap) return;
+    let overlay = document.getElementById("map-status-overlay");
+    if (!overlay) {
+      overlay = document.createElement("div");
+      overlay.id = "map-status-overlay";
+      overlay.className = "map-status-overlay";
+      overlay.setAttribute("role", "status");
+      overlay.setAttribute("aria-live", "polite");
+      mapWrap.appendChild(overlay);
+    }
+    [
+      "map-status-dot",
+      "map-status-text",
+      "map-battery-text",
+      "map-loc-text",
+      "map-dock-text",
+      "map-action-text",
+    ].forEach((id) => {
+      const node = document.getElementById(id);
+      if (!node || overlay.contains(node)) return;
+      const item = node.closest(".status-item");
+      if (item && item !== overlay && !overlay.contains(item)) overlay.appendChild(item);
+    });
+  }
+
+  function mapStatusElement(id) {
+    const overlay = document.getElementById("map-status-overlay");
+    return (overlay && overlay.querySelector("#" + id)) || document.getElementById(id);
+  }
+
+  // 占位分辨率/原点：真实地图加载成功后会被 mapMeta 覆盖（见 pxToWorld/worldToPx）。
+  const RES = 0.05;
+  const ORIGIN_PX = { x: W / 2, y: H / 2 };
+  let mapMeta = null; // { origin_x, origin_y, width, height, resolution }
+  let mapImage = null; // 已加载的 <img>，绘制在世界坐标 (origin_x, origin_y) 起的栅格区域
+  let mapImageUrl = null; // 上一次 blob URL，加载新图前需要 revoke 避免泄漏
+
+  function pxToWorld(px, py) {
+    if (mapMeta) {
+      return {
+        x: mapMeta.origin_x + px * mapMeta.resolution,
+        y: mapMeta.origin_y + (mapMeta.height - py) * mapMeta.resolution,
+      };
+    }
+    return { x: (px - ORIGIN_PX.x) * RES, y: (ORIGIN_PX.y - py) * RES };
+  }
+  function worldToPx(wx, wy) {
+    if (mapMeta) {
+      return {
+        x: (wx - mapMeta.origin_x) / mapMeta.resolution,
+        y: mapMeta.height - (wy - mapMeta.origin_y) / mapMeta.resolution,
+      };
+    }
+    return { x: ORIGIN_PX.x + wx / RES, y: ORIGIN_PX.y - wy / RES };
+  }
+
+  let view = { scale: 1, x: 0, y: 0 };
+  // 适配画布的比例作为用户可见的 100% 基准，避免默认放大后显示成 149% 等数值。
+  let zoomBaseScale = 1;
+  let MIN_SCALE = 0.05;
+  let MAX_SCALE = 8;
+  let mapUnitsPerScreenPixel = 1;
+
+  function screenPx(value) {
+    return value * mapUnitsPerScreenPixel;
+  }
+
+  function fitToView() {
+    if (!mapMeta || !mapMeta.width || !mapMeta.height) return;
+    // 保留极窄安全边距，尽量让地图内容铺满画布，同时维持等比例投影。
+    const fitScale = Math.min(W / mapMeta.width, H / mapMeta.height) * 0.98;
+    MIN_SCALE = Math.min(MIN_SCALE, fitScale / 2);
+    zoomBaseScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, fitScale));
+    view.scale = zoomBaseScale;
+    view.x = (W - mapMeta.width * view.scale) / 2;
+    view.y = (H - mapMeta.height * view.scale) / 2;
+    mapHasBeenFitted = true;
+    centerViewOnRobot();
+    setZoomLabel();
+  }
+
+  let pois = []; // { id, name, x, y }
+  let zones = { areas: [], lines: [] }; // 禁行/危险/电梯等矩形区域 + 虚拟墙/轨道
+  let robot = { x: 0, y: 0, yaw: 0, target: null, moving: false, hasFix: false };
+
+  // 实时传感器数据只保留在浏览器内存中，作为地图底图上方的临时图层。
+  // 后端负责从底盘采集并缓存快照，前端只消费一个快照接口，避免多浏览器把
+  // 请求压力直接放到底盘上。
+  const TELEMETRY_POLL_MS = 200;
+  const TELEMETRY_STALE_MS = 1000;
+  const TELEMETRY_TRAIL_MS = 1800;
+  const TELEMETRY_TRAIL_MAX_FRAMES = 8;
+  const ROBOT_STATUS_POLL_MS = 2000;
+  let telemetry = {
+    latest: null,
+    points: [],
+    trail: [],
+    scanPose: null,
+    radar: null,
+    receivedAtMs: 0,
+    capturedAtMs: 0,
+    ageMs: Infinity,
+    stale: true,
+    partial: false,
+    requestError: false,
+    error: "",
+    hasFrame: false,
+  };
+  const mapLayers = {
+    liveScan: true,
+    radar: true,
+    trail: false,
+    follow: true,
+  };
+  let telemetryActive = false;
+  let telemetryTimer = null;
+  let telemetryAgeTimer = null;
+  let telemetryRequestInFlight = false;
+  let telemetryPollDelay = TELEMETRY_POLL_MS;
+  let telemetryErrorLogged = false;
+  let robotStatusTimer = null;
+  let robotStatusRequestInFlight = false;
+  let poseFallbackTimer = null;
+  let poseRequestInFlight = false;
+  let mapImageRequestInFlight = false;
+  let mapHasBeenFitted = false;
+  let pendingClick = null;
+  let patrolQueue = []; // indexes into pois
+  let patrolIndex = 0;
+  let patrolRunning = false;
+  let patrolPaused = false;
+  let currentActionId = null;
+
+  function clientToCanvasPx(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = W / rect.width;
+    const scaleY = H / rect.height;
+    return {
+      x: (clientX - rect.left) * scaleX,
+      y: (clientY - rect.top) * scaleY,
+      rect,
+      scaleX,
+      scaleY,
+    };
+  }
+  function canvasPxToMapPx(cx, cy) {
+    return { x: (cx - view.x) / view.scale, y: (cy - view.y) / view.scale };
+  }
+  function setZoomLabel() {
+    document.getElementById("map-zoom-level").textContent =
+      Math.round((view.scale / zoomBaseScale) * 100) + "%";
+  }
+  function zoomAt(cx, cy, factor) {
+    const before = canvasPxToMapPx(cx, cy);
+    const newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, view.scale * factor));
+    view.x = cx - before.x * newScale;
+    view.y = cy - before.y * newScale;
+    view.scale = newScale;
+    setZoomLabel();
+    drawMap();
+  }
+
+  function finiteNumber(value) {
+    const number = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  function firstFinite() {
+    for (let index = 0; index < arguments.length; index += 1) {
+      const value = finiteNumber(arguments[index]);
+      if (value !== null) return value;
+    }
+    return null;
+  }
+
+  function timestampMs(value) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value < 100000000000 ? value * 1000 : value;
+    }
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Date.parse(value);
+      if (Number.isFinite(parsed)) return parsed;
+      const numeric = finiteNumber(value);
+      if (numeric !== null) return numeric < 100000000000 ? numeric * 1000 : numeric;
+    }
+    return 0;
+  }
+
+  function extractPose(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const pose = raw.pose && typeof raw.pose === "object" ? raw.pose : raw;
+    const position = pose.position && typeof pose.position === "object" ? pose.position : {};
+    const translation = pose.translation && typeof pose.translation === "object" ? pose.translation : {};
+    const orientation = pose.orientation && typeof pose.orientation === "object" ? pose.orientation : {};
+    const x = firstFinite(pose.x, position.x, translation.x);
+    const y = firstFinite(pose.y, position.y, translation.y);
+    if (x === null || y === null) return null;
+    let yaw = firstFinite(pose.yaw, pose.theta, pose.heading, orientation.yaw);
+    if (yaw === null) {
+      const qx = firstFinite(orientation.x, pose.qx);
+      const qy = firstFinite(orientation.y, pose.qy);
+      const qz = firstFinite(orientation.z, pose.qz);
+      const qw = firstFinite(orientation.w, pose.qw);
+      if (qx !== null && qy !== null && qz !== null && qw !== null) {
+        yaw = Math.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz));
+      }
+    }
+    return { x, y, yaw: yaw === null ? 0 : yaw };
+  }
+
+  function angleInRadians(value, source) {
+    const number = finiteNumber(value);
+    if (number === null) return null;
+    const unit = String(
+      source && (source.angle_unit || source.angleUnit || source.angle_units || "")
+    ).toLowerCase();
+    return unit.indexOf("deg") === 0 ? (number * Math.PI) / 180 : number;
+  }
+
+  function normalizeLaserPoints(scan) {
+    if (!scan || typeof scan !== "object") return [];
+    let rawPoints = scan.laser_points || scan.laserPoints || scan.points;
+    if (!Array.isArray(rawPoints) && Array.isArray(scan.ranges)) {
+      const start = firstFinite(scan.angle_min, scan.angleMin, 0) || 0;
+      const increment = firstFinite(scan.angle_increment, scan.angleIncrement, 0) || 0;
+      rawPoints = scan.ranges.map((range, index) => ({
+        distance: range,
+        angle: start + increment * index,
+        valid: true,
+      }));
+    }
+    if (!Array.isArray(rawPoints)) return [];
+    return rawPoints
+      .map((point) => {
+        let distance;
+        let angle;
+        let valid = true;
+        if (Array.isArray(point)) {
+          distance = point[0];
+          angle = point[1];
+          if (point.length > 2) valid = point[2] === 0 ? false : point[2] !== false;
+        } else if (point && typeof point === "object") {
+          distance = point.distance;
+          if (distance === undefined) distance = point.range;
+          angle = point.angle;
+          if (angle === undefined) angle = point.theta;
+          if (point.valid !== undefined) {
+            valid = point.valid === 0 ? false : point.valid !== false;
+          }
+          if (point.is_valid !== undefined) {
+            valid = point.is_valid === 0 ? false : point.is_valid !== false;
+          }
+        }
+        const d = finiteNumber(distance);
+        const a = angleInRadians(angle, scan);
+        if (!valid || d === null || a === null || d <= 0) return null;
+        return { distance: d, angle: a };
+      })
+      .filter(Boolean);
+  }
+
+  function buildRadarSpec(snapshot, scan, points) {
+    const sources = [];
+    if (snapshot && snapshot.radar && typeof snapshot.radar === "object") sources.push(snapshot.radar);
+    if (snapshot && snapshot.sensor_info && typeof snapshot.sensor_info === "object") {
+      sources.push(snapshot.sensor_info);
+    }
+    if (snapshot && snapshot.sensorInfo && typeof snapshot.sensorInfo === "object") {
+      sources.push(snapshot.sensorInfo);
+    }
+    if (scan && scan.radar && typeof scan.radar === "object") sources.push(scan.radar);
+    if (scan && typeof scan === "object") sources.push(scan);
+    const read = (names) => {
+      for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex += 1) {
+        const source = sources[sourceIndex];
+        for (let nameIndex = 0; nameIndex < names.length; nameIndex += 1) {
+          const value = finiteNumber(source[names[nameIndex]]);
+          if (value !== null) return { value, source };
+        }
+      }
+      return null;
+    };
+    const maxRangeRead = read([
+      "observed_range_max",
+      "observedRangeMax",
+      "max_range",
+      "maxRange",
+      "range_max",
+      "rangeMax",
+      "max_distance",
+      "maxDistance",
+    ]);
+    const minAngleRead = read([
+      "observed_angle_min",
+      "observedAngleMin",
+      "min_angle",
+      "minAngle",
+      "angle_min",
+      "angleMin",
+    ]);
+    const maxAngleRead = read([
+      "observed_angle_max",
+      "observedAngleMax",
+      "max_angle",
+      "maxAngle",
+      "angle_max",
+      "angleMax",
+    ]);
+    const fovRead = read(["fov", "field_of_view", "fieldOfView", "scan_angle"]);
+    let maxRange = maxRangeRead ? maxRangeRead.value : null;
+    if (maxRange !== null && maxRange <= 0) maxRange = null;
+    if (maxRange !== null) maxRange = Math.min(30, maxRange);
+    if (maxRange === null && points.length) {
+      maxRange = Math.max.apply(null, points.map((point) => point.distance));
+      if (maxRange > 0) maxRange = Math.min(30, maxRange * 1.05);
+    }
+    if (maxRange === null || !Number.isFinite(maxRange)) return null;
+    let minAngle = minAngleRead ? angleInRadians(minAngleRead.value, minAngleRead.source) : null;
+    let maxAngle = maxAngleRead ? angleInRadians(maxAngleRead.value, maxAngleRead.source) : null;
+    if (fovRead) {
+      const fov = angleInRadians(fovRead.value, fovRead.source);
+      if (fov !== null && fov > 0) {
+        const center = minAngle !== null && maxAngle !== null ? (minAngle + maxAngle) / 2 : 0;
+        minAngle = center - fov / 2;
+        maxAngle = center + fov / 2;
+      }
+    }
+    if (minAngle === null || maxAngle === null) {
+      if (!points.length) return null;
+      minAngle = Math.min.apply(null, points.map((point) => point.angle));
+      maxAngle = Math.max.apply(null, points.map((point) => point.angle));
+    }
+    if (maxAngle < minAngle) {
+      const swap = minAngle;
+      minAngle = maxAngle;
+      maxAngle = swap;
+    }
+    if (maxAngle - minAngle < 0.05) {
+      const center = (minAngle + maxAngle) / 2;
+      minAngle = center - 0.025;
+      maxAngle = center + 0.025;
+    }
+    return { minAngle, maxAngle, maxRange };
+  }
+
+  function projectScanPoints(scanPose, points) {
+    if (!scanPose || !points.length) return [];
+    return points.map((point) => {
+      const heading = scanPose.yaw + point.angle;
+      return {
+        x: scanPose.x + point.distance * Math.cos(heading),
+        y: scanPose.y + point.distance * Math.sin(heading),
+        distance: point.distance,
+        angle: point.angle,
+      };
+    });
+  }
+
+  function centerViewOnRobot() {
+    if (!mapLayers.follow || !robot.hasFix) return;
+    const point = worldToPx(robot.x, robot.y);
+    view.x = W / 2 - point.x * view.scale;
+    view.y = H / 2 - point.y * view.scale;
+  }
+
+  function updateTelemetryStatus() {
+    const statusEl = document.getElementById("map-telemetry-status");
+    const qualityEl = document.getElementById("map-telemetry-quality");
+    const ageEl = document.getElementById("map-telemetry-age");
+    const ageValueEl = document.getElementById("map-telemetry-age-value");
+    const rangeEl = document.getElementById("map-telemetry-range");
+    const locEl = mapStatusElement("map-loc-text");
+    if (!statusEl && !qualityEl && !ageEl && !ageValueEl && !rangeEl && !locEl) return;
+    const age = telemetry.ageMs;
+    const ageText = Number.isFinite(age) ? String(Math.max(0, Math.round(age))) : "—";
+    if (statusEl) {
+      let text = "等待实时数据";
+      if ((telemetry.requestError || telemetry.error) && !telemetry.hasFrame) {
+        text = "实时数据不可用";
+      }
+      else if (telemetry.requestError) text = "实时数据请求异常";
+      else if (telemetry.stale) text = "实时数据过期";
+      else if (telemetry.partial) text = "激光实时（部分数据缺失）";
+      else if (telemetry.hasFrame) text = "实时数据正常";
+      statusEl.textContent = text;
+      statusEl.classList.toggle("is-stale", telemetry.stale || telemetry.requestError);
+      statusEl.classList.toggle(
+        "is-partial",
+        !telemetry.stale && !telemetry.requestError && telemetry.partial
+      );
+      statusEl.classList.toggle(
+        "is-live",
+        telemetry.hasFrame && !telemetry.stale && !telemetry.partial && !telemetry.requestError
+      );
+    }
+    if (qualityEl) {
+      const quality = telemetry.latest && firstFinite(
+        telemetry.latest.localization_quality,
+        telemetry.latest.localizationQuality,
+        telemetry.latest.quality
+      );
+      qualityEl.textContent = quality === null ? "定位质量 —" : `定位质量 ${Math.round(quality)}`;
+    }
+    if (ageValueEl) ageValueEl.textContent = ageText;
+    else if (ageEl) ageEl.textContent = `延迟 ${ageText} ms`;
+    if (rangeEl) {
+      if (telemetry.radar) {
+        const degrees = ((telemetry.radar.maxAngle - telemetry.radar.minAngle) * 180) / Math.PI;
+        rangeEl.textContent = `观测 ${Math.round(Math.min(360, degrees))}° · ${telemetry.radar.maxRange.toFixed(1)} m`;
+      } else {
+        rangeEl.textContent = "观测范围 —";
+      }
+    }
+    // 定位状态随遥测快照变化，不在电源轮询中写死为“正常”。
+    if (locEl && telemetry.latest) {
+      const hasPose = Boolean(telemetrySnapshotPose(telemetry.latest));
+      locEl.textContent = hasPose ? (telemetry.stale ? "待确认" : "正常") : "未知";
+    }
+  }
+
+  function drawRadarOverlay() {
+    if (!mapLayers.radar || !telemetry.radar) return;
+    const pose = telemetry.scanPose || (robot.hasFix ? robot : null);
+    if (!pose) return;
+    const spec = telemetry.radar;
+    const center = worldToPx(pose.x, pose.y);
+    const span = Math.min(Math.PI * 2, Math.max(0.05, spec.maxAngle - spec.minAngle));
+    const sampleCount = span >= Math.PI * 1.99 ? 96 : Math.max(12, Math.ceil(span * 24));
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(center.x, center.y);
+    for (let index = 0; index <= sampleCount; index += 1) {
+      const relativeAngle = spec.minAngle + (span * index) / sampleCount;
+      const wx = pose.x + spec.maxRange * Math.cos(pose.yaw + relativeAngle);
+      const wy = pose.y + spec.maxRange * Math.sin(pose.yaw + relativeAngle);
+      const point = worldToPx(wx, wy);
+      ctx.lineTo(point.x, point.y);
+    }
+    ctx.closePath();
+    ctx.fillStyle = telemetry.stale ? "rgba(52,211,153,0.05)" : "rgba(52,211,153,0.13)";
+    ctx.fill();
+    ctx.strokeStyle = telemetry.stale ? "rgba(52,211,153,0.22)" : "rgba(52,211,153,0.62)";
+    ctx.lineWidth = screenPx(1.25);
+    ctx.setLineDash([screenPx(6), screenPx(5)]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+
+  function drawScanPoints(points, color, alpha) {
+    if (!points || !points.length) return;
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.globalAlpha = alpha;
+    const radius = screenPx(2.3);
+    points.forEach((point) => {
+      const pixel = worldToPx(point.x, point.y);
+      ctx.beginPath();
+      ctx.arc(pixel.x, pixel.y, radius, 0, Math.PI * 2);
+      ctx.fill();
+    });
+    ctx.restore();
+  }
+
+  function drawTelemetryTrail() {
+    if (!mapLayers.trail || !telemetry.trail.length) return;
+    const now = Date.now();
+    telemetry.trail.forEach((frame) => {
+      const age = Math.max(0, now - frame.at);
+      if (age > TELEMETRY_TRAIL_MS) return;
+      const alpha = Math.max(0.04, 0.32 * (1 - age / TELEMETRY_TRAIL_MS));
+      drawScanPoints(frame.points, "#67e8f9", alpha);
+    });
+  }
+
+  function drawLiveScan() {
+    if (!mapLayers.liveScan || !telemetry.points.length) return;
+    // A stale frame remains useful as context during a short transport hiccup,
+    // but its lower opacity makes it impossible to mistake for fresh hits.
+    drawScanPoints(telemetry.points, "#fbbf24", telemetry.stale ? 0.24 : 0.95);
+  }
+
+  function drawMap() {
+    syncCanvasResolution();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // 地图外部也使用栅格图的“未探索”灰色，避免出现另一层深色画布。
+    ctx.fillStyle = "#cdcdcd";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    const displayedWidth = canvas.getBoundingClientRect().width;
+    mapUnitsPerScreenPixel =
+      (displayedWidth > 0 ? W / displayedWidth : 1) / view.scale;
+    ctx.setTransform(
+      backingScaleX * view.scale,
+      0,
+      0,
+      backingScaleY * view.scale,
+      backingScaleX * view.x,
+      backingScaleY * view.y
+    );
+
+    if (mapImage && mapMeta) {
+      // 图片已在后端按世界坐标做过垂直翻转，(0,0) 对应 pxToWorld(0,0)。
+      ctx.drawImage(mapImage, 0, 0, mapMeta.width, mapMeta.height);
+    } else {
+      ctx.strokeStyle = "#2c473f";
+      ctx.lineWidth = screenPx(1);
+      for (let gx = 0; gx <= W; gx += 40) {
+        ctx.beginPath();
+        ctx.moveTo(gx, 0);
+        ctx.lineTo(gx, H);
+        ctx.stroke();
+      }
+      for (let gy = 0; gy <= H; gy += 40) {
+        ctx.beginPath();
+        ctx.moveTo(0, gy);
+        ctx.lineTo(W, gy);
+        ctx.stroke();
+      }
+      ctx.fillStyle = "#5d8f82";
+      ctx.font = `${screenPx(12)}px sans-serif`;
+      ctx.fillText(
+        "占位网格 · 地图图片加载中或暂不可用",
+        screenPx(14),
+        screenPx(20)
+      );
+    }
+
+    // 传感器范围置于静态区域之下，实时点置于区域之上，便于同时判断
+    // "规划限制"与"当前观测"是否重叠。
+    drawRadarOverlay();
+    drawTelemetryTrail();
+    drawZones();
+    drawLiveScan();
+
+    // 停留点
+    pois.forEach((p, i) => {
+      const pt = worldToPx(p.x, p.y);
+      ctx.fillStyle = "#0f766e";
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, screenPx(9), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "#e7f2ef";
+      ctx.lineWidth = screenPx(2);
+      ctx.stroke();
+      ctx.fillStyle = "#fff";
+      ctx.font = `bold ${screenPx(10)}px sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(String(i + 1), pt.x, pt.y);
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+      ctx.fillStyle = "#d5e8e2";
+      ctx.font = `${screenPx(11)}px sans-serif`;
+      ctx.fillText(p.name, pt.x + screenPx(12), pt.y + screenPx(4));
+    });
+
+    if (pendingClick) {
+      const pt = worldToPx(pendingClick.x, pendingClick.y);
+      ctx.strokeStyle = "#ffd166";
+      ctx.lineWidth = screenPx(2);
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, screenPx(10), 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    if (robot.target) {
+      const from = worldToPx(robot.x, robot.y);
+      const to = worldToPx(robot.target.x, robot.target.y);
+      ctx.setLineDash([screenPx(5), screenPx(5)]);
+      ctx.strokeStyle = "#57d9a3";
+      ctx.lineWidth = screenPx(2);
+      ctx.beginPath();
+      ctx.moveTo(from.x, from.y);
+      ctx.lineTo(to.x, to.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    if (robot.hasFix) {
+      drawRobotIcon(worldToPx(robot.x, robot.y), robot.yaw || 0, robot.moving);
+    }
+  }
+
+  function installMapResizeObserver() {
+    const target = canvas.closest(".map-wrap");
+    if (!target) return;
+    if (typeof global.ResizeObserver === "function") {
+      const observer = new global.ResizeObserver(() => drawMap());
+      observer.observe(target);
+    }
+    if (typeof global.addEventListener === "function") {
+      global.addEventListener("resize", drawMap);
+    }
+  }
+
+  // 参照 RoboStudio 里底盘图标的构图重画：蓝色车身圆 + 淡色安全圈 +
+  // 红色朝向三角 + 对称的 X/Y 局部坐标轴，比之前的纯圆点直观得多，一眼能看出
+  // 机器人当前朝向和车体坐标方向。
+  function drawRobotIcon(rp, yaw, moving) {
+    const BODY_R = 11;
+    ctx.save();
+    ctx.translate(rp.x, rp.y);
+    ctx.scale(screenPx(1), screenPx(1));
+    ctx.rotate(-yaw); // 世界坐标逆时针为正角，画布坐标 Y 轴相反，取负号对齐
+
+    // 底盘局部坐标轴：X+ 沿车头，Y+ 指向车头左侧，随底盘朝向同步旋转。
+    // 两条轴使用同一套几何样式；颜色只用于区分坐标轴（X 红、Y 青）。
+    // 轴长和线宽均在缩放后的局部坐标中换算，始终保持稳定的屏幕像素大小。
+    const axisLen = 36;
+    const axisHead = 6;
+    function drawAxisArrow(endX, endY, color, label, labelX, labelY) {
+      const angle = Math.atan2(endY, endX);
+      ctx.save();
+      // 先描白边，再绘制主体，避免轴线落在灰色地图或雷达扇区上时失去对比度。
+      ctx.strokeStyle = "rgba(255,255,255,.9)";
+      ctx.lineWidth = 5;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(endX, endY);
+      ctx.stroke();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(endX, endY);
+      ctx.stroke();
+      ctx.translate(endX, endY);
+      ctx.rotate(angle);
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(-axisHead, -axisHead * 0.58);
+      ctx.lineTo(-axisHead, axisHead * 0.58);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+      ctx.font = "bold 11px sans-serif";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.lineWidth = 3.5;
+      ctx.strokeStyle = "rgba(255,255,255,.95)";
+      ctx.strokeText(label, endX + labelX, endY + labelY);
+      ctx.fillStyle = color;
+      ctx.fillText(label, endX + labelX, endY + labelY);
+      ctx.textBaseline = "alphabetic";
+    }
+
+    // 安全圈光晕
+    ctx.fillStyle = "rgba(91,111,214,0.22)";
+    ctx.beginPath();
+    ctx.arc(0, 0, BODY_R + 7, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 两条轴先绘制，随后由车身覆盖中心部分；这样箭头、标签和长度完全一致，
+    // 车身内部仍保持干净，红色 X 轴同时继续表达底盘朝向。
+    drawAxisArrow(axisLen, 0, "#d92626", "X", 5, 0);
+    drawAxisArrow(0, -axisLen, "#0891b2", "Y", 4, -1);
+
+    // 车身
+    ctx.fillStyle = moving ? "#4a63d6" : "#5b6fd6";
+    ctx.beginPath();
+    ctx.arc(0, 0, BODY_R, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "#1c2b6e";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // 车身一侧的小凸块（呼应实体底盘上传感器/接口的不对称外形）
+    ctx.fillStyle = "#8b93a6";
+    ctx.fillRect(-BODY_R - 5, -4, 6, 8);
+
+    // 朝向三角
+    ctx.fillStyle = "#d92626";
+    ctx.beginPath();
+    ctx.moveTo(BODY_R - 1, 0);
+    ctx.lineTo(-4, -6.5);
+    ctx.lineTo(-4, 6.5);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  // 禁行/危险/电梯等矩形区域 + 虚拟墙/虚拟轨道——这些是矢量配置数据，跟栅格
+  // 地图图片是分开存的，不叠加这层的话只看地图图片是看不到的（这也是之前
+  // 反馈"看不到设置的区域"的原因）。
+  const ZONE_COLORS = {
+    forbidden_area: "#e5484d",
+    dangerous_area: "#f5a524",
+    elevator_area: "#8b5cf6",
+    coverage_area: "#3b82f6",
+    maintenance_area: "#9ca3af",
+    sensor_disable_area: "#14b8a6",
+    restricted_area: "#ec4899",
+  };
+  const ZONE_LABELS = {
+    forbidden_area: "禁行",
+    dangerous_area: "危险",
+    elevator_area: "电梯",
+    coverage_area: "覆盖",
+    maintenance_area: "运维",
+    sensor_disable_area: "传感器禁用",
+    restricted_area: "限行",
+  };
+  const LINE_COLORS = { walls: "#eab308", tracks: "#22d3ee" };
+
+  function drawZones() {
+    const pxPerMeter = mapMeta ? 1 / mapMeta.resolution : 1 / RES;
+
+    (zones.areas || []).forEach((area) => {
+      const a = area.area || {};
+      const start = a.start;
+      const end = a.end;
+      if (!start || !end) return;
+      const halfWidth = typeof a.half_width === "number" ? a.half_width : 0.3;
+      const p1 = worldToPx(start.x, start.y);
+      const p2 = worldToPx(end.x, end.y);
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const hwPx = halfWidth * pxPerMeter;
+      const nx = (-dy / len) * hwPx;
+      const ny = (dx / len) * hwPx;
+      const color = ZONE_COLORS[area.usage] || "#999999";
+      ctx.beginPath();
+      ctx.moveTo(p1.x + nx, p1.y + ny);
+      ctx.lineTo(p2.x + nx, p2.y + ny);
+      ctx.lineTo(p2.x - nx, p2.y - ny);
+      ctx.lineTo(p1.x - nx, p1.y - ny);
+      ctx.closePath();
+      ctx.fillStyle = color + "33";
+      ctx.fill();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = screenPx(2);
+      ctx.stroke();
+      const midX = (p1.x + p2.x) / 2;
+      const midY = (p1.y + p2.y) / 2;
+      ctx.fillStyle = color;
+      ctx.font = `${screenPx(11)}px sans-serif`;
+      ctx.fillText(
+        ZONE_LABELS[area.usage] || area.usage || "",
+        midX + screenPx(4),
+        midY - screenPx(4)
+      );
+    });
+
+    (zones.lines || []).forEach((line) => {
+      const start = line.start;
+      const end = line.end;
+      if (!start || !end) return;
+      const p1 = worldToPx(start.x, start.y);
+      const p2 = worldToPx(end.x, end.y);
+      const color = LINE_COLORS[line.usage] || "#cccccc";
+      ctx.strokeStyle = color;
+      ctx.lineWidth = screenPx(3);
+      if (line.usage === "tracks") ctx.setLineDash([screenPx(6), screenPx(4)]);
+      ctx.beginPath();
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    });
+  }
+
+  async function loadZones() {
+    try {
+      zones = await apiGet("/api/map/zones");
+    } catch (error) {
+      logEvent("获取区域/虚拟墙配置失败：" + error.message);
+    }
+    drawMap();
+  }
+
+  // ---------------------------------------------------------------------
+  // 后端 API 封装
+  // ---------------------------------------------------------------------
+  async function apiGet(path) {
+    const response = await fetch(path, { cache: "no-store" });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `请求失败：${path}`);
+    return body;
+  }
+  async function apiSend(method, path, payload) {
+    const response = await fetch(path, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `请求失败：${path}`);
+    return body;
+  }
+
+  function logEvent(text) {
+    const log = document.getElementById("map-event-log");
+    const row = document.createElement("div");
+    row.className = "event-row";
+    const ts = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+    row.innerHTML =
+      '<span class="event-ts">' + ts + "</span><span></span>";
+    row.lastElementChild.textContent = text;
+    log.prepend(row);
+    while (log.children.length > 40) log.removeChild(log.lastChild);
+  }
+  function setAction(text) {
+    const actionEl = mapStatusElement("map-action-text");
+    if (actionEl) actionEl.textContent = text;
+  }
+  function setConnected(ok, text) {
+    const dotEl = mapStatusElement("map-status-dot");
+    const textEl = mapStatusElement("map-status-text");
+    if (dotEl) dotEl.className = "dot" + (ok ? "" : " err");
+    if (textEl) textEl.textContent = text;
+  }
+
+  function applyCurrentActionStatus(payload) {
+    if (!payload || payload.active === false) {
+      setAction("空闲");
+      return;
+    }
+    const action = payload.action && typeof payload.action === "object"
+      ? payload.action
+      : null;
+    if (!action) return;
+    const state = action.state && typeof action.state === "object"
+      ? action.state
+      : action;
+    const status = finiteNumber(state.status);
+    if (status === 4) {
+      setAction("空闲");
+      return;
+    }
+    const rawName = action.action_name || action.actionName || action.name || "";
+    const actionName = String(rawName).split(".").pop() || "未知动作";
+    if (status === 0) setAction(`准备中 → ${actionName}`);
+    else if (status === 3) setAction(`已暂停 → ${actionName}`);
+    else setAction(`执行中 → ${actionName}`);
+  }
+
+  // 轮询 action 状态直到完成（status: 0 初始化 / 1 执行中 / 4 已完成）。
+  async function pollAction(actionId, { onTick } = {}) {
+    currentActionId = actionId;
+    for (let attempt = 0; attempt < 240; attempt += 1) {
+      // 最长轮询约 2 分钟（240 * 500ms），超时按失败处理，避免死循环。
+      if (currentActionId !== actionId) return { aborted: true };
+      let state;
+      try {
+        state = await apiGet("/api/map/actions/" + encodeURIComponent(actionId));
+      } catch (error) {
+        logEvent("查询动作状态失败：" + error.message);
+        return { aborted: true, error };
+      }
+      if (onTick) onTick(state);
+      const status = state && state.state ? state.state.status : state.status;
+      if (status === 4) {
+        const result = state && state.state ? state.state.result : state.result;
+        return { done: true, result, raw: state };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    return { aborted: true, timeout: true };
+  }
+
+  async function navigateTo(target, { silent } = {}) {
+    robot.target = target;
+    robot.moving = true;
+    setAction("执行中 → MoveToAction");
+    const dockEl = mapStatusElement("map-dock-text");
+    if (dockEl) dockEl.textContent = "未在桩上";
+    if (!silent) logEvent(`发送导航指令：x=${target.x.toFixed(2)}, y=${target.y.toFixed(2)}`);
+    drawMap();
+    let response;
+    try {
+      response = await apiSend("POST", "/api/map/navigate", {
+        x: target.x,
+        y: target.y,
+        precise: true,
+      });
+    } catch (error) {
+      logEvent("导航请求失败：" + error.message);
+      robot.moving = false;
+      robot.target = null;
+      setAction("空闲");
+      drawMap();
+      throw error;
+    }
+    const actionId = response.action_id;
+    const outcome = await pollAction(actionId);
+    robot.moving = false;
+    robot.target = null;
+    // 不再在这里手动把机器人图标跳到目标点：/api/map/pose 的定时轮询会持续
+    // 更新 robot.x/y/yaw，这里保持不动即可，避免跟真实位姿"打架"。
+    setAction("空闲");
+    if (outcome.done) {
+      logEvent(
+        outcome.result === 0
+          ? "到达目标点（result=0 成功）"
+          : `动作结束但未成功（result=${outcome.result}）`
+      );
+    } else if (outcome.timeout) {
+      logEvent("导航动作轮询超时，请到机器人 / RS 端确认实际状态。");
+    }
+    drawMap();
+    return outcome;
+  }
+
+  // ---------------------------------------------------------------------
+  // 地图交互：缩放 / 拖拽平移 / 单击选点
+  // ---------------------------------------------------------------------
+  const popover = document.getElementById("map-click-popover");
+
+  function handleMapClick(e, rect) {
+    const { x: cx, y: cy } = clientToCanvasPx(e.clientX, e.clientY);
+    const mapPt = canvasPxToMapPx(cx, cy);
+    const world = pxToWorld(mapPt.x, mapPt.y);
+    pendingClick = world;
+    drawMap();
+    popover.hidden = false;
+    const screenX = e.clientX - rect.left;
+    const screenY = e.clientY - rect.top;
+    const left = Math.min(rect.width - 220, Math.max(0, screenX + 14));
+    const top = Math.min(rect.height - 140, Math.max(0, screenY - 10));
+    popover.style.left = left + "px";
+    popover.style.top = top + "px";
+    document.getElementById("map-popover-coord").textContent =
+      `x=${world.x.toFixed(2)}, y=${world.y.toFixed(2)}`;
+  }
+
+  let dragState = null;
+  canvas.addEventListener("mousedown", (e) => {
+    dragState = { startX: e.clientX, startY: e.clientY, x0: view.x, y0: view.y, moved: false };
+    canvas.classList.add("is-dragging");
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!dragState) return;
+    const dx = e.clientX - dragState.startX;
+    const dy = e.clientY - dragState.startY;
+    if (Math.hypot(dx, dy) > 3) dragState.moved = true;
+    if (!dragState.moved) return;
+    if (mapLayers.follow) {
+      mapLayers.follow = false;
+      const followToggle = document.getElementById("map-follow-toggle");
+      if (followToggle) followToggle.checked = false;
+    }
+    const { scaleX, scaleY } = clientToCanvasPx(e.clientX, e.clientY);
+    view.x = dragState.x0 + dx * scaleX;
+    view.y = dragState.y0 + dy * scaleY;
+    drawMap();
+  });
+  window.addEventListener("mouseup", (e) => {
+    if (!dragState) return;
+    const wasDrag = dragState.moved;
+    dragState = null;
+    canvas.classList.remove("is-dragging");
+    if (!wasDrag && e.target === canvas) {
+      handleMapClick(e, canvas.getBoundingClientRect());
+    }
+  });
+  canvas.addEventListener(
+    "wheel",
+    (e) => {
+      e.preventDefault();
+      const { x: cx, y: cy } = clientToCanvasPx(e.clientX, e.clientY);
+      zoomAt(cx, cy, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+    },
+    { passive: false }
+  );
+  document.getElementById("map-btn-zoom-in").onclick = () => zoomAt(W / 2, H / 2, 1.25);
+  document.getElementById("map-btn-zoom-out").onclick = () => zoomAt(W / 2, H / 2, 1 / 1.25);
+  document.getElementById("map-btn-zoom-reset").onclick = () => {
+    // 重置到地图适配视野；适配比例定义为 100%，保持地图铺满画布。
+    fitToView();
+    drawMap();
+  };
+  document.getElementById("map-btn-cancel-popover").onclick = () => {
+    pendingClick = null;
+    popover.hidden = true;
+    drawMap();
+  };
+  document.getElementById("map-btn-go-here").onclick = () => {
+    const target = pendingClick;
+    pendingClick = null;
+    popover.hidden = true;
+    drawMap();
+    navigateTo(target).catch(() => {});
+  };
+  document.getElementById("map-btn-save-here").onclick = async () => {
+    const name = prompt("停留点名称：", `停留点${pois.length + 1}`);
+    if (!name) return;
+    const target = pendingClick;
+    pendingClick = null;
+    popover.hidden = true;
+    try {
+      await apiSend("POST", "/api/map/pois", { name, x: target.x, y: target.y });
+      logEvent(`新增停留点「${name}」`);
+      await refreshPois();
+    } catch (error) {
+      logEvent("保存停留点失败：" + error.message);
+      alert("保存停留点失败：" + error.message);
+    }
+    drawMap();
+  };
+  document.getElementById("map-btn-refresh").onclick = () => {
+    refreshPois();
+    loadMapImage();
+    loadZones();
+  };
+
+  // 自动刷新地图：默认关闭。地图已建好、只做日常导航时没必要一直重拉图片；
+  // 建图中或环境有较大变化时可以手动打开，每 5 秒重新拉一次。
+  let mapAutoRefreshTimer = null;
+  const mapAutoRefreshToggle = document.getElementById("map-auto-refresh-toggle");
+  function startMapAutoRefresh() {
+    if (!mapAutoRefreshToggle || !mapAutoRefreshToggle.checked || mapAutoRefreshTimer) return;
+    mapAutoRefreshTimer = global.setInterval(loadMapImage, 5000);
+  }
+  function stopMapAutoRefresh() {
+    if (!mapAutoRefreshTimer) return;
+    global.clearInterval(mapAutoRefreshTimer);
+    mapAutoRefreshTimer = null;
+  }
+  if (mapAutoRefreshToggle) mapAutoRefreshToggle.onchange = () => {
+    if (mapAutoRefreshToggle.checked) {
+      logEvent("已开启地图自动刷新（每 5 秒）");
+      if (telemetryActive) startMapAutoRefresh();
+    } else {
+      logEvent("已关闭地图自动刷新");
+      stopMapAutoRefresh();
+    }
+  };
+
+  function bindMapLayerControls() {
+    const bindings = [
+      ["map-live-scan-toggle", "liveScan"],
+      ["map-radar-toggle", "radar"],
+      ["map-trail-toggle", "trail"],
+      ["map-follow-toggle", "follow"],
+    ];
+    bindings.forEach(([id, key]) => {
+      const input = document.getElementById(id);
+      if (!input) return;
+      input.checked = Boolean(mapLayers[key]);
+      input.onchange = () => {
+        mapLayers[key] = Boolean(input.checked);
+        if (key === "follow" && mapLayers.follow) centerViewOnRobot();
+        drawMap();
+      };
+    });
+  }
+
+  // 右侧抽屉只保留一个活动分组；签栏始终可见，当前分类保持选中态。
+  function bindMapSideSections() {
+    const grid = document.querySelector(".map-layout-grid");
+    const rail = document.querySelector(".map-control-rail");
+    const sections = Array.from(
+      document.querySelectorAll(".map-control-rail > .map-side-section")
+    );
+    if (!sections.length) return;
+    const tabs = rail
+      ? Array.from(rail.querySelectorAll(":scope > .map-drawer-tabs > .map-drawer-tab"))
+      : [];
+    const desktopQuery = typeof global.matchMedia === "function"
+      ? global.matchMedia("(min-width:1081px)")
+      : null;
+    const isDesktop = () => !desktopQuery || desktopQuery.matches;
+
+    if (rail) {
+      rail.setAttribute("aria-label", "地图功能抽屉");
+      rail.setAttribute("role", "region");
+    }
+
+    // 为抽屉入口建立稳定的无障碍关系，同时保留原有 DOM/ID，方便旧壳层兼容。
+    sections.forEach((section, index) => {
+      const summary = section.querySelector(":scope > .map-side-summary");
+      const body = section.querySelector(":scope > .map-side-body");
+      const key =
+        section.dataset.drawerSection ||
+        section.id ||
+        "section-" + String(index + 1);
+      section.dataset.drawerSection = key;
+      if (body && !body.id) body.id = "map-drawer-panel-" + String(index + 1);
+      if (summary) {
+        summary.setAttribute("aria-expanded", section.open ? "true" : "false");
+        if (body) summary.setAttribute("aria-controls", body.id);
+      }
+    });
+
+    // 默认打开第一个分组（当前模板将“底盘连接”显式设为 open），并保留
+    // 最后选择的分类，便于收起后再次点击同一签恢复内容。
+    const initiallyOpen = sections.find((section) => section.open);
+    sections.forEach((section) => {
+      if (section !== initiallyOpen && section.open) section.open = false;
+    });
+    if (!initiallyOpen && tabs.length) sections[0].open = true;
+    let selectedKey = (initiallyOpen || sections[0]).dataset.drawerSection;
+
+    const sectionForTab = (tab) => {
+      const target = tab && tab.dataset ? tab.dataset.drawerTarget : "";
+      return sections.find(
+        (section) => section.id === target || section.dataset.drawerSection === target
+      ) || null;
+    };
+
+    let redrawTimer = null;
+    const syncDockLayout = () => {
+      const active = sections.find((section) => section.open) || null;
+      const isOpen = Boolean(active);
+      if (grid) grid.classList.toggle("map-dock-open", isOpen);
+      if (rail) {
+        rail.classList.toggle("has-open-section", isOpen);
+        rail.dataset.openSection = active ? active.dataset.drawerSection : "";
+        rail.dataset.selectedSection = selectedKey || "";
+      }
+      sections.forEach((section) => {
+        const summary = section.querySelector(":scope > .map-side-summary");
+        section.classList.toggle("is-active", section === active);
+        if (summary) {
+          summary.setAttribute("aria-expanded", section.open ? "true" : "false");
+          if (section.dataset.drawerSection === selectedKey) {
+            summary.setAttribute("aria-current", "true");
+          }
+          else summary.removeAttribute("aria-current");
+        }
+      });
+      tabs.forEach((tab) => {
+        const section = sectionForTab(tab);
+        const key = section ? section.dataset.drawerSection : tab.dataset.drawerTarget;
+        const open = Boolean(section && section.open);
+        const selected = key === selectedKey;
+        tab.classList.toggle("is-selected", selected);
+        tab.setAttribute("aria-selected", selected ? "true" : "false");
+        tab.setAttribute("aria-expanded", open ? "true" : "false");
+        if (section) tab.setAttribute("aria-controls", section.id || key);
+      });
+
+      // 网格列宽/抽屉动画改变后重新计算固定像素图标和地图视图比例。
+      if (redrawTimer) global.clearTimeout(redrawTimer);
+      global.requestAnimationFrame(drawMap);
+      redrawTimer = global.setTimeout(() => {
+        redrawTimer = null;
+        drawMap();
+      }, 240);
+    };
+
+    const toggleSectionFromTab = (section) => {
+      if (!section) return;
+      selectedKey = section.dataset.drawerSection;
+      if (section.open) {
+        // 当前签再次点击只收起面板，但保留 selectedKey 和高亮样式。
+        section.open = false;
+      } else {
+        sections.forEach((other) => {
+          if (other !== section && other.open) other.open = false;
+        });
+        section.open = true;
+      }
+      syncDockLayout();
+    };
+
+    tabs.forEach((tab) => {
+      tab.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleSectionFromTab(sectionForTab(tab));
+      });
+    });
+
+    sections.forEach((section) => {
+      const summary = section.querySelector(":scope > .map-side-summary");
+      if (summary) {
+        // 桌面端展开/折叠统一从最右签栏操作；面板标题仅作当前分类标识。
+        summary.addEventListener("click", (event) => {
+          if (!isDesktop()) return;
+          event.preventDefault();
+          event.stopPropagation();
+          toggleSectionFromTab(section);
+        });
+      }
+      section.addEventListener("toggle", () => {
+        if (section.open) {
+          selectedKey = section.dataset.drawerSection;
+          sections.forEach((other) => {
+            if (other !== section && other.open) other.open = false;
+          });
+        }
+        syncDockLayout();
+      });
+    });
+
+    // Esc 是抽屉的统一关闭入口，关闭后把焦点交还给当前竖签，便于键盘连续操作。
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      const active = sections.find((section) => section.open);
+      if (!active) return;
+      selectedKey = active.dataset.drawerSection;
+      active.open = false;
+      const tab = tabs.find((item) => sectionForTab(item) === active);
+      const summary = active.querySelector(":scope > .map-side-summary");
+      if (tab) tab.focus();
+      else if (summary) summary.focus();
+      syncDockLayout();
+      event.preventDefault();
+    });
+
+    syncDockLayout();
+  }
+
+  // 桌面端三列使用两条分隔线调整宽度；窄屏回到单列，不抢占触摸滚动。
+  function bindMapColumnResizers() {
+    const grid = document.querySelector(".map-layout-grid");
+    if (!grid) return;
+    const handles = Array.from(
+      grid.querySelectorAll(":scope > .map-column-resizer")
+    );
+    const eventsRail = grid.querySelector(":scope > .map-events-rail");
+    const centerColumn = grid.querySelector(":scope > .map-center-column");
+    const controlRail = grid.querySelector(":scope > .map-control-rail");
+    if (!handles.length || !eventsRail || !centerColumn || !controlRail) return;
+
+    const compactQuery = typeof global.matchMedia === "function"
+      ? global.matchMedia("(max-width:1080px)")
+      : null;
+    const MIN_EVENTS = 220;
+    const MIN_CENTER = 260;
+    const MIN_RAIL_CLOSED = 44;
+    const MIN_RAIL_OPEN = 300;
+    const MAX_RAIL = 560;
+    const state = {
+      events: null,
+      railClosed: null,
+      railOpen: null,
+      modeOpen: null,
+    };
+    let active = null;
+    let syncTimer = null;
+
+    const isCompact = () => Boolean(compactQuery && compactQuery.matches);
+    const numberOr = (value, fallback) => {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : fallback;
+    };
+    const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+    const readWidths = () => ({
+      events: eventsRail.getBoundingClientRect().width,
+      center: centerColumn.getBoundingClientRect().width,
+      rail: controlRail.getBoundingClientRect().width,
+    });
+    const trackBudget = () => {
+      const style = global.getComputedStyle(grid);
+      const gap = numberOr(parseFloat(style.columnGap), 14);
+      const handleWidth = handles[0].getBoundingClientRect().width || 8;
+      // 两条分隔线和四个 grid gap 不属于三个可调区域。
+      return Math.max(0, grid.clientWidth - gap * 4 - handleWidth * 2);
+    };
+    const defaultOpenRail = () => {
+      const viewportWidth = numberOr(global.innerWidth, grid.clientWidth);
+      return clamp(Math.round(viewportWidth * 0.28), MIN_RAIL_OPEN, 404);
+    };
+
+    const updateAria = (eventsWidth, centerWidth, budget, railWidth, open) => {
+      const eventHandle = handles.find((handle) => handle.dataset.resizeTarget === "events");
+      const centerHandle = handles.find((handle) => handle.dataset.resizeTarget === "center");
+      if (eventHandle) {
+        const maxEvents = Math.max(MIN_EVENTS, budget - MIN_CENTER - railWidth);
+        eventHandle.setAttribute("aria-valuemin", String(MIN_EVENTS));
+        eventHandle.setAttribute("aria-valuemax", String(Math.round(maxEvents)));
+        eventHandle.setAttribute("aria-valuenow", String(Math.round(eventsWidth)));
+        eventHandle.setAttribute("aria-valuetext", `${Math.round(eventsWidth)} 像素`);
+        eventHandle.setAttribute("aria-disabled", "false");
+        eventHandle.removeAttribute("aria-hidden");
+      }
+      if (centerHandle) {
+        const minRail = open ? MIN_RAIL_OPEN : MIN_RAIL_CLOSED;
+        const maxCenter = Math.max(MIN_CENTER, budget - MIN_EVENTS - minRail);
+        centerHandle.setAttribute("aria-valuemin", String(MIN_CENTER));
+        centerHandle.setAttribute("aria-valuemax", String(Math.round(maxCenter)));
+        centerHandle.setAttribute("aria-valuenow", String(Math.round(centerWidth)));
+        centerHandle.setAttribute("aria-valuetext", `${Math.round(centerWidth)} 像素`);
+        centerHandle.setAttribute("aria-disabled", "false");
+        centerHandle.removeAttribute("aria-hidden");
+      }
+    };
+
+    const sync = () => {
+      if (isCompact()) {
+        handles.forEach((handle) => {
+          handle.setAttribute("aria-disabled", "true");
+          handle.setAttribute("aria-hidden", "true");
+        });
+        grid.style.removeProperty("--map-events-track");
+        grid.style.removeProperty("--map-rail-track");
+        grid.classList.remove("is-resizing");
+        return;
+      }
+
+      const open = grid.classList.contains("map-dock-open") ||
+        Boolean(grid.querySelector(".map-side-section[open]"));
+      const widths = readWidths();
+      // 地图页初始可能仍带 hidden 属性；隐藏网格的宽度为 0，不能把它
+      // 误记成最小列宽，否则从其它页面切回时事件栏会一直偏窄。
+      if (grid.clientWidth <= 0 || widths.events <= 0) return;
+      if (state.events === null) state.events = widths.events;
+      if (state.modeOpen === null) {
+        state.modeOpen = open;
+        if (open) {
+          state.railOpen = widths.rail >= MIN_RAIL_OPEN ? widths.rail : defaultOpenRail();
+        } else {
+          state.railClosed = widths.rail || MIN_RAIL_CLOSED;
+        }
+      } else if (state.modeOpen !== open) {
+        state.modeOpen = open;
+        if (open && state.railOpen === null) state.railOpen = defaultOpenRail();
+        if (!open && state.railClosed === null) state.railClosed = MIN_RAIL_CLOSED;
+      }
+
+      const budget = trackBudget();
+      const minRail = open ? MIN_RAIL_OPEN : MIN_RAIL_CLOSED;
+      const requestedRail = open
+        ? (state.railOpen === null ? defaultOpenRail() : state.railOpen)
+        : (state.railClosed === null ? MIN_RAIL_CLOSED : state.railClosed);
+      const maxRail = Math.max(minRail, Math.min(MAX_RAIL, budget - MIN_EVENTS - MIN_CENTER));
+      let railWidth = clamp(requestedRail, minRail, maxRail);
+      const maxEvents = Math.max(MIN_EVENTS, budget - MIN_CENTER - railWidth);
+      let eventsWidth = clamp(state.events, MIN_EVENTS, maxEvents);
+      // 极窄桌面窗口优先保证地图最小宽度，再压缩事件/功能栏。
+      if (eventsWidth + railWidth > budget - MIN_CENTER) {
+        eventsWidth = Math.max(MIN_EVENTS, budget - MIN_CENTER - railWidth);
+        if (eventsWidth + railWidth > budget - MIN_CENTER) {
+          railWidth = Math.max(minRail, budget - MIN_CENTER - eventsWidth);
+        }
+      }
+      const centerWidth = Math.max(0, budget - eventsWidth - railWidth);
+      grid.style.setProperty("--map-events-track", `${Math.round(eventsWidth)}px`);
+      grid.style.setProperty("--map-rail-track", `${Math.round(railWidth)}px`);
+      updateAria(eventsWidth, centerWidth, budget, railWidth, open);
+    };
+
+    const scheduleSync = () => {
+      if (syncTimer) global.clearTimeout(syncTimer);
+      global.requestAnimationFrame(sync);
+      syncTimer = global.setTimeout(() => {
+        syncTimer = null;
+        sync();
+      }, 240);
+    };
+
+    const logicalCenterWidth = (open) => {
+      const widths = readWidths();
+      const budget = trackBudget();
+      const eventsWidth = state.events === null ? widths.events : state.events;
+      const railWidth = open
+        ? (state.railOpen === null ? widths.rail : state.railOpen)
+        : (state.railClosed === null ? widths.rail : state.railClosed);
+      return Math.max(0, budget - eventsWidth - railWidth);
+    };
+
+    const setCenterWidth = (desiredWidth, open) => {
+      const budget = trackBudget();
+      const minRail = open ? MIN_RAIL_OPEN : MIN_RAIL_CLOSED;
+      // CSS grid 正在过渡时 getBoundingClientRect() 是中间值；优先使用
+      // 上一次逻辑列宽，避免连续按键把动画中的临时宽度当成新基准。
+      const widths = readWidths();
+      const eventsWidth = clamp(
+        state.events === null ? widths.events : state.events,
+        MIN_EVENTS,
+        Math.max(MIN_EVENTS, budget - minRail - MIN_CENTER)
+      );
+      const maxCenter = Math.max(MIN_CENTER, budget - eventsWidth - minRail);
+      const centerWidth = clamp(desiredWidth, MIN_CENTER, maxCenter);
+      const railWidth = Math.max(minRail, budget - eventsWidth - centerWidth);
+      if (open) state.railOpen = railWidth;
+      else state.railClosed = railWidth;
+    };
+
+    const onPointerDown = (event) => {
+      if (isCompact() || event.button !== undefined && event.button !== 0) return;
+      const handle = event.currentTarget;
+      const target = handle.dataset.resizeTarget;
+      if (target !== "events" && target !== "center") return;
+      const widths = readWidths();
+      const open = grid.classList.contains("map-dock-open");
+      active = {
+        handle,
+        target,
+        startX: event.clientX,
+        startEvents: widths.events,
+        startRail: widths.rail,
+        open,
+      };
+      handle.classList.add("is-dragging");
+      grid.classList.add("is-resizing");
+      document.body.classList.add("map-columns-resizing");
+      if (typeof handle.setPointerCapture === "function" && event.pointerId !== undefined) {
+        try { handle.setPointerCapture(event.pointerId); } catch (error) { /* no-op */ }
+      }
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    const onPointerMove = (event) => {
+      if (!active) return;
+      const delta = event.clientX - active.startX;
+      if (active.target === "events") {
+        state.events = active.startEvents + delta;
+      } else {
+        // 第二条分隔线向右移动时地图变宽、右侧功能栏变窄。
+        const nextRail = active.startRail - delta;
+        if (active.open) state.railOpen = nextRail;
+        else state.railClosed = nextRail;
+      }
+      sync();
+      event.preventDefault();
+    };
+    const finishPointer = (event) => {
+      if (!active) return;
+      const handle = active.handle;
+      if (typeof handle.releasePointerCapture === "function" && event && event.pointerId !== undefined) {
+        try { handle.releasePointerCapture(event.pointerId); } catch (error) { /* no-op */ }
+      }
+      handle.classList.remove("is-dragging");
+      grid.classList.remove("is-resizing");
+      document.body.classList.remove("map-columns-resizing");
+      active = null;
+      scheduleSync();
+    };
+
+    handles.forEach((handle) => {
+      handle.addEventListener("pointerdown", onPointerDown);
+      handle.addEventListener("pointermove", onPointerMove);
+      handle.addEventListener("pointerup", finishPointer);
+      handle.addEventListener("pointercancel", finishPointer);
+      handle.addEventListener("lostpointercapture", finishPointer);
+      handle.addEventListener("keydown", (event) => {
+        if (isCompact()) return;
+        const target = handle.dataset.resizeTarget;
+        const open = grid.classList.contains("map-dock-open");
+        const step = event.shiftKey ? 64 : 16;
+        const widths = readWidths();
+        if (target === "events") {
+          if (event.key === "ArrowLeft") state.events = widths.events - step;
+          else if (event.key === "ArrowRight") state.events = widths.events + step;
+          else if (event.key === "Home") state.events = MIN_EVENTS;
+          else if (event.key === "End") {
+            const rail = open ? (state.railOpen || widths.rail) : (state.railClosed || widths.rail);
+            state.events = trackBudget() - MIN_CENTER - rail;
+          } else return;
+        } else if (target === "center") {
+          const currentCenter = logicalCenterWidth(open);
+          if (event.key === "ArrowLeft") setCenterWidth(currentCenter - step, open);
+          else if (event.key === "ArrowRight") setCenterWidth(currentCenter + step, open);
+          else if (event.key === "Home") setCenterWidth(MIN_CENTER, open);
+          else if (event.key === "End") setCenterWidth(trackBudget(), open);
+          else return;
+        } else return;
+        grid.classList.add("is-resizing");
+        sync();
+        global.requestAnimationFrame(() => grid.classList.remove("is-resizing"));
+        event.preventDefault();
+      });
+    });
+    grid.querySelectorAll(".map-side-section").forEach((section) => {
+      section.addEventListener("toggle", scheduleSync);
+    });
+    global.addEventListener("resize", scheduleSync);
+    if (global.KsqShell && typeof global.KsqShell.onViewChange === "function") {
+      global.KsqShell.onViewChange(scheduleSync);
+    }
+    if (compactQuery && typeof compactQuery.addEventListener === "function") {
+      compactQuery.addEventListener("change", scheduleSync);
+    }
+    if (global.KsqShell && typeof global.KsqShell.onViewChange === "function") {
+      global.KsqShell.onViewChange(() => scheduleSync());
+    }
+    sync();
+  }
+
+  // ---------------------------------------------------------------------
+  // 停留点列表
+  // ---------------------------------------------------------------------
+  async function refreshPois() {
+    try {
+      const body = await apiGet("/api/map/pois");
+      pois = Array.isArray(body.pois) ? body.pois : [];
+    } catch (error) {
+      logEvent("获取停留点失败：" + error.message);
+    }
+    renderPoiList();
+    drawMap();
+  }
+
+  function renderPoiList() {
+    const wrap = document.getElementById("map-poi-list");
+    wrap.innerHTML = "";
+    if (!pois.length) {
+      wrap.innerHTML = '<div class="poi-empty">暂无停留点 · 点击地图添加</div>';
+      return;
+    }
+    pois.forEach((p, i) => {
+      const row = document.createElement("div");
+      row.className = "poi-item";
+      row.innerHTML = `
+        <span class="poi-badge">${i + 1}</span>
+        <div class="poi-main">
+          <div class="poi-name"></div>
+          <div class="poi-coord"></div>
+        </div>
+        <div class="poi-actions">
+          <button class="secondary" data-act="go" data-i="${i}">导航</button>
+          <button class="secondary" data-act="add" data-i="${i}">加入巡逻</button>
+          <button class="danger" data-act="del" data-i="${i}">删除</button>
+        </div>`;
+      row.querySelector(".poi-name").textContent = p.name || "(未命名)";
+      row.querySelector(".poi-coord").textContent =
+        `x=${Number(p.x).toFixed(2)}, y=${Number(p.y).toFixed(2)}`;
+      wrap.appendChild(row);
+    });
+    wrap.querySelectorAll("button").forEach((btn) => {
+      btn.onclick = async () => {
+        const i = Number(btn.dataset.i);
+        const act = btn.dataset.act;
+        if (act === "go") navigateTo({ x: pois[i].x, y: pois[i].y }).catch(() => {});
+        if (act === "add") {
+          patrolQueue.push(i);
+          renderPatrolQueue();
+        }
+        if (act === "del") {
+          try {
+            await apiSend("POST", "/api/map/pois/delete", { id: pois[i].id });
+            logEvent(`删除停留点「${pois[i].name}」`);
+            await refreshPois();
+          } catch (error) {
+            alert("删除失败：" + error.message);
+          }
+        }
+      };
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // 巡逻队列
+  // ---------------------------------------------------------------------
+  function renderPatrolQueue() {
+    const wrap = document.getElementById("map-patrol-queue");
+    wrap.innerHTML = "";
+    if (!patrolQueue.length) {
+      wrap.innerHTML =
+        '<span class="meta" style="padding:4px 2px">请先从停留点加入</span>';
+      return;
+    }
+    patrolQueue.forEach((poiIdx, qi) => {
+      const chip = document.createElement("span");
+      chip.className =
+        "patrol-chip" + (patrolRunning && !patrolPaused && qi === patrolIndex ? " is-current" : "");
+      const label = pois[poiIdx] ? pois[poiIdx].name : "(已删除)";
+      chip.innerHTML = `${qi + 1}. <span></span> <button data-qi="${qi}">✕</button>`;
+      chip.querySelector("span").textContent = label;
+      wrap.appendChild(chip);
+    });
+    wrap.querySelectorAll("button").forEach((btn) => {
+      btn.onclick = () => {
+        patrolQueue.splice(Number(btn.dataset.qi), 1);
+        renderPatrolQueue();
+      };
+    });
+  }
+
+  async function patrolStep() {
+    if (!patrolRunning || patrolPaused) return;
+    if (!patrolQueue.length) {
+      stopPatrol();
+      return;
+    }
+    const poiIdx = patrolQueue[patrolIndex];
+    const poi = pois[poiIdx];
+    document.getElementById("map-patrol-status").textContent =
+      `巡逻中：前往第 ${patrolIndex + 1}/${patrolQueue.length} 个点` + (poi ? ` · ${poi.name}` : "");
+    renderPatrolQueue();
+    if (!poi) {
+      advancePatrol();
+      return;
+    }
+    try {
+      await navigateTo({ x: poi.x, y: poi.y }, { silent: true });
+    } catch (error) {
+      logEvent("巡逻中导航失败，任务已停止：" + error.message);
+      stopPatrol();
+      return;
+    }
+    if (!patrolRunning || patrolPaused) return;
+    setTimeout(advancePatrol, 400);
+  }
+  function advancePatrol() {
+    patrolIndex += 1;
+    if (patrolIndex >= patrolQueue.length) {
+      if (document.getElementById("map-loop-toggle").checked) {
+        patrolIndex = 0;
+      } else {
+        stopPatrol();
+        return;
+      }
+    }
+    patrolStep();
+  }
+  function startPatrol() {
+    if (!patrolQueue.length) {
+      alert("请先加入至少一个巡逻点");
+      return;
+    }
+    patrolRunning = true;
+    patrolPaused = false;
+    patrolIndex = 0;
+    document.getElementById("map-btn-patrol-start").disabled = true;
+    document.getElementById("map-btn-patrol-pause").disabled = false;
+    document.getElementById("map-btn-patrol-stop").disabled = false;
+    logEvent("开始巡逻任务");
+    patrolStep();
+  }
+  async function pausePatrol() {
+    patrolPaused = !patrolPaused;
+    const btn = document.getElementById("map-btn-patrol-pause");
+    btn.textContent = patrolPaused ? "继续" : "暂停";
+    if (patrolPaused) {
+      try {
+        await apiSend("POST", "/api/map/actions/cancel", {});
+        logEvent("已暂停巡逻（取消当前动作）");
+      } catch (error) {
+        logEvent("暂停失败：" + error.message);
+      }
+    } else {
+      logEvent("巡逻继续");
+      patrolStep();
+    }
+  }
+  async function stopPatrol() {
+    patrolRunning = false;
+    patrolPaused = false;
+    document.getElementById("map-btn-patrol-start").disabled = false;
+    document.getElementById("map-btn-patrol-pause").disabled = true;
+    document.getElementById("map-btn-patrol-pause").textContent = "暂停";
+    document.getElementById("map-btn-patrol-stop").disabled = true;
+    document.getElementById("map-patrol-status").textContent = "巡逻已停止";
+    try {
+      await apiSend("POST", "/api/map/actions/cancel", {});
+    } catch (error) {
+      // 没有正在执行的动作时机器人可能直接报错，忽略即可。
+    }
+    logEvent("巡逻任务结束");
+    renderPatrolQueue();
+  }
+  document.getElementById("map-btn-patrol-start").onclick = startPatrol;
+  document.getElementById("map-btn-patrol-pause").onclick = pausePatrol;
+  document.getElementById("map-btn-patrol-stop").onclick = stopPatrol;
+
+  // ---------------------------------------------------------------------
+  // 回桩 / 重定位
+  // ---------------------------------------------------------------------
+  document.getElementById("map-btn-relocate").onclick = async () => {
+    const btn = document.getElementById("map-btn-relocate");
+    btn.disabled = true;
+    const locEl = mapStatusElement("map-loc-text");
+    if (locEl) locEl.textContent = "重定位中…";
+    setAction("执行中 → RecoverLocalizationAction");
+    logEvent("调用 RecoverLocalizationAction（原地重新定位，不移动机器人）");
+    try {
+      const response = await apiSend("POST", "/api/map/relocate", {});
+      await pollAction(response.action_id);
+      const currentLocEl = mapStatusElement("map-loc-text");
+      if (currentLocEl) currentLocEl.textContent = "正常";
+      logEvent("重定位完成");
+    } catch (error) {
+      const failedLocEl = mapStatusElement("map-loc-text");
+      if (failedLocEl) failedLocEl.textContent = "失败";
+      logEvent("重定位失败：" + error.message);
+    } finally {
+      btn.disabled = false;
+      setAction("空闲");
+    }
+  };
+  document.getElementById("map-btn-gohome").onclick = async () => {
+    const btn = document.getElementById("map-btn-gohome");
+    btn.disabled = true;
+    logEvent('发送回桩指令：GoHomeAction（flags: "dock"）');
+    setAction("执行中 → GoHomeAction");
+    try {
+      const response = await apiSend("POST", "/api/map/gohome", {});
+      const outcome = await pollAction(response.action_id);
+      if (outcome.done && outcome.result === 0) {
+        const dockEl = mapStatusElement("map-dock-text");
+        if (dockEl) dockEl.textContent = "已上桩充电";
+        logEvent("已到达充电桩并上桩，开始充电");
+      } else {
+        logEvent("回桩动作结束但未确认成功，请现场核实。");
+      }
+    } catch (error) {
+      logEvent("回桩失败：" + error.message);
+    } finally {
+      btn.disabled = false;
+      setAction("空闲");
+    }
+  };
+
+  // ---------------------------------------------------------------------
+  // 真实地图图片
+  // ---------------------------------------------------------------------
+  async function loadMapImage() {
+    if (mapImageRequestInFlight) return;
+    mapImageRequestInFlight = true;
+    try {
+      const response = await fetch("/api/map/image", { cache: "no-store" });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        logEvent(
+          "获取地图图片失败：" +
+            (body.error || `HTTP ${response.status}`) +
+            "（机器人可能尚未建图，或地址未连通）"
+        );
+        drawMap();
+        return;
+      }
+      const meta = {
+        origin_x: parseFloat(response.headers.get("X-Map-Origin-X")),
+        origin_y: parseFloat(response.headers.get("X-Map-Origin-Y")),
+        resolution: parseFloat(response.headers.get("X-Map-Resolution")),
+        width: parseInt(response.headers.get("X-Map-Width"), 10),
+        height: parseInt(response.headers.get("X-Map-Height"), 10),
+      };
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      try {
+        const img = await new Promise((resolve, reject) => {
+          const image = new Image();
+          image.onload = () => resolve(image);
+          image.onerror = () => reject(new Error("图片解码失败"));
+          image.src = url;
+        });
+        const firstMapImage = !mapMeta;
+        if (mapImageUrl) URL.revokeObjectURL(mapImageUrl);
+        mapImageUrl = url;
+        mapImage = img;
+        mapMeta = meta;
+        // 首次加载自动适配；后续地图刷新保留用户当前的缩放/平移，避免实时
+        // 更新底图时视角跳回原点。开启“跟随底盘”时只重新计算居中位置。
+        if (firstMapImage || !mapHasBeenFitted) fitToView();
+        else centerViewOnRobot();
+        logEvent(`地图已加载：${meta.width}×${meta.height} 格`);
+      } catch (error) {
+        URL.revokeObjectURL(url);
+        logEvent("地图图片解码失败：" + error.message);
+      }
+      drawMap();
+    } catch (error) {
+      logEvent("获取地图图片失败（网络异常）：" + error.message);
+      drawMap();
+    } finally {
+      mapImageRequestInFlight = false;
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // 实时位姿与激光遥测
+  // ---------------------------------------------------------------------
+  function telemetrySnapshotPose(snapshot) {
+    return extractPose(snapshot && snapshot.pose) ||
+      extractPose(snapshot && snapshot.localization_pose) ||
+      extractPose(snapshot && snapshot.localizationPose) ||
+      extractPose(snapshot);
+  }
+
+  function applyTelemetrySnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== "object") throw new Error("实时数据格式无效");
+    const scan = snapshot.laser_scan || snapshot.laserScan || snapshot.scan ||
+      (Array.isArray(snapshot.laser_points) || Array.isArray(snapshot.points) || Array.isArray(snapshot.ranges)
+        ? snapshot
+        : null);
+    const pose = telemetrySnapshotPose(snapshot);
+    const scanPose = extractPose(snapshot.scan_pose) ||
+      extractPose(snapshot.scanPose) ||
+      extractPose(scan && scan.pose) ||
+      pose;
+    if (pose) {
+      robot.x = pose.x;
+      robot.y = pose.y;
+      robot.yaw = pose.yaw;
+      robot.hasFix = true;
+    }
+    const points = normalizeLaserPoints(scan);
+    const projected = projectScanPoints(scanPose, points);
+    const capturedAt = timestampMs(
+      snapshot.captured_at || snapshot.capturedAt || (scan && (scan.captured_at || scan.timestamp))
+    );
+    const receivedAt = timestampMs(snapshot.received_at || snapshot.receivedAt);
+    telemetry.latest = snapshot;
+    telemetry.points = projected;
+    telemetry.scanPose = scanPose;
+    telemetry.radar = buildRadarSpec(snapshot, scan, points);
+    telemetry.capturedAtMs = capturedAt || Date.now();
+    telemetry.receivedAtMs = receivedAt || Date.now();
+    const reportedAge = firstFinite(snapshot.age_ms, snapshot.ageMs);
+    telemetry.ageMs = reportedAge === null
+      ? Math.max(0, Date.now() - telemetry.capturedAtMs)
+      : Math.max(0, reportedAge);
+    telemetry.stale = Boolean(snapshot.stale) || telemetry.ageMs > TELEMETRY_STALE_MS;
+    telemetry.partial = Boolean(snapshot.partial);
+    telemetry.requestError = false;
+    telemetry.error = typeof snapshot.error === "string"
+      ? snapshot.error
+      : Array.isArray(snapshot.errors)
+        ? snapshot.errors.filter(Boolean).join("；")
+        : snapshot.errors && typeof snapshot.errors === "object"
+          ? Object.values(snapshot.errors)
+              .map((item) => (item && typeof item === "object" ? item.message : item))
+              .filter(Boolean)
+              .join("；")
+          : "";
+    telemetry.hasFrame = Boolean(scanPose || projected.length || pose);
+    if (telemetry.hasFrame && projected.length) {
+      telemetry.trail.push({ at: Date.now(), points: projected });
+      while (telemetry.trail.length > TELEMETRY_TRAIL_MAX_FRAMES) telemetry.trail.shift();
+    }
+    if (mapLayers.follow && robot.hasFix) centerViewOnRobot();
+    updateTelemetryStatus();
+    drawMap();
+  }
+
+  function markTelemetryError(error) {
+    telemetry.requestError = true;
+    telemetry.error = error && error.message ? error.message : "实时数据请求失败";
+    telemetry.stale = true;
+    telemetry.ageMs = telemetry.hasFrame && telemetry.capturedAtMs
+      ? Math.max(0, Date.now() - telemetry.capturedAtMs)
+      : Infinity;
+    updateTelemetryStatus();
+    if (!telemetryErrorLogged) {
+      logEvent("实时雷达数据暂不可用：" + telemetry.error);
+      telemetryErrorLogged = true;
+    }
+    drawMap();
+  }
+
+  async function refreshTelemetry() {
+    if (telemetryRequestInFlight || !telemetryActive) return;
+    telemetryRequestInFlight = true;
+    try {
+      const snapshot = await apiGet("/api/map/telemetry");
+      applyTelemetrySnapshot(snapshot);
+      telemetryPollDelay = TELEMETRY_POLL_MS;
+      if (telemetryErrorLogged) {
+        logEvent("实时雷达数据已恢复");
+        telemetryErrorLogged = false;
+      }
+    } catch (error) {
+      markTelemetryError(error);
+      telemetryPollDelay = Math.min(5000, Math.max(800, telemetryPollDelay * 2));
+    } finally {
+      telemetryRequestInFlight = false;
+      scheduleTelemetryPoll(telemetryPollDelay);
+    }
+  }
+
+  function scheduleTelemetryPoll(delay) {
+    if (!telemetryActive) return;
+    if (telemetryTimer) global.clearTimeout(telemetryTimer);
+    telemetryTimer = global.setTimeout(() => {
+      telemetryTimer = null;
+      refreshTelemetry();
+    }, Math.max(0, delay || TELEMETRY_POLL_MS));
+  }
+
+  function refreshTelemetryAge() {
+    if (!telemetry.hasFrame || !telemetry.capturedAtMs) return;
+    const now = Date.now();
+    const previousTrailLength = telemetry.trail.length;
+    telemetry.trail = telemetry.trail.filter(
+      (frame) => now - frame.at <= TELEMETRY_TRAIL_MS
+    );
+    const previousStale = telemetry.stale;
+    const reportedAge = telemetry.latest && firstFinite(telemetry.latest.age_ms, telemetry.latest.ageMs);
+    telemetry.ageMs = reportedAge === null
+      ? Math.max(0, now - telemetry.capturedAtMs)
+      : Math.max(0, reportedAge + Math.max(0, now - telemetry.receivedAtMs));
+    telemetry.stale = telemetry.requestError || Boolean(telemetry.latest && telemetry.latest.stale) || telemetry.ageMs > TELEMETRY_STALE_MS;
+    updateTelemetryStatus();
+    const trailChanged = previousTrailLength !== telemetry.trail.length;
+    if (previousStale !== telemetry.stale || trailChanged || (mapLayers.trail && telemetry.trail.length)) drawMap();
+  }
+
+  function startTelemetryAgeTimer() {
+    if (telemetryAgeTimer) return;
+    telemetryAgeTimer = global.setInterval(refreshTelemetryAge, 250);
+  }
+
+  function stopTelemetryAgeTimer() {
+    if (!telemetryAgeTimer) return;
+    global.clearInterval(telemetryAgeTimer);
+    telemetryAgeTimer = null;
+  }
+
+  // 在旧后端或底盘暂不提供激光快照时保留位姿回退，避免地图导航图标消失。
+  async function refreshPose() {
+    if (!telemetryActive || (!telemetry.stale && telemetry.hasFrame)) return;
+    if (poseRequestInFlight) return;
+    poseRequestInFlight = true;
+    try {
+      const pose = await apiGet("/api/map/pose");
+      const normalized = extractPose(pose);
+      if (normalized) {
+        robot.x = normalized.x;
+        robot.y = normalized.y;
+        robot.yaw = normalized.yaw;
+        robot.hasFix = true;
+        if (mapLayers.follow) centerViewOnRobot();
+        drawMap();
+      }
+    } catch (error) {
+      // 保留上一次已知位置；遥测状态栏会显示当前数据是否过期。
+    } finally {
+      poseRequestInFlight = false;
+    }
+  }
+
+  function startPoseFallback() {
+    if (poseFallbackTimer) return;
+    poseFallbackTimer = global.setInterval(refreshPose, 1000);
+    refreshPose();
+  }
+
+  function stopPoseFallback() {
+    if (!poseFallbackTimer) return;
+    global.clearInterval(poseFallbackTimer);
+    poseFallbackTimer = null;
+  }
+
+  function activateTelemetry() {
+    if (telemetryActive) return;
+    telemetryActive = true;
+    telemetryPollDelay = TELEMETRY_POLL_MS;
+    refreshTelemetry();
+    startTelemetryAgeTimer();
+    startPoseFallback();
+    startRobotStatusPoll();
+    if (mapAutoRefreshToggle && mapAutoRefreshToggle.checked) startMapAutoRefresh();
+  }
+
+  function deactivateTelemetry() {
+    telemetryActive = false;
+    if (telemetryTimer) {
+      global.clearTimeout(telemetryTimer);
+      telemetryTimer = null;
+    }
+    stopTelemetryAgeTimer();
+    stopPoseFallback();
+    stopRobotStatusPoll();
+    stopMapAutoRefresh();
+  }
+
+  // ---------------------------------------------------------------------
+  // 机器人连接设置 + 状态
+  // ---------------------------------------------------------------------
+  async function loadConnectionSettings() {
+    try {
+      const settings = await apiGet("/api/map/settings");
+      document.getElementById("map-robot-url").value = settings.robot_base_url || "";
+    } catch (error) {
+      logEvent("读取机器人连接设置失败：" + error.message);
+    }
+  }
+  document.getElementById("map-btn-save-connection").onclick = async () => {
+    const url = document.getElementById("map-robot-url").value.trim();
+    const statusEl = document.getElementById("map-connection-status");
+    try {
+      await apiSend("PUT", "/api/map/settings", { robot_base_url: url });
+      statusEl.textContent = "已保存。";
+      logEvent("已更新机器人地址：" + url);
+      checkConnection();
+    } catch (error) {
+      statusEl.textContent = "保存失败：" + error.message;
+    }
+  };
+  document.getElementById("map-btn-test-connection").onclick = () => checkConnection(true);
+
+  async function checkConnection(verbose) {
+    const statusEl = document.getElementById("map-connection-status");
+    try {
+      const info = await apiGet("/api/map/robot-info");
+      setConnected(true, "已连接" + (info && info.model ? ` · ${info.model}` : ""));
+      if (verbose) statusEl.textContent = "连接正常。";
+      refreshPower();
+      return true;
+    } catch (error) {
+      setConnected(false, "未连接");
+      if (verbose) statusEl.textContent = "连接失败：" + error.message;
+      return false;
+    }
+  }
+  function applyPowerStatus(power) {
+    if (!power || typeof power !== "object") return;
+    const battery = firstFinite(
+      power.batteryPercentage,
+      power.battery_percentage,
+      power.batteryLevel,
+      power.battery_level,
+      power.percentage
+    );
+    if (battery !== null) {
+      const batteryEl = mapStatusElement("map-battery-text");
+      if (batteryEl) batteryEl.textContent = `${Math.round(battery)}%`;
+    }
+    const dockEl = mapStatusElement("map-dock-text");
+    if (dockEl) {
+      const dockingStatus = String(
+        power.dockingStatus || power.docking_status || power.dockStatus || ""
+      ).toLowerCase();
+      const charging = power.isCharging === true || power.charging === true;
+      const onDock = ["on_dock", "ondock", "docked", "on-dock"].includes(dockingStatus);
+      if (charging) {
+        dockEl.textContent = "已上桩充电";
+      } else if (onDock) {
+        dockEl.textContent = "已上桩";
+      } else if (dockingStatus) {
+        dockEl.textContent = "未在桩上";
+      }
+    }
+    // 首帧遥测尚未到达时，电源接口成功仍可作为连接后的定位占位状态。
+    if (!telemetry.latest) {
+      const locEl = mapStatusElement("map-loc-text");
+      if (locEl) locEl.textContent = "正常";
+    }
+  }
+  async function refreshPower() {
+    try {
+      const power = await apiGet("/api/map/power");
+      applyPowerStatus(power);
+      return true;
+    } catch (error) {
+      // 连不上时保留最后有效电量/充电状态，连接状态由轮询统一标记。
+      return false;
+    }
+  }
+
+  async function refreshRobotStatus() {
+    if (!telemetryActive || robotStatusRequestInFlight) return;
+    robotStatusRequestInFlight = true;
+    try {
+      // 电源和当前动作是独立状态源，单项超时不应阻塞另一项更新。
+      const read = (path) => apiGet(path)
+        .then((value) => ({ ok: true, value }))
+        .catch((error) => ({ ok: false, error }));
+      const [powerResult, actionResult] = await Promise.all([
+        read("/api/map/power"),
+        read("/api/map/current-action"),
+      ]);
+      if (powerResult.ok) {
+        applyPowerStatus(powerResult.value);
+        setConnected(true, "已连接");
+      } else {
+        // 保留最后一次有效电量，避免瞬时网络抖动造成状态栏跳变。
+        setConnected(false, "未连接");
+      }
+      if (actionResult.ok) applyCurrentActionStatus(actionResult.value);
+    } finally {
+      robotStatusRequestInFlight = false;
+      if (telemetryActive) {
+        if (robotStatusTimer) global.clearTimeout(robotStatusTimer);
+        robotStatusTimer = global.setTimeout(refreshRobotStatus, ROBOT_STATUS_POLL_MS);
+      }
+    }
+  }
+
+  function startRobotStatusPoll() {
+    if (robotStatusTimer) global.clearTimeout(robotStatusTimer);
+    robotStatusTimer = null;
+    refreshRobotStatus();
+  }
+
+  function stopRobotStatusPoll() {
+    if (robotStatusTimer) global.clearTimeout(robotStatusTimer);
+    robotStatusTimer = null;
+  }
+
+  function installMapLifecycle() {
+    const shell = global.KsqShell;
+    if (shell && typeof shell.onViewChange === "function") {
+      shell.onViewChange((viewName) => {
+        if (viewName === "map") activateTelemetry();
+        else deactivateTelemetry();
+      });
+      if (typeof shell.currentView === "function" && shell.currentView() === "map") {
+        activateTelemetry();
+      }
+    } else {
+      // 独立打开地图脚本或旧壳层时仍保持可用。
+      activateTelemetry();
+    }
+  }
+
+  global.KsqMap = {
+    activate: activateTelemetry,
+    deactivate: deactivateTelemetry,
+    refreshTelemetry,
+  };
+
+  // ---------------------------------------------------------------------
+  // 初始化
+  // ---------------------------------------------------------------------
+  installMapStatusOverlay();
+  bindMapLayerControls();
+  bindMapSideSections();
+  bindMapColumnResizers();
+  installMapResizeObserver();
+  setZoomLabel();
+  drawMap();
+  renderPoiList();
+  renderPatrolQueue();
+  loadConnectionSettings().then(() => checkConnection());
+  refreshPois();
+  loadMapImage();
+  loadZones();
+  installMapLifecycle();
+  logEvent("地图导航页已加载。");
+})(window);

@@ -5,6 +5,7 @@
     "query",
     "order",
     "test-order",
+    "map",
     "logs",
     "settings",
   ];
@@ -28,6 +29,7 @@
       title: "测试下单",
       subtitle: "按比例生成测试 SKU 清单并提交测试订单",
     },
+    map: { title: "地图导航", subtitle: "实时地图与底盘控制" },
     logs: { title: "日志查询", subtitle: "查看机器人相关服务的运行日志与状态" },
     settings: {
       title: "设置",
