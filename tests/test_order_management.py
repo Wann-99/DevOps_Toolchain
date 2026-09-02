@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
 import inspect
 import io
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -42,6 +45,29 @@ class ConfigurationDefaultsTests(unittest.TestCase):
         self.assertEqual(config["order_source"], "")
         self.assertEqual(config["business_mode_code"], "")
 
+    def test_public_config_hides_secret_unless_admin(self) -> None:
+        """GET /api/order/config 不校验角色，密钥只能对管理员下发。"""
+        config = dict(VALID_CONFIG, client_secret="SUPER-SECRET")
+
+        viewer = order_config.public_order_config(config)
+        admin = order_config.public_order_config(config, include_secret=True)
+
+        self.assertEqual(viewer["client_secret"], "")
+        self.assertTrue(viewer["has_client_secret"])
+        self.assertEqual(admin["client_secret"], "SUPER-SECRET")
+        self.assertTrue(admin["has_client_secret"])
+
+    def test_empty_secret_never_wipes_saved_secret(self) -> None:
+        """密钥现在预填到输入框；普通用户拿到空串，保存时不得抹掉已存值。"""
+        config = dict(VALID_CONFIG, client_secret="SUPER-SECRET")
+
+        merged = order_config.merge_config_update(
+            config, {"client_secret": "", "client_id": "new-cid"}
+        )
+
+        self.assertEqual(merged["client_secret"], "SUPER-SECRET")
+        self.assertEqual(merged["client_id"], "new-cid")
+
     def test_customer_options_include_none_and_shuyu(self) -> None:
         public = order_config.public_order_config(order_config.default_order_config())
         self.assertEqual(
@@ -51,21 +77,101 @@ class ConfigurationDefaultsTests(unittest.TestCase):
                 {"value": "dashenlin", "cn": "大参林"},
                 {"value": "yaoshibang", "cn": "药师帮"},
                 {"value": "shuyu", "cn": "漱玉"},
+                {"value": "noematrix", "cn": "穹彻智能"},
             ],
         )
-        shuyu = order_config.apply_customer_defaults({"customer": "shuyu"})
-        self.assertEqual(shuyu["order_source"], "meituan")
+        shuyu = order_config.apply_customer_defaults(
+            {"customer": "shuyu", "order_source": "legacy-source"}
+        )
+        self.assertEqual(shuyu["order_source"], "legacy-source")
         self.assertEqual(shuyu["business_mode_code"], "MODE_PICK_WAIT_PACK")
 
-    def test_unselected_customer_cannot_silently_create_order(self) -> None:
-        with self.assertRaisesRegex(ValueError, "请先选择客户"):
-            build_create_task_body(
-                {"store_id": "store-1", "order_source": ""},
+        noematrix = order_config.apply_customer_defaults(
+            {"customer": "noematrix", "order_source": "legacy-source"}
+        )
+        self.assertEqual(noematrix["order_source"], "legacy-source")
+        self.assertTrue(noematrix["need_image_upload"])
+        self.assertEqual(noematrix["business_mode_code"], "MODE_PICK")
+
+        custom = order_config.apply_customer_defaults(
+            {"customer": "custom_customer", "order_source": "legacy-source"}
+        )
+        self.assertEqual(custom["order_source"], "legacy-source")
+
+    def test_order_source_is_generated_independently_from_customer(self) -> None:
+        def choose_value(values: object) -> str:
+            if isinstance(values, list):
+                return "jd"
+            return str(values)[0]
+
+        with patch(
+            "ksq.order.payload.secrets.choice", side_effect=choose_value
+        ) as choose:
+            body = build_create_task_body(
+                {
+                    "store_id": "store-1",
+                    "customer": "桂中大药房",
+                    "order_source": "桂中大药房",
+                },
                 [{"item_id": "item-1", "location_code": "A-01"}],
             )
 
+        self.assertEqual(
+            choose.call_args_list[0].args[0], ["meituan", "eleme", "jd", "dy"]
+        )
+        self.assertEqual(body["order_source"], "jd")
+        self.assertTrue(str(body["platform_order_no"]).startswith("JD"))
+
     def test_feishu_default_is_disabled(self) -> None:
         self.assertFalse(dashboard_api._default_feishu_settings()["enabled"])
+
+    def test_store_id_is_only_required_for_order_validation(self) -> None:
+        config = dict(VALID_CONFIG)
+        config["store_id"] = ""
+
+        order_config.validate_order_config(config, require_store=False)
+        with self.assertRaisesRegex(ValueError, "store_id"):
+            order_config.validate_order_config(config)
+
+
+class StoreListingTests(unittest.TestCase):
+    def test_list_stores_can_fetch_before_store_is_selected(self) -> None:
+        config = dict(VALID_CONFIG)
+        config["store_id"] = ""
+        with (
+            patch.object(order_api, "load_order_config", return_value=config),
+            patch.object(order_api, "_ensure_token", return_value="token") as ensure,
+            patch.object(
+                order_api.broker,
+                "list_my_stores",
+                return_value=(200, {"data": [{"store_id": "store-1"}]}),
+            ),
+        ):
+            result = order_api.list_stores("test")
+
+        self.assertEqual(result["stores"], [{"store_id": "store-1"}])
+        ensure.assert_called_once_with(config, "test", require_store=False)
+
+    def test_public_config_reports_cached_token_until_jwt_expiry(self) -> None:
+        config = dict(VALID_CONFIG)
+        payload = base64.urlsafe_b64encode(b'{"exp":200}').decode().rstrip("=")
+        token = "header." + payload + ".signature"
+        key = order_api._token_cache_key(config)
+        with (
+            patch.object(order_api, "load_order_config", return_value=config),
+            patch.object(order_api.state, "order_access_tokens", {key: token}),
+            patch.object(order_api.state, "order_access_token", None),
+            patch.object(order_api.time, "time", return_value=100),
+        ):
+            self.assertTrue(order_api.get_public_config("test")["token_ready"])
+
+        with (
+            patch.object(order_api, "load_order_config", return_value=config),
+            patch.object(order_api.state, "order_access_tokens", {key: token}),
+            patch.object(order_api.state, "order_access_token", None),
+            patch.object(order_api.time, "time", return_value=201),
+        ):
+            self.assertFalse(order_api.get_public_config("test")["token_ready"])
 
 
 class BrokerClientTests(unittest.TestCase):
@@ -185,7 +291,39 @@ class TaskListTests(unittest.TestCase):
         self.assertEqual(list_tasks.call_args_list[0].args[2], "dashenlin_test")
         self.assertEqual(list_tasks.call_args_list[0].args[-1], "")
         self.assertEqual(list_tasks.call_args_list[1].args[-1], "cursor-2")
+        # 每一批都要发同一个过滤值：曾因 status 被 HTTP 状态码覆盖，第二批发出 200，
+        # 被 Broker 报 status must be one of: [...]
+        self.assertEqual(list_tasks.call_args_list[0].args[5], "running")
+        self.assertEqual(list_tasks.call_args_list[1].args[5], "running")
         self.assertNotIn("store_id", inspect.signature(order_api.list_tasks).parameters)
+
+    def test_manual_status_is_filtered_locally_not_sent_upstream(self) -> None:
+        upstream = {
+            "data": {
+                "tasks": [
+                    {"task_id": "task-1", "status": "manual_cancel"},
+                    {"task_id": "task-2", "status": "running"},
+                ],
+                "has_more": False,
+            }
+        }
+        with (
+            patch.object(order_api, "load_order_config", return_value=VALID_CONFIG),
+            patch.object(order_api, "_ensure_token", return_value="token"),
+            patch.object(
+                order_api.broker, "list_robot_tasks", return_value=(200, upstream)
+            ) as list_tasks,
+        ):
+            result = order_api.list_tasks("test", status="manual_cancel")
+
+        # Broker 不接受 manual_* 作为过滤值，不能往上发
+        self.assertEqual(list_tasks.call_args.args[5], "")
+        # 但筛选结果必须生效（本地过滤）
+        self.assertEqual(
+            result["tasks"], [{"task_id": "task-1", "status": "manual_cancel"}]
+        )
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["status"], "manual_cancel")
 
     def test_clamps_page_after_total_changes(self) -> None:
         upstream = {
@@ -243,6 +381,114 @@ class TaskListTests(unittest.TestCase):
         self.assertFalse(refreshed["cached"])
         self.assertEqual(list_tasks.call_count, 2)
 
+    def test_stale_cache_serves_old_data_and_defers_refresh(self) -> None:
+        """缓存过期不能让前端等拉全量（4~7s），否则分页/刷新按钮被卡死。"""
+        upstream = {
+            "data": {"tasks": [{"task_id": "task-1"}], "has_more": False}
+        }
+        with (
+            patch.object(order_api, "load_order_config", return_value=VALID_CONFIG),
+            patch.object(order_api, "_ensure_token", return_value="token"),
+            patch.object(
+                order_api.broker, "list_robot_tasks", return_value=(200, upstream)
+            ) as upstream_call,
+        ):
+            primed = order_api.list_tasks("test")
+            self.assertFalse(primed["stale"])
+            self.assertEqual(upstream_call.call_count, 1)
+
+            # TTL 置 0 令缓存恒为过期
+            with (
+                patch.object(order_api, "_TASK_LIST_CACHE_SECONDS", 0.0),
+                patch.object(
+                    order_api, "_start_background_task_list_refresh"
+                ) as background,
+            ):
+                served = order_api.list_tasks("test")
+
+        # 返回旧值，且前端未再次请求上游
+        self.assertTrue(served["stale"])
+        self.assertTrue(served["cached"])
+        self.assertEqual(served["total"], 1)
+        self.assertEqual(upstream_call.call_count, 1)
+        self.assertEqual(background.call_count, 1)
+
+    def test_background_refresh_updates_cache_and_is_single_flight(self) -> None:
+        released = threading.Event()
+        entered = threading.Event()
+
+        def slow_fetch(*_args: object, **_kwargs: object) -> list:
+            entered.set()
+            released.wait(5)
+            return [{"task_id": "fresh"}]
+
+        cache_key = ("test", "srv", "cid", "store", "desc", "", "Asia/Shanghai")
+        args = (VALID_CONFIG, "test", "store", "desc", "", "Asia/Shanghai")
+        with patch.object(order_api, "_fetch_all_tasks", side_effect=slow_fetch):
+            self.assertTrue(
+                order_api._start_background_task_list_refresh(cache_key, *args)
+            )
+            self.assertTrue(entered.wait(5))
+            # 同一 key 正在刷新时不重复开线程
+            self.assertFalse(
+                order_api._start_background_task_list_refresh(cache_key, *args)
+            )
+            released.set()
+            for _ in range(100):
+                with order_api._TASK_LIST_CACHE_LOCK:
+                    done = cache_key not in order_api._TASK_LIST_REFRESHING
+                if done:
+                    break
+                time.sleep(0.05)
+
+        with order_api._TASK_LIST_CACHE_LOCK:
+            self.assertNotIn(cache_key, order_api._TASK_LIST_REFRESHING)
+            self.assertEqual(
+                order_api._TASK_LIST_CACHE[cache_key][1], [{"task_id": "fresh"}]
+            )
+
+    def test_background_refresh_failure_keeps_old_cache(self) -> None:
+        cache_key = ("test", "srv", "cid", "store", "desc", "", "Asia/Shanghai")
+        old = [{"task_id": "old"}]
+        with order_api._TASK_LIST_CACHE_LOCK:
+            order_api._TASK_LIST_CACHE[cache_key] = (time.monotonic(), old)
+        args = (VALID_CONFIG, "test", "store", "desc", "", "Asia/Shanghai")
+
+        with patch.object(
+            order_api, "_fetch_all_tasks", side_effect=RuntimeError("broker down")
+        ):
+            order_api._start_background_task_list_refresh(cache_key, *args)
+            for _ in range(100):
+                with order_api._TASK_LIST_CACHE_LOCK:
+                    done = cache_key not in order_api._TASK_LIST_REFRESHING
+                if done:
+                    break
+                time.sleep(0.05)
+
+        with order_api._TASK_LIST_CACHE_LOCK:
+            self.assertEqual(order_api._TASK_LIST_CACHE[cache_key][1], old)
+
+    def test_broker_status_is_returned_verbatim(self) -> None:
+        """订单状态直出 Broker 原值，不做本地覆盖。"""
+        upstream = {
+            "data": {
+                "tasks": [{"task_id": "task-1", "status": "running"}],
+                "has_more": False,
+            }
+        }
+        with (
+            patch.object(order_api, "load_order_config", return_value=VALID_CONFIG),
+            patch.object(order_api, "_ensure_token", return_value="token"),
+            patch.object(
+                order_api.broker,
+                "list_robot_tasks",
+                return_value=(200, upstream),
+            ),
+        ):
+            result = order_api.list_tasks("test")
+
+        self.assertEqual(result["tasks"][0]["status"], "running")
+
     def test_rejects_invalid_paging_sort_status_and_timezone(self) -> None:
         invalid_cases = (
             {"page": 0},
@@ -286,22 +532,49 @@ class TaskListTests(unittest.TestCase):
         self.assertEqual(request.call_count, 1)
         clear.assert_not_called()
 
+    def test_retries_once_after_http_200_token_error_code(self) -> None:
+        request = Mock(
+            side_effect=[
+                (200, {"code": 4014, "msg": "expired"}),
+                (200, {"code": 0, "data": {}}),
+            ]
+        )
+        with (
+            patch.object(order_api, "_ensure_token", side_effect=["old", "new"]) as token,
+            patch.object(order_api, "_clear_token") as clear,
+        ):
+            result = order_api._request_with_token_retry(
+                VALID_CONFIG, "test", request
+            )
+
+        self.assertEqual(result, (200, {"code": 0, "data": {}}))
+        self.assertEqual(request.call_args_list[1].args, ("new",))
+        self.assertEqual(token.call_count, 2)
+        clear.assert_called_once_with(VALID_CONFIG)
+
+    def test_non_numeric_business_code_is_not_treated_as_success(self) -> None:
+        with self.assertRaises(broker.OrderBrokerError):
+            order_api._ensure_broker_response_succeeded(
+                "查询任务", 200, {"code": "unexpected", "data": {}}
+            )
+
+    def test_fractional_business_code_is_not_treated_as_success(self) -> None:
+        with self.assertRaises(broker.OrderBrokerError):
+            order_api._ensure_broker_response_succeeded(
+                "查询任务", 200, {"code": 0.1, "data": {}}
+            )
+
 
 class CurrentOrderActionTests(unittest.TestCase):
-    STATUS_MATRIX = {
-        "pending": {"cancel"},
-        "dispatched": {"cancel"},
-        "running": {"cancel", "manual_claim"},
-        "awaiting_pack": {"cancel"},
-        "manual_transferred": {"manual_complete"},
-        "success": set(),
-        "error": set(),
-        "cancel": set(),
-        "manual_transferred_completed": set(),
-    }
+    # 状态门槛已对齐 devtools（直发，由 Broker 裁决），矩阵仅用于覆盖各状态。
+    ALL_STATUSES = (
+        "pending", "dispatched", "running", "awaiting_pack", "manual_transferred",
+        "manual_claimed_in_progress", "success", "error", "cancel",
+        "manual_transferred_completed",
+    )
 
-    def test_full_status_matrix(self) -> None:
-        for status, allowed in self.STATUS_MATRIX.items():
+    def test_all_statuses_send_request_directly(self) -> None:
+        for status in self.ALL_STATUSES:
             for action in ("cancel", "manual_claim", "manual_complete"):
                 with self.subTest(status=status, action=action):
                     context = (
@@ -320,18 +593,14 @@ class CurrentOrderActionTests(unittest.TestCase):
                             return_value=(200, {"ok": True}),
                         ) as request,
                     ):
-                        if action in allowed:
-                            result = order_api.operate_current_order(
-                                action, "operator request"
-                            )
-                            self.assertTrue(result["ok"])
-                            request.assert_called_once()
-                        else:
-                            with self.assertRaises(order_api.CurrentOrderConflict):
-                                order_api.operate_current_order(
-                                    action, "operator request"
-                                )
-                            request.assert_not_called()
+                        kwargs = (
+                            {"cancel_reason": "operator request"}
+                            if action == "cancel"
+                            else {}
+                        )
+                        result = order_api.operate_current_order(action, **kwargs)
+                        self.assertTrue(result["ok"])
+                        request.assert_called_once()
 
     def test_cancel_always_uses_current_task_and_user_type(self) -> None:
         context = (
@@ -428,17 +697,12 @@ class CurrentOrderActionTests(unittest.TestCase):
 
 
 class OperateTaskTests(unittest.TestCase):
-    STATUS_MATRIX = {
-        "pending": {"cancel"},
-        "dispatched": {"cancel"},
-        "running": {"cancel", "manual_claim"},
-        "awaiting_pack": {"cancel"},
-        "manual_transferred": {"manual_complete"},
-        "success": set(),
-        "error": set(),
-        "cancel": set(),
-        "manual_transferred_completed": set(),
-    }
+    # 状态门槛已对齐 devtools（直发，由 Broker 裁决），矩阵仅用于覆盖各状态。
+    ALL_STATUSES = (
+        "pending", "dispatched", "running", "awaiting_pack", "manual_transferred",
+        "manual_claimed_in_progress", "success", "error", "cancel",
+        "manual_transferred_completed",
+    )
 
     def _operate(
         self,
@@ -488,23 +752,17 @@ class OperateTaskTests(unittest.TestCase):
             result = order_api.operate_task(action, "task-9", **kwargs)
         return result, cancel, claim, complete, clear_cache
 
-    def test_full_status_matrix(self) -> None:
-        for status, allowed in self.STATUS_MATRIX.items():
+    def test_all_statuses_send_request_directly(self) -> None:
+        for status in self.ALL_STATUSES:
             for action in ("cancel", "manual_claim", "manual_complete"):
                 with self.subTest(status=status, action=action):
-                    if action in allowed:
-                        result, *_ = self._operate(
-                            action, status, cancel_reason="operator request"
-                        )
-                        self.assertTrue(result["ok"])
-                        self.assertEqual(result["action"], action)
-                        self.assertEqual(result["task_id"], "task-9")
-                        self.assertEqual(result["order_no"], "ORDER-9")
-                    else:
-                        with self.assertRaises(order_api.TaskOperationConflict):
-                            self._operate(
-                                action, status, cancel_reason="operator request"
-                            )
+                    result, *_ = self._operate(
+                        action, status, cancel_reason="operator request"
+                    )
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(result["action"], action)
+                    self.assertEqual(result["task_id"], "task-9")
+                    self.assertEqual(result["order_no"], "ORDER-9")
 
     def test_cancel_type_defaults_to_user(self) -> None:
         _, cancel, *_ = self._operate(
@@ -539,6 +797,23 @@ class OperateTaskTests(unittest.TestCase):
         _, _, claim, _, clear_cache = self._operate("manual_claim", "running")
         claim.assert_called_once()
         clear_cache.assert_called_once_with()
+
+    def test_http_200_business_error_is_not_reported_as_success(self) -> None:
+        with self.assertRaisesRegex(broker.OrderBrokerError, "Broker 拒绝操作"):
+            order_api._ensure_task_action_succeeded(
+                "manual_complete",
+                200,
+                {"code": 422, "msg": "Broker 拒绝操作"},
+            )
+
+    def test_manual_complete_sends_request_regardless_of_stale_status(self) -> None:
+        """对齐 devtools：无本地状态门槛，stale running 详情也直发完成请求。"""
+        result, _cancel, _claim, complete, _clear = self._operate(
+            "manual_complete",
+            "running",
+        )
+        self.assertTrue(result["ok"])
+        complete.assert_called_once()
 
     def test_queue_status_attached_when_task_is_active_order(self) -> None:
         result, *_ = self._operate(
@@ -641,6 +916,126 @@ class ErrorPayloadTests(unittest.TestCase):
         active.assert_not_called()
 
 
+class CreateOrderBusinessCodeTests(unittest.TestCase):
+    """Broker 业务错误码（HTTP 200 但 code 非 0）的自动重试与指引。"""
+
+    CONFIG = dict(VALID_CONFIG, order_source="meituan")
+    ITEMS = [{"item_id": "item-1", "location_code": "A01", "barcode": "690001"}]
+
+    def _create(self, create_side_effect, items=None):
+        with (
+            patch.object(
+                dashboard_api, "ensure_order_queue_capacity", return_value=None
+            ),
+            patch.object(
+                dashboard_api, "active_order_blocking_keys", return_value=[]
+            ),
+            patch.object(
+                order_api, "load_order_config", return_value=dict(self.CONFIG)
+            ),
+            patch.object(order_api, "_ensure_token", return_value="token"),
+            patch.object(order_api, "_clear_token") as clear,
+            patch.object(
+                order_api.broker, "create_robot_task", side_effect=create_side_effect
+            ) as create,
+        ):
+            result = order_api.create_order(
+                {"mode": "test", "items": items or self.ITEMS}
+            )
+        return result, create, clear
+
+    def test_group_metadata_is_local_only(self) -> None:
+        item = dict(self.ITEMS[0], group_id="A01", group_field="批次")
+        result, create, _clear = self._create(
+            [(200, {"code": 0, "data": {"task_id": "t-group"}})],
+            [item],
+        )
+
+        broker_item = create.call_args.args[2]["items"][0]
+        self.assertNotIn("group_id", broker_item)
+        self.assertNotIn("group_field", broker_item)
+        self.assertEqual(result[2]["items"][0]["group_id"], "A01")
+        self.assertEqual(result[2]["items"][0]["group_field"], "批次")
+
+    def test_4014_refreshes_token_and_retries(self) -> None:
+        result, create, clear = self._create(
+            [
+                (200, {"code": 4014, "msg": "client token is invalid", "data": None}),
+                (200, {"code": 0, "data": {"task_id": "t-1"}}),
+            ]
+        )
+        self.assertEqual(create.call_count, 2)
+        clear.assert_called_once()
+        self.assertEqual(result[1]["data"]["task_id"], "t-1")
+
+    def test_4601_regenerates_order_no_and_retries(self) -> None:
+        result, create, _clear = self._create(
+            [
+                (200, {"code": 4601, "msg": "order is duplicated", "data": None}),
+                (200, {"code": 0, "data": {"task_id": "t-2"}}),
+            ]
+        )
+        self.assertEqual(create.call_count, 2)
+        first_body = create.call_args_list[0].args[2]
+        second_body = create.call_args_list[1].args[2]
+        self.assertNotEqual(first_body["order_no"], second_body["order_no"])
+        self.assertEqual(result[1]["data"]["task_id"], "t-2")
+
+    def test_non_retryable_code_raises_with_message(self) -> None:
+        with self.assertRaises(broker.OrderBrokerError) as ctx:
+            self._create(
+                [(200, {"code": 4511, "msg": "robot manager device is empty"})]
+            )
+        self.assertIn("robot manager device is empty", str(ctx.exception))
+        payload = order_api.broker_error_payload(ctx.exception)
+        self.assertEqual(payload["upstream_code"], 4511)
+        self.assertIn("注册机器人", payload["hint"])
+
+    def test_known_codes_carry_hints(self) -> None:
+        for code, keyword in (
+            (4014, "Token"),
+            (4524, "接单"),
+            (4552, "库位管理工具"),
+            (4601, "单号"),
+            (4800, "并发"),
+        ):
+            error = broker.OrderBrokerError("失败", 200, {"code": code, "msg": "x"})
+            hint = order_api.broker_error_payload(error)["hint"]
+            self.assertIn(keyword, hint)
+
+    def test_missing_task_id_is_rejected_before_local_registration(self) -> None:
+        with (
+            patch.object(
+                order_api,
+                "create_order",
+                return_value=(200, {"code": 0, "data": {}}, {"items": []}),
+            ),
+            patch.object(dashboard_api, "register_created_order") as register,
+            self.assertRaisesRegex(broker.OrderBrokerError, "缺少 task_id"),
+        ):
+            order_api.create_registered_order({"items": []})
+
+        register.assert_not_called()
+
+    def test_unresolved_previous_prompt_is_rejected_before_broker_request(self) -> None:
+        with (
+            patch.object(
+                dashboard_api,
+                "active_order_requires_manual_completion",
+                return_value=True,
+            ),
+            patch.object(order_api, "load_order_config") as load_config,
+            self.assertRaises(order_api.OrderQueueConflict) as raised,
+        ):
+            order_api.create_order({"mode": "test", "items": self.ITEMS})
+
+        self.assertEqual(
+            raised.exception.code, "PREVIOUS_ORDER_REQUIRES_COMPLETION"
+        )
+        self.assertIn("完成上一单", raised.exception.hint)
+        load_config.assert_not_called()
+
+
 @unittest.skipIf(QueryHandler is None, "HTTP handlers require Python 3.12 or older")
 class OrderRouteTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -708,6 +1103,21 @@ class OrderRouteTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(data, expected)
         self.assertNotIn("store_id", list_tasks.call_args.kwargs)
+
+    def test_order_preflight_returns_structured_previous_order_conflict(self) -> None:
+        conflict = order_api.OrderQueueConflict(
+            "上一单仍在等待人工确认。",
+            "PREVIOUS_ORDER_REQUIRES_COMPLETION",
+            "请先完成上一单。",
+        )
+        with patch.object(
+            order_api, "ensure_order_creation_allowed", side_effect=conflict
+        ):
+            status, data = self.request("POST", "/api/order/preflight")
+
+        self.assertEqual(status, 409)
+        self.assertEqual(data["error_code"], conflict.code)
+        self.assertEqual(data["hint"], conflict.hint)
 
     def test_cancel_ignores_browser_task_and_order_identifiers(self) -> None:
         result = {

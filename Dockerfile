@@ -47,4 +47,5 @@ CMD ["python3", "/opt/ksq/knowledge_shelf_query.bin", \
      "--host", "0.0.0.0", \
      "--port", "8765", \
      "--config-pnp", "/data/config_pnp", \
-     "--knowledge", "/data/knowledge"]
+     "--knowledge-root", "/data/knowledge", \
+     "--knowledge", "/data/knowledge/knowledge"]

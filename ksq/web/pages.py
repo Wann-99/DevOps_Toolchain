@@ -6,7 +6,13 @@ import html
 from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
-from ksq.constants import APP_VERSION, BASE_COLUMNS, PACKAGE_DIRECTORY
+from ksq.constants import (
+    APP_VERSION,
+    BASE_COLUMNS,
+    DEFAULT_KNOWLEDGE,
+    DEFAULT_KNOWLEDGE_ROOT,
+    PACKAGE_DIRECTORY,
+)
 from ksq.display import display_value
 from ksq.models import Dataset, ShelfEntry
 from ksq.side_data import (
@@ -20,8 +26,47 @@ TEMPLATES_DIRECTORY = PACKAGE_DIRECTORY / "web" / "templates"
 STATIC_DIRECTORY = PACKAGE_DIRECTORY / "web" / "static"
 
 
-def optional_path_display(path: Optional[Path]) -> str:
-    return "" if path is None else str(path)
+def path_field_bases() -> Tuple[Optional[Path], Optional[Path]]:
+    # In the mounted-root layout the root, rather than the current target
+    # directory, is the base for all relative scene paths.
+    knowledge_base = state.configured_knowledge_root
+    if knowledge_base is None:
+        knowledge_base = state._cli_config_paths.get("knowledge")
+    if knowledge_base is None and state.configured_vfm_app is not None:
+        knowledge_base = state.configured_vfm_app / "model/templates"
+    if knowledge_base is None and state.configured_knowledge == DEFAULT_KNOWLEDGE:
+        knowledge_base = DEFAULT_KNOWLEDGE_ROOT
+    return knowledge_base, state.configured_config_pnp
+
+
+def path_field_display(path: Optional[Path], base: Optional[Path]) -> str:
+    if path is None:
+        return ""
+    if base is not None:
+        try:
+            return str(path.resolve().relative_to(base.resolve()))
+        except ValueError:
+            pass
+    return str(path)
+
+
+def configured_path_field_values() -> Dict[str, str]:
+    knowledge_base, config_base = path_field_bases()
+    return {
+        "knowledge": path_field_display(
+            state.configured_knowledge, knowledge_base
+        ),
+        "shelves": path_field_display(state.configured_shelves, config_base),
+        "unavailable": path_field_display(
+            state.configured_unavailable, config_base
+        ),
+        "tool_mapping": path_field_display(
+            state.configured_tool_mapping, config_base
+        ),
+        "pick_strategy": path_field_display(
+            state.configured_pick_strategy, config_base
+        ),
+    }
 
 
 def _read_template(name: str) -> str:
@@ -29,23 +74,15 @@ def _read_template(name: str) -> str:
 
 
 def shell_page_html() -> str:
+    paths = configured_path_field_values()
     return (
         _read_template("shell.html")
         .replace("__APP_VERSION__", html.escape(APP_VERSION))
-        .replace("__KNOWLEDGE__", html.escape(str(state.configured_knowledge)))
-        .replace("__SHELVES__", html.escape(str(state.configured_shelves)))
-        .replace(
-            "__UNAVAILABLE__",
-            html.escape(optional_path_display(state.configured_unavailable)),
-        )
-        .replace(
-            "__TOOL_MAPPING__",
-            html.escape(optional_path_display(state.configured_tool_mapping)),
-        )
-        .replace(
-            "__PICK_STRATEGY__",
-            html.escape(optional_path_display(state.configured_pick_strategy)),
-        )
+        .replace("__KNOWLEDGE__", html.escape(paths["knowledge"]))
+        .replace("__SHELVES__", html.escape(paths["shelves"]))
+        .replace("__UNAVAILABLE__", html.escape(paths["unavailable"]))
+        .replace("__TOOL_MAPPING__", html.escape(paths["tool_mapping"]))
+        .replace("__PICK_STRATEGY__", html.escape(paths["pick_strategy"]))
     )
 
 
@@ -133,6 +170,20 @@ def format_status_html(
             "库位表同库位行字段冲突（已按先出现的行取值，建议核对库位表）："
             + f"<ul class='status-list'>{preview}{more}</ul>"
         )
+    if report.shelf_location_warnings:
+        preview = "".join(
+            f"<li>{html.escape(item)}</li>"
+            for item in report.shelf_location_warnings[:5]
+        )
+        more = (
+            ""
+            if len(report.shelf_location_warnings) <= 5
+            else f"<li>… 共 {len(report.shelf_location_warnings)} 行</li>"
+        )
+        notes.append(
+            "库位字段缺失（不影响加载，页面显示为 -）："
+            + f"<ul class='status-list'>{preview}{more}</ul>"
+        )
     dictionary_notes: List[str] = []
     if report.duplicate_knowledge_files:
         dictionary_notes.append(
@@ -216,24 +267,33 @@ def _shelf_display_fields(entries: tuple[ShelfEntry, ...]) -> Dict[str, str]:
     )
     baffle_heights = _join_unique_display([entry.baffle_height for entry in entries])
     out_item_ids = _join_unique_display([entry.out_item_id for entry in entries])
+    sku_codes = _join_unique_display([entry.sku_code for entry in entries])
     return {
         "name": names,
         "locations": locations,
         "shelf_attribute": shelf_attributes,
         "baffle_height": baffle_heights,
         "out_item_id": out_item_ids,
+        "sku_code": sku_codes,
     }
 
 
-def _order_lines(barcode: str, entries: tuple[ShelfEntry, ...]) -> List[Dict[str, str]]:
+def _resolve_line_item_id(entry: ShelfEntry, sku_id: str, record_id: str) -> str:
+    """下单 item_id 取值优先级：商品编码 > SKU ID > 69码；记录主键兜底。"""
+    return entry.out_item_id or sku_id or entry.sku_code or record_id
+
+
+def _order_lines(item_id: str, entries: tuple[ShelfEntry, ...]) -> List[Dict[str, str]]:
     lines: List[Dict[str, str]] = []
+    sku_id = item_id if any(entry.sku_code != item_id for entry in entries) else ""
     for entry in entries:
-        if not entry.out_item_id or not entry.location:
+        if not entry.location:
             continue
         lines.append(
             {
-                "item_id": entry.out_item_id,
-                "barcode": barcode,
+                "item_id": _resolve_line_item_id(entry, sku_id, item_id),
+                "barcode": entry.sku_code or item_id,
+                "sku_id": sku_id,
                 "location_code": entry.location,
                 "name": entry.name if entry.name != "未命名" else "",
                 "shelf_attribute": entry.shelf_attribute or "",
@@ -252,19 +312,23 @@ def _build_query_record(
     unavailable_ids: Optional[FrozenSet[str]],
 ) -> Dict[str, object]:
     shelf_fields = _shelf_display_fields(entries)
+    sku_codes = [entry.sku_code for entry in entries if entry.sku_code]
+    sku_id = item_id if not sku_codes or any(code != item_id for code in sku_codes) else ""
     return {
         "id": item_id,
+        "sku_id": sku_id,
+        "sku_code": shelf_fields["sku_code"],
         "out_item_id": shelf_fields["out_item_id"],
         "name": shelf_fields["name"],
         "locations": shelf_fields["locations"],
         "shelf_attribute": shelf_fields["shelf_attribute"],
         "baffle_height": shelf_fields["baffle_height"],
-        "tool": display_value(resolve_tool_name(item_id, tool_mapping)),
+        "tool": display_value(resolve_tool_name(item_id, tool_mapping, sku_codes)),
         "closed_loop": display_value(
-            resolve_closed_loop_label(item_id, closed_loop_ids)
+            resolve_closed_loop_label(item_id, closed_loop_ids, sku_codes)
         ),
         "unavailable": display_value(
-            resolve_unavailable_label(item_id, unavailable_ids)
+            resolve_unavailable_label(item_id, unavailable_ids, sku_codes)
         ),
         "order_lines": _order_lines(item_id, entries),
         "knowledge": knowledge_values,

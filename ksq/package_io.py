@@ -24,6 +24,7 @@ def save_package(dataset: Dataset, package_file: Path) -> None:
                     "shelf_attribute": entry.shelf_attribute,
                     "baffle_height": entry.baffle_height,
                     "out_item_id": entry.out_item_id,
+                    "sku_code": entry.sku_code,
                 }
                 for entry in entries
             ]
@@ -41,6 +42,7 @@ def save_package(dataset: Dataset, package_file: Path) -> None:
             "multi_location_sku_count": dataset.report.multi_location_sku_count,
             "conflicting_knowledge_ids": list(dataset.report.conflicting_knowledge_ids),
             "shelves_without_knowledge": list(dataset.report.shelves_without_knowledge),
+            "shelf_location_warnings": list(dataset.report.shelf_location_warnings),
         },
     }
     package_file.parent.mkdir(parents=True, exist_ok=True)
@@ -58,7 +60,7 @@ def load_package(package_file: Path) -> Dataset:
     if not isinstance(payload, dict):
         raise ValueError(f"数据包格式错误：{package_file}")
     version = payload.get("version")
-    if version not in {1, 2, PACKAGE_VERSION}:
+    if version not in {1, 2, 3, PACKAGE_VERSION}:
         raise ValueError(f"不支持的数据包版本：{version}")
 
     knowledge = payload.get("knowledge")
@@ -92,6 +94,7 @@ def load_package(package_file: Path) -> Dataset:
                         shelf_attribute="",
                         baffle_height="",
                         out_item_id="",
+                        sku_code=item_id,
                     )
                 )
         elif isinstance(raw_locations, list):
@@ -102,16 +105,19 @@ def load_package(package_file: Path) -> Dataset:
                     shelf_attribute = str(item.get("shelf_attribute") or "").strip()
                     baffle_height = str(item.get("baffle_height") or "").strip()
                     out_item_id = str(item.get("out_item_id") or "").strip()
-                    if location:
-                        entries.append(
-                            ShelfEntry(
-                                location=location,
-                                name=name,
-                                shelf_attribute=shelf_attribute,
-                                baffle_height=baffle_height,
-                                out_item_id=out_item_id,
-                            )
+                    sku_code = str(item.get("sku_code") or "").strip()
+                    if version < 4:
+                        sku_code = item_id
+                    entries.append(
+                        ShelfEntry(
+                            location=location,
+                            name=name,
+                            shelf_attribute=shelf_attribute,
+                            baffle_height=baffle_height,
+                            out_item_id=out_item_id,
+                            sku_code=sku_code,
                         )
+                    )
                 else:
                     location = str(item).strip()
                     if location:
@@ -122,6 +128,7 @@ def load_package(package_file: Path) -> Dataset:
                                 shelf_attribute="",
                                 baffle_height="",
                                 out_item_id="",
+                                sku_code=item_id,
                             )
                         )
         else:
@@ -146,6 +153,11 @@ def load_package(package_file: Path) -> Dataset:
     else:
         empty_sku_count = int(payload.get("skipped_empty_sku_count", 0))
         shelf_rows = mapped_row_count
+    location_warnings = (
+        tuple(str(item) for item in report_payload.get("shelf_location_warnings", ()))
+        if isinstance(report_payload, dict)
+        else ()
+    )
     report = build_load_report(
         records,
         len(knowledge),
@@ -157,6 +169,7 @@ def load_package(package_file: Path) -> Dataset:
         shelf_rows,
         mapped_row_count,
         [],
+        shelf_location_warnings=location_warnings,
     )
 
     return Dataset(

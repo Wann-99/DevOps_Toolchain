@@ -189,3 +189,33 @@ def manual_complete_order(
     encoded = quote(order_no, safe="")
     url = f"{_normalize_server(server)}/api/orders/{encoded}/manual-complete"
     return _request_json("POST", url, None, token)
+
+
+def update_robot_task(
+    server: str, token: str, task_id: str, fields: Dict[str, object]
+) -> Tuple[int, object]:
+    """PUT /api/robot-tasks/{task_id}：更新零售单号等任务字段。"""
+    encoded = quote(task_id, safe="")
+    url = f"{_normalize_server(server)}/api/robot-tasks/{encoded}"
+    return _request_json("PUT", url, fields, token)
+
+
+def list_business_modes(server: str, token: str) -> Tuple[int, object]:
+    url = f"{_normalize_server(server)}/api/business-modes"
+    return _request_json("GET", url, None, token)
+
+
+def get_business_config(
+    server: str, token: str, store_id: str
+) -> Tuple[int, object]:
+    encoded = quote(store_id, safe="")
+    url = f"{_normalize_server(server)}/api/retail-stores/{encoded}/business-config"
+    return _request_json("GET", url, None, token)
+
+
+def update_business_config(
+    server: str, token: str, store_id: str, body: Dict[str, object]
+) -> Tuple[int, object]:
+    encoded = quote(store_id, safe="")
+    url = f"{_normalize_server(server)}/api/retail-stores/{encoded}/business-config"
+    return _request_json("PUT", url, body, token)

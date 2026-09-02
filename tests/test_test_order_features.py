@@ -9,6 +9,7 @@ from ksq.test_order_select import (
     DEFAULT_COLUMNS,
     parse_import_csv,
     parse_import_csv_full,
+    public_item,
 )
 from ksq.web import logs_api, test_order_api
 
@@ -54,13 +55,32 @@ class FlexibleCsvImportTests(unittest.TestCase):
                 self.assertEqual(rows[0]["out_item_id"], expected)
                 self.assertEqual(errors, [])
 
-    def test_multiple_identifiers_must_match_same_candidate(self) -> None:
+    def test_multiple_identifiers_prefer_the_matching_candidate(self) -> None:
         rows, errors = self.parse("商品编码,库位\nOUT-2,01-02-04\n")
         self.assertEqual(rows[0]["sku_code"], "690002")
         self.assertEqual(errors, [])
 
-        with self.assertRaisesRegex(ValueError, "未找到"):
-            self.parse("商品编码,库位\nOUT-1,01-02-04\n")
+    def test_row_absent_from_candidates_is_imported_from_the_file(self) -> None:
+        # 候选数据里没有这个组合（OUT-1 在 010203），仍按原文件导入不拦截
+        rows, errors = self.parse("商品编码,库位\nOUT-1,01-02-04\n")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["out_item_id"], "OUT-1")
+        self.assertEqual(rows[0]["location_code"], "010204")
+        self.assertEqual(rows[0]["sku_code"], "")
+        self.assertEqual(errors, [])
+
+    def test_unknown_sku_is_imported_and_keeps_orderable_key(self) -> None:
+        rows, _errors = self.parse("69码,库位\n699999,52-07-01\n")
+
+        self.assertEqual(rows[0]["sku_code"], "699999")
+        self.assertEqual(public_item(rows[0])["key"], "699999|520701")
+
+    def test_out_item_id_only_row_still_has_a_usable_key(self) -> None:
+        # 无 sku_id/69码 时回退用商品编码做标识，否则 key 为 "|520701" 无法下单
+        rows, _errors = self.parse("商品编码,库位\nOUT-9,52-07-01\n")
+
+        self.assertEqual(public_item(rows[0])["key"], "OUT-9|520701")
 
     def test_rejects_csv_without_supported_identifier_header(self) -> None:
         with self.assertRaisesRegex(ValueError, "至少需要商品编码、库位、69码"):
@@ -106,6 +126,217 @@ class TestOrderBatchTests(unittest.TestCase):
         self.assertEqual(result["order_count"], 1)
         self.assertEqual(result["order_batches"][0]["sku_count"], 2)
         self.assertTrue(all(row["order_no"] == "ORDER-1" for row in result["ordered"]))
+
+    def test_mark_ordered_retry_is_idempotent_for_same_external_order(self) -> None:
+        item = candidate("OUT-1", "010203", "690001")
+        self.save_pending([item])
+        payload = {
+            "keys": ["690001|010203"],
+            "order_no": "ORDER-RETRY",
+            "task_id": "TASK-RETRY",
+        }
+
+        first = test_order_api.mark_ordered(payload)
+        second = test_order_api.mark_ordered(payload)
+
+        self.assertNotIn("idempotent", first)
+        self.assertTrue(second["idempotent"])
+        self.assertEqual(second["pending_count"], 0)
+        self.assertEqual(second["ordered_count"], 1)
+        self.assertEqual(second["order_count"], 1)
+        self.assertEqual(len(second["order_batches"]), 1)
+
+    def test_restore_cleans_order_metadata_and_trims_batches(self) -> None:
+        first = candidate("OUT-1", "010203", "690001")
+        second = candidate("OUT-2", "010204", "690002")
+        third = candidate("OUT-3", "010205", "690003")
+        self.save_pending([first, second, third])
+        test_order_api.mark_ordered(
+            {
+                "keys": ["690001|010203", "690002|010204"],
+                "order_no": "ORDER-A",
+                "task_id": "TASK-A",
+            }
+        )
+        test_order_api.mark_ordered(
+            {"keys": ["690003|010205"], "order_no": "ORDER-B", "task_id": "TASK-B"}
+        )
+
+        restored = test_order_api.restore({"keys": ["690001|010203"]})
+
+        self.assertEqual(
+            [item["sku_code"] for item in restored["pending"]], ["690001"]
+        )
+        self.assertEqual(
+            [item["sku_code"] for item in restored["ordered"]], ["690003", "690002"]
+        )
+        self.assertEqual(restored["order_count"], 2)
+        self.assertEqual(
+            [(batch["order_no"], batch["sku_count"]) for batch in restored["order_batches"]],
+            [("ORDER-B", 1), ("ORDER-A", 1)],
+        )
+        raw = test_order_api._load_state_file()
+        self.assertNotIn("order_no", raw["pending"][0])
+        self.assertNotIn("task_id", raw["pending"][0])
+
+        restored_again = test_order_api.restore({"keys": ["690002|010204"]})
+        self.assertEqual(restored_again["order_count"], 1)
+        self.assertEqual(restored_again["order_batches"][0]["order_no"], "ORDER-B")
+
+    def test_restore_rejects_missing_or_mixed_keys_without_mutation(self) -> None:
+        first = candidate("OUT-1", "010203", "690001")
+        second = candidate("OUT-2", "010204", "690002")
+        self.save_pending([first, second])
+        test_order_api.mark_ordered(
+            {"keys": ["690001|010203"], "order_no": "ORDER-A"}
+        )
+        before = self.state_file.read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "同时包含"):
+            test_order_api.restore(
+                {"keys": ["690001|010203", "690002|010204"]}
+            )
+        self.assertEqual(self.state_file.read_bytes(), before)
+
+        with self.assertRaisesRegex(ValueError, "不存在"):
+            test_order_api.restore({"keys": ["690999|010299"]})
+        self.assertEqual(self.state_file.read_bytes(), before)
+
+    def test_batch_id_fallback_is_stable_across_state_reads(self) -> None:
+        item = candidate("OUT-1", "010203", "690001")
+        state = test_order_api._empty_state()
+        state["ordered"] = [item]
+        state["order_batches"] = [
+            {
+                "ordered_at": "2026-08-26T10:00:00+08:00",
+                "order_no": "ORDER-1",
+                "task_id": "TASK-1",
+                "item_keys": ["690001|010203"],
+            }
+        ]
+        test_order_api._save_state(state)
+
+        first = test_order_api.get_state()
+        second = test_order_api.get_state()
+
+        self.assertEqual(first["order_batches"], second["order_batches"])
+        self.assertTrue(first["order_batches"][0]["batch_id"].startswith("batch-"))
+
+    def test_config_rejects_string_boolean_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "布尔值"):
+            test_order_api.update_config(
+                {"config": {"closed_loop_enabled": "false"}}
+            )
+
+    def test_config_rejects_coerced_numbers_and_nonfinite_ratios(self) -> None:
+        for key, value in (("count", True), ("count", 1.5), ("seed", 1.5)):
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(
+                ValueError, "整数"
+            ):
+                test_order_api._normalize_config({key: value})
+        for value in (float("nan"), float("inf"), "NaN"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                test_order_api._normalize_config({"closed_loop_ratio": value})
+
+    def test_malformed_key_and_state_count_are_safe(self) -> None:
+        self.assertIsNone(test_order_api._parse_key("690001|010203|group|extra"))
+        state = test_order_api._empty_state()
+        state["candidate_count"] = "not-a-number"
+        test_order_api._save_state(state)
+        self.assertEqual(test_order_api._load_state_file()["candidate_count"], 0)
+
+    def test_packaging_choices_cache_changes_with_data_revision(self) -> None:
+        self.packaging_patch.stop()
+        old_cache = test_order_api._packaging_choices_cache
+        old_cache_at = test_order_api._packaging_choices_cache_at
+        old_cache_revision = test_order_api._packaging_choices_cache_revision
+        old_revision = test_order_api.state.data_revision
+        try:
+            test_order_api._packaging_choices_cache = None
+            test_order_api._packaging_choices_cache_at = 0
+            test_order_api._packaging_choices_cache_revision = None
+            with patch.object(
+                test_order_api,
+                "_load_packaging_choices",
+                side_effect=[["纸盒"], ["塑料袋"]],
+            ) as loader, patch.object(test_order_api.state, "data_revision", 10):
+                self.assertEqual(test_order_api._candidate_packaging_choices(), ["纸盒"])
+                self.assertEqual(test_order_api._candidate_packaging_choices(), ["纸盒"])
+                test_order_api.state.data_revision = 11
+                self.assertEqual(test_order_api._candidate_packaging_choices(), ["塑料袋"])
+                self.assertEqual(loader.call_count, 2)
+        finally:
+            test_order_api._packaging_choices_cache = old_cache
+            test_order_api._packaging_choices_cache_at = old_cache_at
+            test_order_api._packaging_choices_cache_revision = old_cache_revision
+            test_order_api.state.data_revision = old_revision
+            self.packaging_patch.start()
+
+    def test_mark_ordered_retry_rejects_mismatched_external_identity(self) -> None:
+        item = candidate("OUT-1", "010203", "690001")
+        self.save_pending([item])
+        test_order_api.mark_ordered(
+            {
+                "keys": ["690001|010203"],
+                "order_no": "ORDER-ORIGINAL",
+                "task_id": "TASK-ORIGINAL",
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "未在待下单"):
+            test_order_api.mark_ordered(
+                {
+                    "keys": ["690001|010203"],
+                    "order_no": "ORDER-OTHER",
+                    "task_id": "TASK-OTHER",
+                }
+            )
+
+    def test_mark_ordered_does_not_partially_move_missing_keys(self) -> None:
+        item = candidate("OUT-1", "010203", "690001")
+        self.save_pending([item])
+
+        with self.assertRaisesRegex(ValueError, "不存在"):
+            test_order_api.mark_ordered(
+                {
+                    "keys": ["690001|010203", "690999|010299"],
+                    "task_id": "TASK-MISSING",
+                }
+            )
+
+        state = test_order_api.get_state()
+        self.assertEqual(state["pending_count"], 1)
+        self.assertEqual(state["ordered_count"], 0)
+
+    def test_legacy_ordered_rows_are_not_treated_as_idempotent(self) -> None:
+        item = candidate("OUT-1", "010203", "690001")
+        state = test_order_api._empty_state()
+        state["ordered"] = [item]
+        test_order_api._save_state(state)
+
+        with self.assertRaisesRegex(ValueError, "未在待下单"):
+            test_order_api.mark_ordered(
+                {
+                    "keys": ["690001|010203"],
+                    "task_id": "TASK-LEGACY",
+                }
+            )
+
+    def test_update_config_saves_switches_without_touching_lists(self) -> None:
+        item = candidate("OUT-1", "010203", "690001")
+        state = test_order_api._empty_state()
+        state["pending"] = [item]
+        state["ordered"] = [dict(item, order_no="ORDER-1")]
+        test_order_api._save_state(state)
+
+        result = test_order_api.update_config(
+            {"config": {"closed_loop_enabled": False, "tool_enabled": False}}
+        )
+
+        self.assertFalse(result["config"]["closed_loop_enabled"])
+        self.assertFalse(result["config"]["tool_enabled"])
+        self.assertEqual(result["pending"][0]["out_item_id"], "OUT-1")
+        self.assertEqual(result["ordered"][0]["out_item_id"], "OUT-1")
 
     def test_newest_order_is_first(self) -> None:
         first = candidate("OUT-1", "010203", "690001")
@@ -195,6 +426,29 @@ class DynamicColumnsImportTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertEqual([row["sku_code"] for row in rows], ["690001"])
+
+    def test_multiple_sku_id_columns_split_into_one_item_each(self) -> None:
+        # 一行两个 SKU ID 列也是宽表；曾只认 69码 列，导致只取第一个、
+        # 第二个被静默丢弃，组合行里也就没有对应的勾选框
+        rows, errors, _columns = self.parse_full(
+            "id,sku_id,sku_id\n002,P000000745,P000000851\n", "id"
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            [row["sku_id"] for row in rows], ["P000000745", "P000000851"]
+        )
+        self.assertEqual([row["group_id"] for row in rows], ["002", "002"])
+
+    def test_one_sku_id_plus_one_barcode_stays_a_single_item(self) -> None:
+        # 不同字段各一列是同一药品的两种标识，不能当宽表拆成两条
+        rows, _errors, _columns = self.parse_full(
+            "SKU ID,69码\nsku-9,699999\n"
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["sku_id"], "sku-9")
+        self.assertEqual(rows[0]["sku_code"], "699999")
 
     def test_fullwidth_header_and_value_are_matched(self) -> None:
         rows, errors, _columns = self.parse_full("\uff16\uff19码\n\uff16\uff19\uff10\uff10\uff10\uff11\n")
@@ -572,7 +826,7 @@ class DockerLogStreamTests(unittest.TestCase):
                 "logs",
                 "--follow",
                 "--tail",
-                "800",
+                "2500",
                 "--timestamps",
                 "robot",
             ],
@@ -587,6 +841,24 @@ class DockerLogStreamTests(unittest.TestCase):
                 "--follow",
                 "--since",
                 "2026-08-12T10:00:00.000000001Z",
+                "--timestamps",
+                "robot",
+            ],
+        )
+        self.assertEqual(
+            logs_api._next_follow_source("resume", 1, True, 0, True),
+            "resume_tail",
+        )
+        self.assertEqual(
+            logs_api._follow_command(
+                "robot", "resume_tail", "2026-08-12T10:00:00.000000001Z"
+            ),
+            [
+                "docker",
+                "logs",
+                "--follow",
+                "--tail",
+                str(logs_api._FOLLOW_BUFFER_LINES),
                 "--timestamps",
                 "robot",
             ],

@@ -178,6 +178,13 @@ class AuthRouteTests(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertIn("error", data)
 
+    def test_unknown_api_request_returns_json(self) -> None:
+        status, data = self._request(
+            "GET", "/api/removed-endpoint", role=auth.ROLE_ADMIN
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(data, {"error": "Endpoint not found"})
+
     def test_anonymous_health_check_is_public(self) -> None:
         status, data = self._request("GET", "/api/health", role=None)
         self.assertEqual(status, 200)
@@ -216,13 +223,19 @@ class AuthRouteTests(unittest.TestCase):
             dashboard_api, "set_active_order", return_value={"task_id": "t"}
         ):
             status, data = self._request(
-                "POST", "/api/dashboard/order", role=auth.ROLE_ADMIN, payload={}
+                "POST",
+                "/api/dashboard/order",
+                role=auth.ROLE_ADMIN,
+                payload={
+                    "task_id": "task-admin",
+                    "items": [{"item_id": "SKU-1", "quantity": 1}],
+                },
             )
         self.assertEqual(status, 200)
         self.assertTrue(data["ok"])
 
     def test_viewer_mode_switch_filters_settings_payload(self) -> None:
-        """普通用户仅可切换工作模式，其余设置字段被后端过滤。"""
+        """普通用户可切换工作模式与自动确认，其余设置字段被后端过滤。"""
         captured: dict[str, object] = {}
 
         def fake_save(payload, restart_robot):
@@ -246,7 +259,7 @@ class AuthRouteTests(unittest.TestCase):
                 },
             )
         self.assertEqual(status, 200)
-        self.assertEqual(captured["payload"], {"mode": "prod"})
+        self.assertEqual(captured["payload"], {"mode": "prod", "auto_confirm": True})
         self.assertFalse(captured["restart_robot"])
 
     def test_admin_keyboard_payload_untouched(self) -> None:

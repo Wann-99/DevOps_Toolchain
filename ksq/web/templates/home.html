@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Knowledge 库位查询</title>
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/app.css?v=__APP_VERSION__">
 </head>
 <body>
 <main>
@@ -19,7 +19,7 @@
       <form id="path-form">
         <div class="path-fields">
           <label class="path-field"><span>Knowledge 目录</span><input id="knowledge-path" value="__KNOWLEDGE__" required></label>
-          <label class="path-field"><span>库位表（sku-shelves*.csv）</span><input id="shelves-path" value="__SHELVES__" required></label>
+          <label class="path-field"><span>库位表（sku-shelves* / etm_sku_locations_cache*）</span><input id="shelves-path" value="__SHELVES__" required></label>
           <label class="path-field"><span>不可处理列表</span><input id="unavailable-path" value="__UNAVAILABLE__"></label>
           <label class="path-field"><span>工具映射</span><input id="tool-mapping-path" value="__TOOL_MAPPING__"></label>
           <label class="path-field"><span>闭环吸取列表</span><input id="pick-strategy-path" value="__PICK_STRATEGY__"></label>
@@ -54,12 +54,14 @@
     <p class="meta" id="missing-meta"></p>
     <div class="missing-table-wrap">
       <table>
-        <thead><tr><th>69码</th><th>药品名称</th><th>库位</th></tr></thead>
+        <thead><tr><th>SKU ID / 69码</th><th>药品名称</th><th>库位</th></tr></thead>
         <tbody id="missing-table-body"></tbody>
       </table>
     </div>
   </section>
 </main>
-<script src="/static/home.js"></script>
+<script src="/static/dialog.js?v=__APP_VERSION__"></script>
+<script src="/static/status.js?v=__APP_VERSION__"></script>
+<script src="/static/home.js?v=__APP_VERSION__"></script>
 </body>
 </html>

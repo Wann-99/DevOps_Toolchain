@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>登录 · DevOps Toolchain</title>
-  <link rel="icon" type="image/png" href="/static/logo.png">
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="icon" type="image/png" href="/static/logo.png?v=__APP_VERSION__">
+  <link rel="stylesheet" href="/static/app.css?v=__APP_VERSION__">
   <style>
     body.login-body { display:grid; place-items:center; min-height:100vh; padding:20px; }
     .login-card { width:min(400px,100%); background:var(--card); border:1px solid var(--line); border-radius:22px; padding:44px 36px 36px; box-shadow:0 24px 60px rgba(23,51,46,.14); }
@@ -23,7 +23,7 @@
 <body class="login-body">
 <div class="login-card">
   <div class="login-head">
-    <img class="login-logo" src="/static/logo.png" alt="DevOps Toolchain">
+    <img class="login-logo" src="/static/logo.png?v=__APP_VERSION__" alt="DevOps Toolchain">
     <div class="login-brand">
       <strong>DevOps Toolchain</strong>
       <small>__APP_VERSION__</small>
@@ -61,7 +61,19 @@
         return;
       }
       const params = new URLSearchParams(window.location.search);
-      window.location.href = params.get("next") || "/";
+      const requestedNext = params.get("next") || "/";
+      // Only accept a same-origin, site-relative destination.  Reject
+      // protocol-relative URLs and backslash variants of external redirects.
+      let next = "/";
+      if (requestedNext.startsWith("/") && !requestedNext.startsWith("//") && !requestedNext.includes("\\")) {
+        try {
+          const target = new URL(requestedNext, window.location.origin);
+          if (target.origin === window.location.origin) next = requestedNext;
+        } catch (_error) {
+          next = "/";
+        }
+      }
+      window.location.href = next;
     } catch (error) {
       errorNode.textContent = "网络异常，请稍后重试。";
       errorNode.hidden = false;

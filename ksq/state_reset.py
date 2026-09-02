@@ -39,7 +39,11 @@ from ksq.constants import (
     TEST_ORDER_STATE_FILE,
 )
 from ksq.order.config import DEFAULT_ORDER_CONFIG
+from ksq.runtime_logging import get_logger
 from ksq.safe_io import safe_write_text
+
+
+LOGGER = get_logger("state_reset")
 
 _VERSION_MARKER_KEY = "_app_version_marker"
 _BACKUP_DIR_NAME = ".backup"
@@ -182,10 +186,10 @@ def reset_state_if_version_changed() -> bool:
             reason = f"新部署（无版本标记），当前版本 {current_version}"
         else:
             reason = f"版本变更（{marker} → {current_version}）"
-        print(f"[state_reset] 状态文件已重置：{reason}")
-        print(f"[state_reset] 备份位于 {backup_dir}")
-        print("[state_reset] dashboard_settings.json 已保留（仅更新版本标记）")
+        LOGGER.info("状态文件已重置：%s", reason)
+        LOGGER.info("备份位于 %s", backup_dir)
+        LOGGER.info("dashboard_settings.json 已保留（仅更新版本标记）")
         return True
     except Exception as exc:  # noqa: BLE001 — must not block startup
-        print(f"[state_reset] 重置失败（不阻断启动）：{exc}")
+        LOGGER.error("重置失败（不阻断启动）：%s", exc, exc_info=True)
         return False

@@ -4,6 +4,7 @@
     "load",
     "query",
     "order",
+    "order-ops",
     "test-order",
     "map",
     "logs",
@@ -25,6 +26,10 @@
       subtitle: "查询在架 SKU 的库位、推荐工具与 knowledge 信息",
     },
     order: { title: "药品下单", subtitle: "扫码或选择在架 SKU，提交下单任务" },
+    "order-ops": {
+      title: "订单操作",
+      subtitle: "操作订单任务和门店业务配置",
+    },
     "test-order": {
       title: "测试下单",
       subtitle: "按比例生成测试 SKU 清单并提交测试订单",

@@ -5,11 +5,12 @@ DevOps Toolchain 是面向药房自动化现场的数据查询与运维工具，
 ## 主要功能
 
 - 登录与权限：账号密码登录，区分管理员与普通用户两级角色，普通用户仅禁止编辑类操作。
-- 仪表板：查看当前工单、门店任务列表、子任务进度和实时事件，并处置当前测试工单。
+- 仪表板：查看当前工单、门店任务列表、子任务进度和实时事件，并处置当前测试工单；子任务名称与库位以 Broker 带回的下单信息为准，日志只提供处理状态与用时。
 - 数据加载：一键解析设备 `config_pnp` 目录加载数据，也支持本机路径手工指定、ZIP 数据包或单独配置文件导入。
 - 数据查询：按药品、库位等条件查询，编辑并导出业务数据。
 - 药品下单：选择药品或扫码下单，最多保留当前单和一张等待单，并查看工单状态和结构化失败详情。
-- 测试下单：生成、宽松 CSV 导入、导出和提交测试药品列表，按批次统计订单量。
+- 测试下单：生成、宽松 CSV 导入（不要求行在候选数据中存在）、导出和提交测试药品列表，按批次统计订单量。
+- 订单操作：逐项调用 Broker 接口处置工单任务与门店业务配置，并查看原始响应；写操作仅测试模式可用。
 - 日志查询：通过 SSE 实时跟随 `docker logs -f`，并执行启动、停止、重启操作；历史日志损坏时自动跳过并继续获取新日志。
 - 设置：维护工作模式、下单接口、虚拟键盘和飞书表单配置。
 
@@ -47,21 +48,27 @@ DevOps Toolchain 是面向药房自动化现场的数据查询与运维工具，
 
 - 本地源码运行：Python 3.12。
 - 容器部署：Linux ARM64/AArch64、Docker Engine、Docker Compose。
-- 业务数据：`config_pnp` 目录和 `knowledge` 目录。
+- 业务数据：`config_pnp` 目录和包含多个场景目录的 `templates` 根目录。
 
 Python 固定为 3.12，是因为项目当前仍使用该版本提供的标准库 `cgi` 模块。
 
 ## 本地运行
 
 ```bash
-KNOWLEDGE_DIR=/path/to/knowledge \
+KNOWLEDGE_DIR=/path/to/model/templates \
 CONFIG_PNP_DIR=/path/to/config_pnp \
 bash start.sh
 ```
 
 浏览器访问 `http://127.0.0.1:8765`，登录后使用（默认账号见「账号与权限」）。
 
-数据文件路径按「命令行显式参数 ＞ `config_pnp/config.py` ＞ 内置默认」的优先级确定。`--config-pnp` 指向设备 `config_pnp` 目录后，启动和重新加载时会解析其中的 `config.py`（仅 AST 解析，不执行代码），自动定位库位表、不可处理列表、工具映射和闭环吸取列表；库位表按日期命名（如 `sku-shelves_20260812.csv`）也能识别，无需随文件改名调整配置。在「数据加载」页手工填写或「导入」写入的路径同样优先于 `config.py`。
+服务自身的运行日志独立写入 `logs/knowledge_shelf_query.log`，同时输出到标准错误。源码和部署包均可执行 `bash start.sh runtime-logs` 查看最近日志并持续跟随。日志按 5 MiB 轮转并保留最近 3 个文件，记录启动信息、HTTP 请求、客户端错误和未处理异常堆栈。它与页面「日志查询」中的机器人服务日志不是同一份日志。
+
+数据文件路径按「命令行显式参数 ＞ `config_pnp/config.py` ＞ 内置默认」的优先级确定。`--config-pnp` 指向设备 `config_pnp` 目录后，启动和重新加载时会解析其中的 `config.py`（仅 AST 解析，不执行代码），自动定位库位表、不可处理列表、工具映射和闭环吸取列表；`sku-shelves*.csv` 和 `etm_sku_locations_cache*.csv` 均可识别。在「数据加载」页手工填写或「导入」写入的路径同样优先于 `config.py`。
+
+`KNOWLEDGE_DIR` 指向宿主机的 `model/templates` 根目录，标准容器将其挂载为 `/data/knowledge`；默认实际读取 `/data/knowledge/knowledge`。页面中的 Knowledge 路径以该根目录为基准，可填写 `knowledge`、场景目录 `pnp_percept/templates_260827` 或其 `.../knowledge` 子目录；填写场景目录时会自动定位 `knowledge` 子目录，不再依赖 VfmApp 的 `config.yaml`。更换挂载根目录时更新该变量并重建容器；只切换根下场景目录时直接在页面填写并加载即可。
+
+旧部署若仍把 `KNOWLEDGE_DIR` 写成 `.../model/templates/knowledge`，启动脚本会在父目录确为 `templates` 时自动提升到新的根目录并给出提示。
 
 ## 构建应用包
 
@@ -98,8 +105,10 @@ hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime:v1.1.1
 ```bash
 tar xzf ksq_deploy_v1.3.1.tar.gz
 cd ksq_deploy_v1.3.1
-bash start.sh start
+./start.sh
 ```
+
+直接执行会检查同名旧容器：存在时先停止并移除，再启动当前部署包；不存在时直接启动。
 
 后续源码更新：
 
@@ -130,6 +139,8 @@ bash start.sh reset-state
 - `order_config.example.json`
 - `order_config.prod.example.json`
 - `devOps/.env.example`
+
+飞书表单规则维护在 `ksq/feishu/rules.json`。新增表单规则时复制一个规则节点，修改规则 ID、显示名称、飞书字段别名和选项映射，然后重新生成部署包。完整部署包会将它复制为 `config/feishu_rules.json` 并挂载到容器 `/app/feishu_rules.json`；现场直接替换该文件后执行 `bash start.sh restart` 即可生效。规则文件在服务启动时严格校验，格式错误会阻止服务启动并在启动日志中说明原因。
 
 部署包的 `config/` 初始为干净值（空状态 + 默认账号），由 `deploy/make_package.sh` 写入、首次启动时 `start.sh` 补齐；运行时配置、账号文件 `users.json`、密码、Token、生成的 `.bin` 和部署压缩包均被 `.gitignore` 排除，不应提交到仓库。
 

@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>地图导航 · 演示页面（非真实连接）</title>
+<style>
+:root { --bg:#f4f7f5; --card:#fff; --ink:#1c2b26; --muted:#5d6f68;
+  --line:#d7e0db; --accent:#0f766e; --accent-ink:#fff; --danger:#b42318; }
+* { box-sizing:border-box; }
+body { margin:0; color:var(--ink); background:radial-gradient(circle at top left,#d9efe8 0%,transparent 40%),linear-gradient(180deg,#f7faf8 0%,var(--bg) 100%); font:16px/1.5 "IBM Plex Sans","Noto Sans SC",sans-serif; min-height:100vh; }
+.app-shell { display:grid; grid-template-columns:220px minmax(0,1fr); min-height:100vh; }
+.sidebar { position:sticky; top:0; align-self:start; height:100vh; padding:20px 14px; background:#17332e; color:#e7f2ef; border-right:1px solid #244740; display:flex; flex-direction:column; }
+.sidebar-brand { display:flex; flex-direction:column; gap:2px; font-weight:700; font-size:1.05rem; margin:0 0 18px; padding:0 10px; }
+.sidebar-version { color:#9ebbb3; font-size:.72rem; font-weight:500; }
+.sidebar-nav { display:grid; gap:6px; }
+.nav-item { display:flex; align-items:center; gap:10px; padding:10px 12px; border-radius:12px; background:transparent; border:1px solid transparent; color:#d5e8e2; cursor:default; text-decoration:none; font-size:.92rem; }
+.nav-item.active { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+.nav-icon { width:18px; height:18px; flex:0 0 auto; }
+.demo-badge { margin-top:auto; padding:10px 12px; border:1px dashed #3a5c54; border-radius:12px; color:#9ebbb3; font-size:.76rem; line-height:1.5; }
+.app-content { padding:28px 24px 48px; min-width:0; }
+.topbar { display:flex; align-items:flex-start; justify-content:space-between; margin-bottom:20px; gap:16px; flex-wrap:wrap; }
+.topbar-title { margin:0 0 4px; font-size:1.7rem; letter-spacing:-.02em; }
+.topbar-subtitle { margin:0; color:var(--muted); font-size:.92rem; }
+.demo-flag { display:inline-flex; align-items:center; gap:6px; padding:6px 14px; border-radius:999px; background:#fff3cd; color:#7a5a12; font-size:.82rem; font-weight:700; white-space:nowrap; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:20px; margin-bottom:16px; }
+.section-title { margin:0 0 4px; font-size:1.05rem; font-weight:700; }
+.meta { color:var(--muted); margin:0; font-size:.88rem; }
+.meta.compact { margin:6px 0 14px; }
+button { font:inherit; display:inline-flex; align-items:center; justify-content:center; gap:6px; cursor:pointer; padding:10px 16px; border-radius:12px; border:1px solid var(--line); background:#fff; color:var(--ink); font-weight:600; line-height:1.2; transition:transform .1s ease, box-shadow .15s ease; }
+button:hover { transform:translateY(-1px); box-shadow:0 6px 14px rgba(28,43,38,.08); }
+button:disabled { opacity:.5; cursor:not-allowed; transform:none; box-shadow:none; }
+button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+button.primary:hover { background:#0d6a63; }
+button.secondary { background:#eef5f2; border-color:#c9d8d2; }
+button.danger { background:#fff0ee; border-color:#f1b0b0; color:var(--danger); }
+input,select { font:inherit; padding:9px 12px; border-radius:10px; border:1px solid var(--line); background:#fff; width:100%; }
+.status-row { display:flex; flex-wrap:wrap; gap:10px 26px; align-items:center; }
+.status-item { display:flex; align-items:center; gap:8px; font-size:.9rem; }
+.dot { width:9px; height:9px; border-radius:50%; background:#16a34a; box-shadow:0 0 0 3px rgba(22,163,74,.18); }
+.dot.warn { background:#e0b400; box-shadow:0 0 0 3px rgba(224,180,0,.18); }
+.dot.err { background:var(--danger); box-shadow:0 0 0 3px rgba(180,35,24,.18); }
+.layout-grid { display:grid; grid-template-columns:minmax(0,1.55fr) minmax(300px,1fr); gap:16px; align-items:start; }
+@media (max-width:1080px) { .layout-grid { grid-template-columns:1fr; } }
+.map-wrap { position:relative; border:1px solid var(--line); border-radius:14px; overflow:hidden; background:#0e1a17; }
+#mapCanvas { display:block; width:100%; height:auto; cursor:grab; touch-action:none; }
+#mapCanvas.is-dragging { cursor:grabbing; }
+.zoom-controls { display:inline-flex; align-items:center; gap:2px; border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+.zoom-controls button { border:0; border-radius:0; padding:8px 12px; }
+.zoom-controls button:hover { transform:none; box-shadow:none; background:#eef5f2; }
+.zoom-controls span { padding:0 8px; font-size:.8rem; color:var(--muted); min-width:44px; text-align:center; }
+.map-toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px; }
+.map-toolbar .spacer { flex:1 1 auto; }
+.map-hint { position:absolute; left:12px; bottom:12px; padding:6px 12px; border-radius:999px; background:rgba(14,26,23,.75); color:#d5e8e2; font-size:.78rem; pointer-events:none; }
+.click-popover { position:absolute; z-index:5; min-width:200px; padding:12px; border-radius:12px; background:#fff; border:1px solid var(--line); box-shadow:0 14px 32px rgba(20,40,34,.25); }
+.click-popover h4 { margin:0 0 8px; font-size:.86rem; }
+.click-popover .coord { margin:0 0 10px; color:var(--muted); font-size:.78rem; font-family:ui-monospace,Consolas,monospace; }
+.click-popover .actions { display:flex; gap:6px; flex-wrap:wrap; }
+.click-popover .actions button { padding:6px 10px; font-size:.8rem; }
+.click-popover[hidden] { display:none; }
+.poi-list { display:grid; gap:8px; max-height:220px; overflow:auto; }
+.poi-item { display:flex; align-items:center; gap:10px; padding:8px 10px; border:1px solid var(--line); border-radius:12px; background:#f8fbfa; }
+.poi-badge { width:26px; height:26px; border-radius:8px; background:#17332e; color:#fff; display:grid; place-items:center; font-size:.78rem; font-weight:700; flex:0 0 auto; }
+.poi-main { min-width:0; flex:1 1 auto; }
+.poi-name { font-weight:600; font-size:.9rem; }
+.poi-coord { color:var(--muted); font-size:.76rem; font-family:ui-monospace,Consolas,monospace; }
+.poi-actions { display:flex; gap:4px; flex:0 0 auto; }
+.poi-actions button { padding:5px 8px; font-size:.76rem; }
+.poi-empty { padding:18px; text-align:center; color:var(--muted); font-size:.86rem; }
+.patrol-queue { display:flex; flex-wrap:wrap; gap:6px; min-height:36px; padding:8px; border:1px dashed var(--line); border-radius:12px; margin-bottom:10px; }
+.patrol-chip { display:inline-flex; align-items:center; gap:6px; padding:5px 10px; border-radius:999px; background:#e8f1ee; color:#31564e; font-size:.8rem; font-weight:600; }
+.patrol-chip button { padding:0; width:16px; height:16px; border:0; background:transparent; color:#31564e; font-size:.8rem; box-shadow:none; }
+.patrol-chip.is-current { background:var(--accent); color:#fff; }
+.patrol-chip.is-current button { color:#fff; }
+.patrol-controls { display:flex; gap:8px; flex-wrap:wrap; margin-top:4px; }
+.event-log { display:grid; gap:6px; max-height:200px; overflow:auto; font-size:.82rem; }
+.event-row { display:flex; gap:8px; padding:6px 8px; border-radius:8px; background:#f8fbfa; }
+.event-ts { color:var(--muted); font-family:ui-monospace,Consolas,monospace; font-size:.74rem; flex:0 0 auto; }
+.switch-row { display:flex; align-items:center; gap:8px; font-size:.86rem; color:var(--ink); }
+.switch-row input { width:auto; }
+hr.sep { border:0; border-top:1px solid var(--line); margin:14px 0; }
+</style>
+</head>
+<body>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <span>DevOps Toolchain</span>
+      <small class="sidebar-version">v1.1.0（演示）</small>
+    </div>
+    <nav class="sidebar-nav">
+      <a class="nav-item">仪表板</a>
+      <a class="nav-item">数据加载</a>
+      <a class="nav-item">数据查询</a>
+      <a class="nav-item">药品下单</a>
+      <a class="nav-item">订单操作</a>
+      <a class="nav-item active">地图导航</a>
+      <a class="nav-item">日志查询</a>
+      <a class="nav-item">设置</a>
+    </nav>
+    <div class="demo-badge">这是独立演示页面，用来预览"地图导航"标签页的交互，不连接真实机器人，所有数据均为模拟。</div>
+  </aside>
+
+  <div class="app-content">
+    <div class="topbar">
+      <div>
+        <h1 class="topbar-title">地图导航</h1>
+        <p class="topbar-subtitle">点击地图导航 · 管理停留点 · 配置巡逻任务</p>
+      </div>
+      <span class="demo-flag">⚠ 演示模式 · 无真实机器人连接</span>
+    </div>
+
+    <div class="card">
+      <div class="status-row">
+        <div class="status-item"><span class="dot" id="statusDot"></span><span id="statusText">已连接（模拟） · 192.168.11.1:1448</span></div>
+        <div class="status-item">🔋 <span id="batteryText">87%</span></div>
+        <div class="status-item">📍 定位：<span id="locText">正常</span></div>
+        <div class="status-item">🔌 <span id="dockText">未在桩上</span></div>
+        <div class="status-item">当前动作：<span id="actionText">空闲</span></div>
+        <div style="margin-left:auto; display:flex; gap:8px;">
+          <button class="secondary" id="btnGoHome">回桩充电</button>
+          <button class="secondary" id="btnRelocate" title="定位丢失或漂移时，让机器人原地旋转重新确认自己在地图上的位置">重定位</button>
+        </div>
+      </div>
+      <p class="meta compact" style="margin-top:10px">
+        <b>回桩充电</b>：调用 <code>GoHomeAction</code>，机器人自主导航回充电桩并尝试上桩（对应真实接口 <code>flags:"dock"</code>）。&nbsp;
+        <b>重定位</b>：调用 <code>RecoverLocalizationAction</code>，用于机器人被人搬动、轮子打滑或定位漂移导致"自己不知道在地图哪里"时，让它原地旋转、结合传感器重新确认坐标——和"回桩"是两回事，重定位不会移动机器人去任何地方，只是修正它对自身位置的认知。
+      </p>
+    </div>
+
+    <div class="layout-grid">
+      <div>
+        <div class="card" style="padding:16px">
+          <div class="map-toolbar">
+            <span class="section-title" style="margin:0">地图</span>
+            <span class="meta">分辨率 5cm/像素（模拟）</span>
+            <div class="spacer"></div>
+            <div class="zoom-controls">
+              <button type="button" id="btnZoomOut" title="缩小">－</button>
+              <span id="zoomLevel">100%</span>
+              <button type="button" id="btnZoomIn" title="放大">＋</button>
+            </div>
+            <button class="secondary" id="btnZoomReset">重置视图</button>
+            <button class="secondary" id="btnRefreshMap">刷新地图</button>
+          </div>
+          <div class="map-wrap">
+            <canvas id="mapCanvas" width="900" height="620"></canvas>
+            <div class="map-hint">滚轮缩放 · 拖拽平移 · 单击选点（导航 / 存为停留点）</div>
+            <div class="click-popover" id="clickPopover" hidden>
+              <h4>选中位置</h4>
+              <p class="coord" id="popoverCoord">x=0.00, y=0.00</p>
+              <div class="actions">
+                <button class="primary" id="btnGoHere">导航过去</button>
+                <button class="secondary" id="btnSaveHere">存为停留点</button>
+                <button class="secondary" id="btnCancelPopover">取消</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <p class="section-title">实时事件流（模拟）</p>
+          <p class="meta compact">显示点击导航 / 巡逻 / 重定位过程中产生的状态事件</p>
+          <div class="event-log" id="eventLog"></div>
+        </div>
+      </div>
+
+      <div>
+        <div class="card">
+          <p class="section-title">停留点</p>
+          <p class="meta compact">点击地图 → "存为停留点" 添加；巡逻任务从这里选点组队</p>
+          <div class="poi-list" id="poiList"></div>
+        </div>
+
+        <div class="card">
+          <p class="section-title">巡逻任务</p>
+          <p class="meta compact">从下方停留点里选择加入队列，按顺序循环巡逻</p>
+          <div class="patrol-queue" id="patrolQueue"></div>
+          <div class="switch-row">
+            <input type="checkbox" id="loopToggle" checked>
+            <label for="loopToggle">循环巡逻</label>
+          </div>
+          <div class="patrol-controls">
+            <button class="primary" id="btnPatrolStart">开始巡逻</button>
+            <button class="secondary" id="btnPatrolPause" disabled>暂停</button>
+            <button class="danger" id="btnPatrolStop" disabled>停止</button>
+          </div>
+          <hr class="sep">
+          <p class="meta compact" id="patrolStatus">尚未开始巡逻</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---------- 模拟地图（仓库货架布局，用 canvas 手绘，代替真实 .stcm 导出图） ----------
+const canvas = document.getElementById('mapCanvas');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+// world <-> pixel：模拟分辨率 0.05m/px，原点在画布中心偏左下
+const RES = 0.05;
+const ORIGIN_PX = { x: 80, y: H - 60 };
+function pxToWorld(px, py) {
+  return { x: (px - ORIGIN_PX.x) * RES, y: (ORIGIN_PX.y - py) * RES };
+}
+function worldToPx(wx, wy) {
+  return { x: ORIGIN_PX.x + wx / RES, y: ORIGIN_PX.y - wy / RES };
+}
+
+const shelves = [];
+for (let row = 0; row < 4; row++) {
+  for (let col = 0; col < 6; col++) {
+    shelves.push({ x: 140 + col * 120, y: 90 + row * 110, w: 80, h: 60 });
+  }
+}
+const dockPx = { x: 60, y: H - 40 };
+const dockWorld = pxToWorld(dockPx.x, dockPx.y);
+
+// ---------- 视图变换（缩放 + 平移） ----------
+let view = { scale: 1, x: 0, y: 0 };
+const MIN_SCALE = 0.5, MAX_SCALE = 5;
+
+function clientToCanvasPx(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width, scaleY = canvas.height / rect.height;
+  return { x: (clientX - rect.left) * scaleX, y: (clientY - rect.top) * scaleY, rect, scaleX, scaleY };
+}
+function canvasPxToMapPx(cx, cy) {
+  return { x: (cx - view.x) / view.scale, y: (cy - view.y) / view.scale };
+}
+function setZoomLabel() {
+  document.getElementById('zoomLevel').textContent = Math.round(view.scale * 100) + '%';
+}
+function zoomAt(cx, cy, factor) {
+  const before = canvasPxToMapPx(cx, cy);
+  const newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, view.scale * factor));
+  view.x = cx - before.x * newScale;
+  view.y = cy - before.y * newScale;
+  view.scale = newScale;
+  setZoomLabel();
+  drawMap();
+}
+
+function drawMap() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  ctx.setTransform(view.scale, 0, 0, view.scale, view.x, view.y);
+  ctx.fillStyle = '#132420';
+  ctx.fillRect(0, 0, W, H);
+  // 已探索区域
+  ctx.fillStyle = '#1c332d';
+  ctx.fillRect(30, 30, W - 60, H - 60);
+  ctx.strokeStyle = '#2c473f';
+  ctx.lineWidth = 1;
+  for (let gx = 30; gx <= W - 30; gx += 20) { ctx.beginPath(); ctx.moveTo(gx, 30); ctx.lineTo(gx, H - 30); ctx.stroke(); }
+  for (let gy = 30; gy <= H - 30; gy += 20) { ctx.beginPath(); ctx.moveTo(30, gy); ctx.lineTo(W - 30, gy); ctx.stroke(); }
+  // 货架（障碍物）
+  ctx.fillStyle = '#0a1512';
+  ctx.strokeStyle = '#3a5c54';
+  shelves.forEach(s => { ctx.fillRect(s.x, s.y, s.w, s.h); ctx.strokeRect(s.x, s.y, s.w, s.h); });
+  // 充电桩
+  ctx.fillStyle = '#e0b400';
+  ctx.beginPath(); ctx.arc(dockPx.x, dockPx.y, 8, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#d5e8e2';
+  ctx.font = '11px sans-serif';
+  ctx.fillText('充电桩', dockPx.x - 16, dockPx.y - 14);
+  // 停留点
+  pois.forEach((p, i) => {
+    const pt = worldToPx(p.x, p.y);
+    ctx.fillStyle = '#0f766e';
+    ctx.beginPath(); ctx.arc(pt.x, pt.y, 9, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#e7f2ef'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 10px sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(String(i + 1), pt.x, pt.y);
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = '#d5e8e2';
+    ctx.font = '11px sans-serif';
+    ctx.fillText(p.name, pt.x + 12, pt.y + 4);
+  });
+  // 待确认点击点
+  if (pendingClick) {
+    const pt = worldToPx(pendingClick.x, pendingClick.y);
+    ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(pt.x, pt.y, 10, 0, Math.PI * 2); ctx.stroke();
+  }
+  // 目标路径（导航/巡逻中显示）
+  if (robot.target) {
+    const from = worldToPx(robot.x, robot.y);
+    const to = worldToPx(robot.target.x, robot.target.y);
+    ctx.setLineDash([5, 5]);
+    ctx.strokeStyle = '#57d9a3'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  // 机器人
+  const rp = worldToPx(robot.x, robot.y);
+  ctx.fillStyle = robot.moving ? '#57d9a3' : '#9ec1ff';
+  ctx.beginPath(); ctx.arc(rp.x, rp.y, 10, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+  // 朝向箭头
+  const ang = robot.yaw;
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(rp.x, rp.y);
+  ctx.lineTo(rp.x + Math.cos(-ang) * 16, rp.y + Math.sin(-ang) * 16);
+  ctx.stroke();
+}
+
+// ---------- 状态 ----------
+let pois = [
+  { name: 'A区起点', x: 0.5, y: 0.5 },
+  { name: 'B区货架前', x: 4.2, y: 2.6 },
+  { name: 'C区货架前', x: 7.0, y: 1.0 },
+];
+let robot = { x: 0, y: 0, yaw: 0, target: null, moving: false };
+let pendingClick = null;
+let patrolQueue = [];
+let patrolTimer = null, patrolIndex = 0, patrolRunning = false, patrolPaused = false;
+
+function logEvent(text, kind) {
+  const log = document.getElementById('eventLog');
+  const row = document.createElement('div');
+  row.className = 'event-row';
+  const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  row.innerHTML = `<span class="event-ts">${ts}</span><span>${text}</span>`;
+  log.prepend(row);
+  while (log.children.length > 30) log.removeChild(log.lastChild);
+}
+
+function setAction(text) { document.getElementById('actionText').textContent = text; }
+
+// 模拟机器人平滑移动到目标点（代替真实的 MoveToAction 轮询 + 位姿查询）
+function moveRobotTo(target, onDone) {
+  robot.target = target;
+  robot.moving = true;
+  setAction('执行中 → MoveToAction');
+  logEvent(`发送导航指令：x=${target.x.toFixed(2)}, y=${target.y.toFixed(2)}`);
+  if (document.getElementById('dockText').textContent !== '未在桩上') {
+    document.getElementById('dockText').textContent = '未在桩上';
+  }
+  const start = { x: robot.x, y: robot.y };
+  const dist = Math.hypot(target.x - start.x, target.y - start.y);
+  const duration = Math.max(600, dist * 500);
+  const t0 = performance.now();
+  function step(now) {
+    const t = Math.min(1, (now - t0) / duration);
+    robot.x = start.x + (target.x - start.x) * t;
+    robot.y = start.y + (target.y - start.y) * t;
+    robot.yaw = Math.atan2(target.y - start.y, target.x - start.x);
+    drawMap();
+    if (t < 1) {
+      requestAnimationFrame(step);
+    } else {
+      robot.moving = false;
+      robot.target = null;
+      setAction('空闲');
+      logEvent('到达目标点，action 状态：status=4 result=0（成功）');
+      drawMap();
+      if (onDone) onDone();
+    }
+  }
+  requestAnimationFrame(step);
+}
+
+// ---------- 点击地图（含缩放 / 拖拽平移，需要和"单击选点"手势区分开） ----------
+const popover = document.getElementById('clickPopover');
+
+function handleMapClick(e, rect) {
+  const { x: cx, y: cy } = clientToCanvasPx(e.clientX, e.clientY);
+  const mapPt = canvasPxToMapPx(cx, cy);
+  const world = pxToWorld(mapPt.x, mapPt.y);
+  pendingClick = world;
+  drawMap();
+  popover.hidden = false;
+  const screenX = e.clientX - rect.left, screenY = e.clientY - rect.top;
+  const left = Math.min(rect.width - 220, Math.max(0, screenX + 14));
+  const top = Math.min(rect.height - 140, Math.max(0, screenY - 10));
+  popover.style.left = left + 'px';
+  popover.style.top = top + 'px';
+  document.getElementById('popoverCoord').textContent = `x=${world.x.toFixed(2)}, y=${world.y.toFixed(2)}`;
+}
+
+let dragState = null;
+canvas.addEventListener('mousedown', (e) => {
+  dragState = { startX: e.clientX, startY: e.clientY, x0: view.x, y0: view.y, moved: false };
+  canvas.classList.add('is-dragging');
+});
+window.addEventListener('mousemove', (e) => {
+  if (!dragState) return;
+  const dx = e.clientX - dragState.startX, dy = e.clientY - dragState.startY;
+  if (Math.hypot(dx, dy) > 3) dragState.moved = true;
+  if (!dragState.moved) return;
+  const { scaleX, scaleY } = clientToCanvasPx(e.clientX, e.clientY);
+  view.x = dragState.x0 + dx * scaleX;
+  view.y = dragState.y0 + dy * scaleY;
+  drawMap();
+});
+window.addEventListener('mouseup', (e) => {
+  if (!dragState) return;
+  const wasDrag = dragState.moved;
+  dragState = null;
+  canvas.classList.remove('is-dragging');
+  if (!wasDrag && e.target === canvas) {
+    handleMapClick(e, canvas.getBoundingClientRect());
+  }
+});
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const { x: cx, y: cy } = clientToCanvasPx(e.clientX, e.clientY);
+  zoomAt(cx, cy, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+}, { passive: false });
+
+document.getElementById('btnZoomIn').onclick = () => zoomAt(W / 2, H / 2, 1.25);
+document.getElementById('btnZoomOut').onclick = () => zoomAt(W / 2, H / 2, 1 / 1.25);
+document.getElementById('btnZoomReset').onclick = () => { view = { scale: 1, x: 0, y: 0 }; setZoomLabel(); drawMap(); };
+document.getElementById('btnCancelPopover').onclick = () => { pendingClick = null; popover.hidden = true; drawMap(); };
+document.getElementById('btnGoHere').onclick = () => {
+  const target = pendingClick; pendingClick = null; popover.hidden = true; drawMap();
+  moveRobotTo(target);
+};
+document.getElementById('btnSaveHere').onclick = () => {
+  const name = prompt('停留点名称：', `停留点${pois.length + 1}`);
+  if (!name) return;
+  pois.push({ name, x: pendingClick.x, y: pendingClick.y });
+  pendingClick = null; popover.hidden = true;
+  logEvent(`新增停留点「${name}」`);
+  renderPoiList(); drawMap();
+};
+
+// ---------- 停留点列表 ----------
+function renderPoiList() {
+  const wrap = document.getElementById('poiList');
+  wrap.innerHTML = '';
+  if (!pois.length) { wrap.innerHTML = '<div class="poi-empty">还没有停留点，点击地图后选择"存为停留点"</div>'; return; }
+  pois.forEach((p, i) => {
+    const row = document.createElement('div');
+    row.className = 'poi-item';
+    row.innerHTML = `
+      <span class="poi-badge">${i + 1}</span>
+      <div class="poi-main">
+        <div class="poi-name">${p.name}</div>
+        <div class="poi-coord">x=${p.x.toFixed(2)}, y=${p.y.toFixed(2)}</div>
+      </div>
+      <div class="poi-actions">
+        <button class="secondary" data-act="go" data-i="${i}">导航</button>
+        <button class="secondary" data-act="add" data-i="${i}">加入巡逻</button>
+        <button class="danger" data-act="del" data-i="${i}">删除</button>
+      </div>`;
+    wrap.appendChild(row);
+  });
+  wrap.querySelectorAll('button').forEach(btn => {
+    btn.onclick = () => {
+      const i = Number(btn.dataset.i), act = btn.dataset.act;
+      if (act === 'go') moveRobotTo({ x: pois[i].x, y: pois[i].y });
+      if (act === 'add') { patrolQueue.push(i); renderPatrolQueue(); }
+      if (act === 'del') { pois.splice(i, 1); renderPoiList(); drawMap(); }
+    };
+  });
+}
+
+// ---------- 巡逻队列 ----------
+function renderPatrolQueue() {
+  const wrap = document.getElementById('patrolQueue');
+  wrap.innerHTML = '';
+  if (!patrolQueue.length) { wrap.innerHTML = '<span class="meta" style="padding:4px 2px">从左侧停留点点击"加入巡逻"来组队</span>'; return; }
+  patrolQueue.forEach((poiIdx, qi) => {
+    const chip = document.createElement('span');
+    chip.className = 'patrol-chip' + (patrolRunning && !patrolPaused && qi === patrolIndex ? ' is-current' : '');
+    chip.innerHTML = `${qi + 1}. ${pois[poiIdx] ? pois[poiIdx].name : '(已删除)'} <button data-qi="${qi}">✕</button>`;
+    wrap.appendChild(chip);
+  });
+  wrap.querySelectorAll('button').forEach(btn => {
+    btn.onclick = () => { patrolQueue.splice(Number(btn.dataset.qi), 1); renderPatrolQueue(); };
+  });
+}
+
+function patrolStep() {
+  if (!patrolRunning || patrolPaused) return;
+  if (!patrolQueue.length) { stopPatrol(); return; }
+  const poiIdx = patrolQueue[patrolIndex];
+  const poi = pois[poiIdx];
+  document.getElementById('patrolStatus').textContent = `巡逻中：前往第 ${patrolIndex + 1}/${patrolQueue.length} 个点 · ${poi ? poi.name : ''}`;
+  renderPatrolQueue();
+  if (!poi) { advancePatrol(); return; }
+  moveRobotTo({ x: poi.x, y: poi.y }, () => {
+    if (!patrolRunning || patrolPaused) return;
+    patrolTimer = setTimeout(advancePatrol, 500);
+  });
+}
+function advancePatrol() {
+  patrolIndex++;
+  if (patrolIndex >= patrolQueue.length) {
+    if (document.getElementById('loopToggle').checked) { patrolIndex = 0; }
+    else { stopPatrol(); return; }
+  }
+  patrolStep();
+}
+function startPatrol() {
+  if (!patrolQueue.length) { alert('请先加入至少一个巡逻点'); return; }
+  patrolRunning = true; patrolPaused = false; patrolIndex = 0;
+  document.getElementById('btnPatrolStart').disabled = true;
+  document.getElementById('btnPatrolPause').disabled = false;
+  document.getElementById('btnPatrolStop').disabled = false;
+  logEvent('开始巡逻任务');
+  patrolStep();
+}
+function pausePatrol() {
+  patrolPaused = !patrolPaused;
+  document.getElementById('btnPatrolPause').textContent = patrolPaused ? '继续' : '暂停';
+  logEvent(patrolPaused ? '巡逻已暂停（DELETE /actions/:current）' : '巡逻继续');
+  if (!patrolPaused) patrolStep();
+}
+function stopPatrol() {
+  patrolRunning = false; patrolPaused = false;
+  clearTimeout(patrolTimer);
+  document.getElementById('btnPatrolStart').disabled = false;
+  document.getElementById('btnPatrolPause').disabled = true;
+  document.getElementById('btnPatrolPause').textContent = '暂停';
+  document.getElementById('btnPatrolStop').disabled = true;
+  document.getElementById('patrolStatus').textContent = '巡逻已停止';
+  logEvent('巡逻任务结束');
+  renderPatrolQueue();
+}
+document.getElementById('btnPatrolStart').onclick = startPatrol;
+document.getElementById('btnPatrolPause').onclick = pausePatrol;
+document.getElementById('btnPatrolStop').onclick = stopPatrol;
+
+document.getElementById('btnRelocate').onclick = () => {
+  // 重定位：不移动机器人位置，只是原地旋转、重新确认自身在地图上的坐标
+  document.getElementById('locText').textContent = '重定位中…';
+  document.getElementById('btnRelocate').disabled = true;
+  setAction('执行中 → RecoverLocalizationAction');
+  logEvent('调用 RecoverLocalizationAction（原地旋转重新定位，机器人不会移动位置）');
+  const spinStart = performance.now(), spinDuration = 1400, startYaw = robot.yaw;
+  function spin(now) {
+    const t = Math.min(1, (now - spinStart) / spinDuration);
+    robot.yaw = startYaw + t * Math.PI * 4;
+    drawMap();
+    if (t < 1) requestAnimationFrame(spin);
+    else {
+      document.getElementById('locText').textContent = '正常';
+      document.getElementById('btnRelocate').disabled = false;
+      setAction('空闲');
+      logEvent('重定位完成，定位质量恢复正常');
+    }
+  }
+  requestAnimationFrame(spin);
+};
+document.getElementById('btnGoHome').onclick = () => {
+  // 回桩：调用 GoHomeAction，导航回充电桩并尝试上桩（真实接口 flags:"dock"）
+  logEvent('发送回桩指令：GoHomeAction（flags: "dock"）');
+  document.getElementById('btnGoHome').disabled = true;
+  moveRobotTo(dockWorld, () => {
+    document.getElementById('dockText').textContent = '已上桩充电';
+    document.getElementById('btnGoHome').disabled = false;
+    logEvent('已到达充电桩并上桩，开始充电');
+  });
+};
+document.getElementById('btnRefreshMap').onclick = () => { logEvent('刷新地图（模拟 GET /api/core/slam/v1/maps/explore）'); drawMap(); };
+
+renderPoiList();
+renderPatrolQueue();
+setZoomLabel();
+drawMap();
+logEvent('演示页面已加载（所有数据为模拟，未连接真实机器人）');
+</script>
+</body>
+</html>

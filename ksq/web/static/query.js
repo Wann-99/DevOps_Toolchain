@@ -20,13 +20,10 @@ const selectedOrderBox = document.getElementById("selected-order-box");
 const selectedOrderText = document.getElementById("selected-order-text");
 const selectedLocation = document.getElementById("selected-location");
 const quickOrderButton = document.getElementById("btn-quick-order");
-const orderResultPanel = document.getElementById("order-result-panel");
-const orderResultMeta = document.getElementById("order-result-meta");
-const orderResultBody = document.getElementById("order-result-body");
-const lastTaskIdInput = document.getElementById("last-task-id");
 
 const baseColumns = [
   "id",
+  "69码",
   "商品编码",
   "药品名称",
   "库位",
@@ -107,6 +104,7 @@ function totalPages() {
 
 function recordValue(record, field) {
   if (field === "id") return record.id;
+  if (field === "69码") return record.sku_code;
   if (field === "商品编码") return record.out_item_id;
   if (field === "药品名称") return record.name;
   if (field === "库位") return record.locations;
@@ -140,9 +138,9 @@ function parseScannedLocation(raw) {
   value = value.replace(/^[A-Za-z]+-/, "");
   value = value.replace(/^[A-Za-z]+(?=\d)/, "");
   value = value.replace(/\s+/g, "");
-  let match = value.match(/^(\d{1,3})-(\d{1,3})-(\d{1,3})$/);
+  let match = value.match(/^(\d{1,4})-(\d{1,3})-(\d{1,3})$/);
   if (match) return normalizeLocation(match[1] + "-" + match[2] + "-" + match[3]);
-  match = value.match(/^(\d{2})(\d{2})(\d{2})$/);
+  match = value.match(/^(\d{2}|\d{4})(\d{2})(\d{2})$/);
   if (match) return match[1] + "-" + match[2] + "-" + match[3];
   return null;
 }
@@ -153,6 +151,10 @@ function rebuildScanIndexes() {
   records.forEach((record) => {
     knownIds.add(String(record.id));
     knownIds.add(normalizeText(record.id));
+    if (record.sku_code) {
+      knownIds.add(String(record.sku_code));
+      knownIds.add(normalizeText(record.sku_code));
+    }
     locationTokens(record.locations).forEach((location) => {
       knownLocations.add(location);
       const normalized = normalizeLocation(location);
@@ -208,7 +210,7 @@ function detectScanQuery(raw) {
   const hasLocationPrefix = /^[A-Za-z]+-/.test(value) || /^[A-Za-z]+\d/.test(value);
   const location = parseScannedLocation(value);
   if (location) {
-    const plainLocation = /^\d{1,3}-\d{1,3}-\d{1,3}$/.test(value);
+    const plainLocation = /^\d{1,4}-\d{1,3}-\d{1,3}$/.test(value);
     if (hasLocationPrefix || plainLocation || knownLocations.has(location)) {
       return { type: "location", value: location, raw: value };
     }
@@ -225,7 +227,9 @@ function matchesScan(record, query) {
     );
   }
   const target = normalizeText(query.value);
-  return String(record.id) === query.value || normalizeText(record.id) === target;
+  return [record.id, record.sku_code].some(
+    (value) => String(value || "") === query.value || normalizeText(value) === target
+  );
 }
 
 function clearScanQuery() {
@@ -544,14 +548,28 @@ function setTokenDot(state) {
   if (state === "err") dot.classList.add("err");
 }
 
-async function ensureToken() {
-  await saveOrderConfig();
+async function ensureOrderCreationAllowed() {
+  const response = await fetch("/api/order/preflight", { method: "POST" });
+  const data = await response.json();
+  if (response.ok) return;
+  const error = new Error(data.error || "当前无法下单");
+  error.payload = data;
+  error.httpStatus = response.status;
+  throw error;
+}
+
+async function ensureToken(options) {
+  const opts = options && typeof options === "object" ? options : {};
+  if (!opts.skipSave) await saveOrderConfig();
   const response = await fetch("/api/order/token", { method: "POST" });
   const data = await response.json();
   if (!response.ok) {
     tokenReady = false;
     setTokenDot("err");
-    throw new Error(data.error || "获取 Token 失败");
+    const error = new Error(data.error || "获取 Token 失败");
+    error.payload = data;
+    error.httpStatus = response.status;
+    throw error;
   }
   tokenReady = true;
   setTokenDot("ok");
@@ -560,7 +578,11 @@ async function ensureToken() {
 
 function setConfigStatus(text, isError) {
   orderConfigStatus.className = isError ? "meta compact error" : "meta compact";
-  orderConfigStatus.textContent = text || "";
+  if (window.KsqStatus && window.KsqStatus.flash) {
+    window.KsqStatus.flash(orderConfigStatus, text || "", isError);
+  } else {
+    orderConfigStatus.textContent = text || "";
+  }
 }
 
 function readOrderConfigForm() {
@@ -587,6 +609,8 @@ function fillOrderConfigForm(config) {
     ? "已保存，留空不改"
     : "请输入 client_secret";
   document.getElementById("cfg-store-id").value = config.store_id || "";
+  tokenReady = Boolean(config.token_ready);
+  setTokenDot(tokenReady ? "ok" : "");
 }
 
 function renderStoreSelect(selectedId) {
@@ -648,6 +672,7 @@ function buildOrderItems() {
       lines.find((item) => item.location_code === entry.location_code) || lines[0];
     if (!line) return;
     items.push({
+      sku_id: line.sku_id || entry.record.sku_id || "",
       item_id: line.item_id,
       location_code: line.location_code,
       barcode: line.barcode || "",
@@ -667,8 +692,11 @@ async function quickOrder() {
   quickOrderButton.disabled = true;
   reloadStatus.textContent = tokenReady ? "下单中..." : "获取 Token 并下单...";
   try {
-    if (!tokenReady) await ensureToken();
-    else await saveOrderConfig();
+    await ensureOrderCreationAllowed();
+    // Saving configuration clears the server-side token cache. Refresh it
+    // after the save instead of relying on the stale local tokenReady flag.
+    await saveOrderConfig();
+    await ensureToken({ skipSave: true });
     const response = await fetch("/api/order/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -680,32 +708,35 @@ async function quickOrder() {
         tokenReady = false;
         setTokenDot("err");
       }
-      throw new Error(data.error || "下单失败");
+      // 保留结构化错误（上游状态/业务码/追踪号），供弹窗展示
+      const apiError = new Error(data.error || "下单失败");
+      apiError.payload = data;
+      apiError.httpStatus = response.status;
+      throw apiError;
     }
-    orderResultPanel.hidden = false;
-    orderResultBody.hidden = false;
-    orderResultBody.textContent = JSON.stringify(data, null, 2);
-    if (data.task_id) {
-      const queued = !!(
-        data.order_session && Number(data.order_session.queue_position) > 0
-      );
-      lastTaskIdInput.value = data.task_id;
-      orderResultMeta.textContent =
-        (queued ? "下一单已进入等待队列" : "下单成功") +
-        " · " + items.length + " 件 · task_id=" + data.task_id;
-      reloadStatus.textContent = queued
-        ? "下一单已排队，当前单结束后自动执行"
-        : "下单成功：" + data.task_id;
-    } else {
-      orderResultMeta.textContent = "已返回响应，请检查 task_id";
-      reloadStatus.textContent = "下单已返回，请查看结果";
+    if (!data.task_id) {
+      // Broker 未返回 task_id 即为下单未生效，弹窗告知而不是假成功
+      const noTaskError = new Error("Broker 未返回 task_id，下单未生效");
+      noTaskError.payload = data;
+      noTaskError.httpStatus = response.status;
+      throw noTaskError;
     }
+    reloadStatus.textContent = "下单成功：" + data.task_id;
   } catch (error) {
     reloadStatus.innerHTML =
       '<span class="error">' + escapeHtml(error.message) + "</span>";
-    orderResultPanel.hidden = false;
-    orderResultBody.hidden = false;
-    orderResultBody.textContent = error.message;
+    // 下单接口阻塞/报错时弹窗明确告知，避免只看到行内小字反复重试陷入循环
+    if (window.KsqDialog && window.KsqDialog.apiError) {
+      window.KsqDialog.apiError({
+        title: "无法下单",
+        payload: error.payload || { error: error.message },
+        httpStatus: error.httpStatus || 0,
+        fallback: "下单失败",
+        items: items,
+      });
+    } else if (window.KsqStatus && window.KsqStatus.error) {
+      window.KsqStatus.error(error.message);
+    }
   } finally {
     quickOrderButton.disabled = false;
   }
@@ -800,11 +831,13 @@ document.getElementById("btn-get-token").addEventListener("click", async () => {
 document.getElementById("btn-fetch-stores").addEventListener("click", async () => {
   setConfigStatus("获取门店中...");
   try {
-    if (!tokenReady) await ensureToken();
-    else await saveOrderConfig();
+    // 获取门店只需要认证信息；store_id 由返回列表或人工输入补上。
+    await saveOrderConfig();
     const response = await fetch("/api/order/stores");
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "获取门店失败");
+    tokenReady = Boolean(data.token_ready);
+    setTokenDot(tokenReady ? "ok" : "");
     storeOptions = Array.isArray(data.stores) ? data.stores : [];
     renderStoreSelect(document.getElementById("cfg-store-id").value.trim());
     setConfigStatus("已获取 " + storeOptions.length + " 个门店");
@@ -821,21 +854,6 @@ document.getElementById("cfg-store-select").addEventListener("change", (event) =
 });
 
 quickOrderButton.addEventListener("click", quickOrder);
-
-document.getElementById("btn-task-detail").addEventListener("click", async () => {
-  const taskId = lastTaskIdInput.value.trim();
-  if (!taskId) return;
-  try {
-    const response = await fetch("/api/order/tasks/" + encodeURIComponent(taskId));
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "查询失败");
-    orderResultBody.hidden = false;
-    orderResultBody.textContent = JSON.stringify(data, null, 2);
-  } catch (error) {
-    orderResultBody.hidden = false;
-    orderResultBody.textContent = error.message;
-  }
-});
 
 columnPicker.addEventListener("change", (event) => {
   const input = event.target;
@@ -905,6 +923,7 @@ async function reloadData() {
   } catch (error) {
     reloadStatus.innerHTML =
       '<span class="error">' + escapeHtml(error.message) + "</span>";
+    if (window.KsqStatus && window.KsqStatus.error) window.KsqStatus.error(error.message);
   } finally {
     reloadButton.disabled = false;
   }
@@ -931,6 +950,7 @@ async function initialize() {
       '<span class="error">' +
       escapeHtml(error.message) +
       '</span> <a class="btn secondary" href="/">返回</a>';
+    if (window.KsqStatus && window.KsqStatus.error) window.KsqStatus.error(error.message);
   }
 }
 

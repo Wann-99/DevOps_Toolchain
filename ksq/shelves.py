@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 from io import TextIOWrapper
 from pathlib import Path
+from typing import Mapping
 
 from ksq.models import ShelfEntry, ShelfParseResult
 
@@ -12,9 +13,15 @@ from ksq.models import ShelfEntry, ShelfParseResult
 # A differing non-empty value means the merge silently drops one of them.
 MERGE_CONFLICT_FIELDS = (
     ("out_item_id", "商品编码"),
+    ("sku_code", "69码"),
     ("shelf_attribute", "货架属性"),
     ("baffle_height", "挡板高度"),
 )
+
+
+def shelf_row_id(row: Mapping[str, object]) -> str:
+    """Use new sku_id when present; old CSVs continue to use sku_code."""
+    return str(row.get("sku_id") or row.get("sku_code") or "").strip()
 
 
 def format_shelf_location(shelf_number: str, level: str, bin_unit: str) -> str:
@@ -56,53 +63,82 @@ def merge_shelf_entry(existing: ShelfEntry, incoming: ShelfEntry) -> ShelfEntry:
     shelf_attribute = existing.shelf_attribute or incoming.shelf_attribute
     baffle_height = existing.baffle_height or incoming.baffle_height
     out_item_id = existing.out_item_id or incoming.out_item_id
+    sku_code = existing.sku_code or incoming.sku_code
     return ShelfEntry(
         location=existing.location,
         name=name,
         shelf_attribute=shelf_attribute,
         baffle_height=baffle_height,
         out_item_id=out_item_id,
+        sku_code=sku_code,
     )
 
 
 def parse_shelf_locations(file_object: TextIOWrapper) -> ShelfParseResult:
     reader = csv.DictReader(file_object)
-    required_columns = {"sku_code", "name", "shelf_number", "level", "bin_unit"}
-    if reader.fieldnames is None or not required_columns.issubset(set(reader.fieldnames)):
-        raise ValueError(f"库位表缺少必要列：{', '.join(sorted(required_columns))}")
+    if reader.fieldnames is not None:
+        reader.fieldnames = [name.lstrip("\ufeff") for name in reader.fieldnames]
+        # Spreadsheet exports may leave several unnamed trailing columns
+        # (for example ``updated_at,,,,``). They are ignored by the loader and
+        # must not be reported as duplicate business columns.
+        named_columns = [name for name in reader.fieldnames if name]
+        duplicate_columns = sorted(
+            {name for name in named_columns if named_columns.count(name) > 1}
+        )
+        if duplicate_columns:
+            raise ValueError(f"库位表存在重复列：{', '.join(duplicate_columns)}")
+    required_columns = {"name", "shelf_number", "level", "bin_unit"}
+    available_columns = set(reader.fieldnames or ())
+    if (
+        not required_columns.issubset(available_columns)
+        or not {"sku_id", "sku_code"}.intersection(available_columns)
+    ):
+        required = sorted(required_columns) + ["sku_id 或 sku_code"]
+        raise ValueError(f"库位表缺少必要列：{', '.join(required)}")
 
     shelf_entries: dict[str, list[ShelfEntry]] = {}
     skipped_empty_sku_count = 0
     shelf_row_count = 0
     mapped_row_count = 0
     merge_conflicts: list[str] = []
+    missing_location_warnings: list[str] = []
 
     for row_number, row in enumerate(reader, start=2):
         shelf_row_count += 1
-        item_id = (row.get("sku_code") or "").strip()
+        item_id = shelf_row_id(row)
         if not item_id:
             skipped_empty_sku_count += 1
             continue
 
-        try:
-            location = format_shelf_location(
-                (row.get("shelf_number") or "").strip(),
-                (row.get("level") or "").strip(),
-                (row.get("bin_unit") or "").strip(),
+        location_parts = {
+            "shelf_number": (row.get("shelf_number") or "").strip(),
+            "level": (row.get("level") or "").strip(),
+            "bin_unit": (row.get("bin_unit") or "").strip(),
+        }
+        missing_fields = [
+            field_name for field_name, value in location_parts.items() if not value
+        ]
+        if missing_fields:
+            missing_location_warnings.append(
+                f"库位表第 {row_number} 行 SKU {item_id} 缺少 "
+                f"{', '.join(missing_fields)}，已按空库位加载"
             )
-        except ValueError as error:
-            raise ValueError(f"库位表第 {row_number} 行无效：{error}") from error
+            location = ""
+        else:
+            location = format_shelf_location(**location_parts)
 
         name = (row.get("name") or "").strip() or "未命名"
         shelf_attribute = (row.get("shelf_attribute") or "").strip()
         baffle_height = (row.get("baffle_height") or "").strip()
         out_item_id = (row.get("out_item_id") or "").strip()
+        sku_code = (row.get("sku_code") or "").strip()
         incoming = ShelfEntry(
             location=location,
             name=name,
             shelf_attribute=shelf_attribute,
             baffle_height=baffle_height,
             out_item_id=out_item_id,
+            sku_code=sku_code,
         )
         entries = shelf_entries.setdefault(item_id, [])
         existing_index = next(
@@ -131,6 +167,7 @@ def parse_shelf_locations(file_object: TextIOWrapper) -> ShelfParseResult:
         row_count=shelf_row_count,
         mapped_row_count=mapped_row_count,
         merge_conflicts=tuple(merge_conflicts),
+        missing_location_warnings=tuple(missing_location_warnings),
     )
 
 

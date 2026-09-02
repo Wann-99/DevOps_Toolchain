@@ -16,6 +16,19 @@ const escapeHtml = (value) =>
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 
+function showLoadError(message) {
+  const text = String(message || "操作失败");
+  loadStatus.innerHTML = '<p class="error">' + escapeHtml(text) + "</p>";
+  if (window.KsqDialog && window.KsqDialog.notice) {
+    window.KsqDialog.notice({
+      title: "加载失败",
+      message: text,
+      confirmText: "确认",
+      tone: "error",
+    });
+  }
+}
+
 document.querySelectorAll(".tab").forEach((tab) =>
   tab.addEventListener("click", () => {
     document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
@@ -158,7 +171,7 @@ document.getElementById("path-form").addEventListener("submit", async (event) =>
       })
     );
   } catch (error) {
-    loadStatus.innerHTML = '<p class="error">' + escapeHtml(error.message) + "</p>";
+    showLoadError(error.message);
   }
 });
 
@@ -174,6 +187,6 @@ document.getElementById("upload-form").addEventListener("submit", async (event) 
   try {
     applyLoad(await postForm("/load-upload", form));
   } catch (error) {
-    loadStatus.innerHTML = '<p class="error">' + escapeHtml(error.message) + "</p>";
+    showLoadError(error.message);
   }
 });

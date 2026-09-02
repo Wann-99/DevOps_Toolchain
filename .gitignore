@@ -20,6 +20,7 @@ venv/
 /docs/manual/images/
 /deploy/standalone/bin/
 /deploy/dist/
+/logs/
 /dashboard_active_order.json
 /dashboard_settings.json
 /users.json

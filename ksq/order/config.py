@@ -17,29 +17,28 @@ ORDER_SOURCES = [
     {"value": "eleme", "prefix": "ELEM", "cn": "淘宝闪购"},
     {"value": "jd", "prefix": "JD", "cn": "京东"},
     {"value": "dy", "prefix": "DY", "cn": "抖音"},
-    {"value": "dsl", "prefix": "DSL", "cn": "大参林健康"},
 ]
 
 CUSTOMER_DEFAULTS: Dict[str, Dict[str, object]] = {
     "": {
-        "order_source": "",
         "need_image_upload": False,
         "business_mode_code": "",
     },
     "dashenlin": {
-        "order_source": "meituan",
         "need_image_upload": False,
         "business_mode_code": "MODE_PICK_WAIT_PACK",
     },
     "yaoshibang": {
-        "order_source": "meituan",
         "need_image_upload": True,
         "business_mode_code": "MODE_PICK",
     },
     "shuyu": {
-        "order_source": "meituan",
         "need_image_upload": False,
         "business_mode_code": "MODE_PICK_WAIT_PACK",
+    },
+    "noematrix": {
+        "need_image_upload": True,
+        "business_mode_code": "MODE_PICK",
     },
 }
 
@@ -51,6 +50,21 @@ MANUAL_CONFIG_KEYS = (
     "client_secret",
     "store_id",
 )
+
+_STRING_CONFIG_KEYS = frozenset(
+    {
+        "server",
+        "customer",
+        "client_id",
+        "client_secret",
+        "store_id",
+        "store_name",
+        "order_source",
+        "order_time_timezone",
+        "business_mode_code",
+    }
+)
+_BOOL_CONFIG_KEYS = frozenset({"need_image_upload"})
 
 DEFAULT_ORDER_CONFIG: Dict[str, object] = {
     "server": "",
@@ -88,6 +102,7 @@ def load_order_config(config_file: Path) -> Dict[str, object]:
             payload = json.load(file)
         if not isinstance(payload, dict):
             raise ValueError(f"下单配置根节点必须是对象：{config_file}")
+        validate_order_config_types(payload)
         for key, value in payload.items():
             if key in config:
                 config[key] = value
@@ -106,8 +121,13 @@ def save_order_config(config_file: Path, payload: Dict[str, object]) -> Dict[str
     return merged
 
 
-def validate_order_config(config: Dict[str, object]) -> None:
-    required_strings = ("server", "client_id", "client_secret", "store_id")
+def validate_order_config(
+    config: Dict[str, object], *, require_store: bool = True
+) -> None:
+    validate_order_config_types(config)
+    required_strings = ("server", "client_id", "client_secret")
+    if require_store:
+        required_strings += ("store_id",)
     for key in required_strings:
         value = config.get(key)
         if not isinstance(value, str) or not value.strip():
@@ -117,12 +137,42 @@ def validate_order_config(config: Dict[str, object]) -> None:
         raise ValueError("server 必须以 http:// 或 https:// 开头。")
 
 
-def public_order_config(config: Dict[str, object]) -> Dict[str, object]:
+def validate_order_config_types(
+    config: Dict[str, object], *, allow_null_secret: bool = False
+) -> None:
+    """Validate known field types without requiring a usable credential set.
+
+    Settings are intentionally saveable before the operator has filled every
+    credential, while malformed JSON types must never be persisted and later
+    stringified into an unusable Broker request.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("下单配置必须是对象。")
+    for key in _STRING_CONFIG_KEYS:
+        if key == "client_secret" and allow_null_secret and config.get(key) is None:
+            continue
+        if key in config and not isinstance(config[key], str):
+            raise ValueError(f"下单配置字段 {key} 必须是字符串。")
+    for key in _BOOL_CONFIG_KEYS:
+        if key in config and not isinstance(config[key], bool):
+            raise ValueError(f"下单配置字段 {key} 必须是布尔值。")
+
+
+def public_order_config(
+    config: Dict[str, object], include_secret: bool = False
+) -> Dict[str, object]:
+    """返回可下发给页面的配置。
+
+    include_secret 仅在调用方确认为管理员会话时为 True：GET /api/order/config
+    只校验登录不校验角色，无条件下发 client_secret 会让普通用户也读到密钥。
+    """
     public = {
         "server": config.get("server", ""),
         "customer": config.get("customer", ""),
         "client_id": config.get("client_id", ""),
-        "client_secret": "",
+        "client_secret": (
+            str(config.get("client_secret") or "") if include_secret else ""
+        ),
         "store_id": config.get("store_id", ""),
         "store_name": config.get("store_name", ""),
         "has_client_secret": bool(str(config.get("client_secret") or "").strip()),
@@ -134,6 +184,7 @@ def public_order_config(config: Dict[str, object]) -> Dict[str, object]:
             {"value": "dashenlin", "cn": "大参林"},
             {"value": "yaoshibang", "cn": "药师帮"},
             {"value": "shuyu", "cn": "漱玉"},
+            {"value": "noematrix", "cn": "穹彻智能"},
         ],
     }
     return public
@@ -142,6 +193,12 @@ def public_order_config(config: Dict[str, object]) -> Dict[str, object]:
 def merge_config_update(
     current: Dict[str, object], update: Dict[str, object]
 ) -> Dict[str, object]:
+    validate_order_config_types(current)
+    if not isinstance(update, dict):
+        raise ValueError("下单配置更新必须是对象。")
+    # Validate known fields even when they are not persisted by this endpoint;
+    # silently accepting an array/object here makes client errors look saved.
+    validate_order_config_types(update, allow_null_secret=True)
     merged = deepcopy(current)
     for key in MANUAL_CONFIG_KEYS:
         if key not in update:
@@ -156,8 +213,10 @@ def merge_config_update(
                 continue
             merged[key] = secret
             continue
+        if not isinstance(update[key], str):
+            raise ValueError(f"下单配置字段 {key} 必须是字符串。")
         merged[key] = update[key]
-    if "store_name" in update and isinstance(update.get("store_name"), str):
+    if "store_name" in update:
         merged["store_name"] = update["store_name"]
     return merged
 

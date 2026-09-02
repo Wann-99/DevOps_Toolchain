@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ksq.constants import (
+    ETM_SHELVES_FILE_PREFIX,
     PICK_STRATEGY_FILE_PREFIX,
     SHELVES_FILE_PREFIX,
     TOOL_MAPPING_FILE_PREFIX,
@@ -24,7 +25,10 @@ def matches_file_prefix(file_name: str, prefix: str, suffix: str) -> bool:
 
 
 def is_shelves_file_name(file_name: str) -> bool:
-    return matches_file_prefix(file_name, SHELVES_FILE_PREFIX, ".csv")
+    return any(
+        matches_file_prefix(file_name, prefix, ".csv")
+        for prefix in (SHELVES_FILE_PREFIX, ETM_SHELVES_FILE_PREFIX)
+    )
 
 
 def is_tool_mapping_file_name(file_name: str) -> bool:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
 
 from ksq.constants import DEFAULT_TOOL_NAME
@@ -64,26 +65,49 @@ def load_unavailable_ids(unavailable_file: Path) -> list[str]:
     return unavailable_ids
 
 
-def resolve_tool_name(item_id: str, tool_mapping: dict[str, str] | None) -> str:
+def _identifiers(item_id: str, aliases: Iterable[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys([item_id, *(value for value in aliases if value)]))
+
+
+def resolve_tool_name(
+    item_id: str,
+    tool_mapping: dict[str, str] | None,
+    aliases: Iterable[str] = (),
+) -> str:
     if tool_mapping is None:
         return "-"
-    return tool_mapping.get(item_id, DEFAULT_TOOL_NAME)
+    return next(
+        (tool_mapping[value] for value in _identifiers(item_id, aliases) if value in tool_mapping),
+        DEFAULT_TOOL_NAME,
+    )
 
 
 def resolve_closed_loop_label(
-    item_id: str, closed_loop_ids: frozenset[str] | None
+    item_id: str,
+    closed_loop_ids: frozenset[str] | None,
+    aliases: Iterable[str] = (),
 ) -> str:
     if closed_loop_ids is None:
         return "-"
-    return "是" if item_id in closed_loop_ids else "否"
+    return (
+        "是"
+        if any(value in closed_loop_ids for value in _identifiers(item_id, aliases))
+        else "否"
+    )
 
 
 def resolve_unavailable_label(
-    item_id: str, unavailable_ids: frozenset[str] | None
+    item_id: str,
+    unavailable_ids: frozenset[str] | None,
+    aliases: Iterable[str] = (),
 ) -> str:
     if unavailable_ids is None:
         return "-"
-    return "是" if item_id in unavailable_ids else "否"
+    return (
+        "是"
+        if any(value in unavailable_ids for value in _identifiers(item_id, aliases))
+        else "否"
+    )
 
 
 def is_closed_loop(item_id: str, closed_loop_ids: frozenset[str]) -> bool:

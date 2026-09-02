@@ -15,13 +15,17 @@
   let groupField = "";
   let columnsSignature = "";
   let busy = false;
+  // Broker 创建成功但本地标记失败时，保留同一请求用于重试，避免重复创建订单。
+  let pendingMarkRecovery = null;
   let active = false;
   let pollId = 0;
   const POLL_MS = 2000;
   let lastStateFingerprint = "";
   let importDialogContext = null;
+  const MARK_RECOVERY_STORAGE_KEY = "ksq-test-order-mark-recovery";
 
   const FALLBACK_COLUMNS = [
+    { key: "sku_id", label: "SKU ID" },
     { key: "out_item_id", label: "商品编码" },
     { key: "location_display", label: "库位" },
     { key: "sku_code", label: "69码" },
@@ -37,6 +41,214 @@
       return global.KsqApp.getDashboardMode() || "test";
     }
     return "test";
+  }
+
+  function recoveryText(value) {
+    if (value == null || typeof value === "object") return "";
+    return String(value).trim();
+  }
+
+  function recoveryKeys(raw) {
+    if (!Array.isArray(raw)) return [];
+    return Array.from(
+      new Set(
+        raw
+          .map((value) => recoveryText(value))
+          .filter((value) => value && value.indexOf("|") >= 0)
+      )
+    );
+  }
+
+  function recoveryItems(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+        const quantity = Number(item.quantity);
+        const safe = {
+          sku_id: recoveryText(item.sku_id),
+          item_id: recoveryText(item.item_id),
+          barcode: recoveryText(item.barcode || item.code || item.sku_code),
+          name: recoveryText(item.name || item.common_name || item["药品名称"]),
+          location_code: recoveryText(item.location_code),
+          quantity:
+            Number.isFinite(quantity) && quantity > 0
+              ? Math.max(1, Math.floor(quantity))
+              : 1,
+          group_id: recoveryText(item.group_id),
+          group_field: recoveryText(item.group_field),
+        };
+        return safe.item_id || safe.barcode ? safe : null;
+      })
+      .filter(Boolean);
+  }
+
+  function recoveryStorage() {
+    try {
+      return global.sessionStorage || null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function currentUsername() {
+    try {
+      const auth = global.KsqAuth;
+      const user = auth && typeof auth.user === "function" ? auth.user() : null;
+      return recoveryText(user && user.username);
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function recoveryMatchesCurrentUser(recovery) {
+    const saved = recoveryText(
+      recovery && recovery.payload && recovery.payload.username
+    );
+    const current = currentUsername();
+    if (!saved) return true;
+    if (!current) return null;
+    return saved === current;
+  }
+
+  function recoverySummary(data, items, fallbackTaskId, fallbackOrderNo) {
+    const source = data && typeof data === "object" ? data : {};
+    const request =
+      source.request_body && typeof source.request_body === "object"
+        ? source.request_body
+        : {};
+    const session =
+      source.order_session && typeof source.order_session === "object"
+        ? source.order_session
+        : {};
+    const sessionItems =
+      Array.isArray(session.items) && session.items.length
+        ? session.items
+        : items;
+    const safeItems = recoveryItems(sessionItems);
+    const taskId = recoveryText(source.task_id || session.task_id || fallbackTaskId);
+    const orderNo = recoveryText(
+      request.order_no || session.order_no || fallbackOrderNo
+    );
+    const platformOrderNo = recoveryText(
+      request.platform_order_no || session.platform_order_no
+    );
+    const orderSource = recoveryText(request.order_source || session.order_source);
+    return {
+      task_id: taskId,
+      request_body: {
+        order_no: orderNo,
+        platform_order_no: platformOrderNo,
+      },
+      order_session: {
+        task_id: taskId,
+        order_no: orderNo,
+        platform_order_no: platformOrderNo,
+        order_source: orderSource,
+        items: safeItems,
+        source: "test-order",
+        queue_position: 0,
+        queued: false,
+      },
+    };
+  }
+
+  function normalizeMarkRecovery(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const rawPayload =
+      raw.payload && typeof raw.payload === "object" ? raw.payload : {};
+    const rawData = raw.data && typeof raw.data === "object" ? raw.data : {};
+    const rawKeys = recoveryKeys(rawPayload.keys || raw.keys);
+    const rawItems = recoveryItems(raw.items);
+    const summary = recoverySummary(
+      rawData,
+      rawItems,
+      recoveryText(rawPayload.task_id),
+      recoveryText(rawPayload.order_no)
+    );
+    const taskId = recoveryText(
+      rawPayload.task_id || summary.task_id
+    );
+    const orderNo = recoveryText(
+      rawPayload.order_no || summary.request_body.order_no
+    );
+    const username = recoveryText(rawPayload.username || currentUsername());
+    if (!rawKeys.length || (!taskId && !orderNo)) return null;
+    summary.task_id = taskId;
+    summary.request_body.order_no = orderNo;
+    summary.order_session.task_id = taskId;
+    summary.order_session.order_no = orderNo;
+    return {
+      payload: {
+        keys: rawKeys,
+        task_id: taskId,
+        order_no: orderNo,
+        username: username,
+      },
+      data: summary,
+      items: rawItems,
+    };
+  }
+
+  function persistMarkRecovery(recovery) {
+    // Normalize first so the Broker response (which may contain secrets) is never stored.
+    const normalized = normalizeMarkRecovery(recovery);
+    if (!normalized) return;
+    pendingMarkRecovery = normalized;
+    const storage = recoveryStorage();
+    if (!storage) return;
+    try {
+      storage.setItem(MARK_RECOVERY_STORAGE_KEY, JSON.stringify(normalized));
+    } catch (_error) {
+      // sessionStorage may be unavailable or full; keep the in-memory guard.
+    }
+  }
+
+  function restoreMarkRecovery() {
+    if (pendingMarkRecovery) return;
+    const storage = recoveryStorage();
+    if (!storage) return;
+    let raw = "";
+    try {
+      raw = storage.getItem(MARK_RECOVERY_STORAGE_KEY) || "";
+    } catch (_error) {
+      return;
+    }
+    if (!raw) return;
+    let normalized = null;
+    try {
+      normalized = normalizeMarkRecovery(JSON.parse(raw));
+    } catch (_error) {
+      normalized = null;
+    }
+    if (normalized) {
+      if (recoveryMatchesCurrentUser(normalized) === false) {
+        try {
+          storage.removeItem(MARK_RECOVERY_STORAGE_KEY);
+        } catch (_error) {
+          // Ignore storage cleanup failures.
+        }
+        return;
+      }
+      pendingMarkRecovery = normalized;
+      return;
+    }
+    try {
+      storage.removeItem(MARK_RECOVERY_STORAGE_KEY);
+    } catch (_error) {
+      // Ignore storage cleanup failures.
+    }
+  }
+
+  function clearMarkRecovery() {
+    pendingMarkRecovery = null;
+    const storage = recoveryStorage();
+    if (!storage) return;
+    try {
+      storage.removeItem(MARK_RECOVERY_STORAGE_KEY);
+    } catch (_error) {
+      // Ignore storage cleanup failures.
+    }
   }
 
   function stateFingerprint(data) {
@@ -68,7 +280,25 @@
     global.KsqStatus.flash(node, message, isError);
   }
 
-  async function reportOrderApiError(response, data, fallback) {
+  function blockDuringMarkRecovery() {
+    if (!pendingMarkRecovery) return false;
+    const userMatch = recoveryMatchesCurrentUser(pendingMarkRecovery);
+    if (userMatch === false) {
+      clearMarkRecovery();
+      return false;
+    }
+    if (userMatch === null) {
+      setStatus("正在确认登录用户，请稍后重试同步。", true);
+      return true;
+    }
+    setStatus(
+      "已有外部订单等待列表同步，请先点击提交重试同步，不要生成、导入或清空列表。",
+      true
+    );
+    return true;
+  }
+
+  async function reportOrderApiError(response, data, fallback, items) {
     const message =
       global.KsqDialog && global.KsqDialog.errorSummary
         ? global.KsqDialog.errorSummary(data, fallback)
@@ -80,6 +310,7 @@
         payload: data,
         httpStatus: response.status,
         fallback: fallback,
+        items: items,
       });
     }
     const error = new Error(message);
@@ -415,15 +646,25 @@
     return order.map((gid) => ({ id: gid, items: byId.get(gid) }));
   }
 
-  // 与服务端 sku_code 别名一致，用于定位组合行里的 69码 列
-  const SKU_ALIASES = new Set([
-    "skucode",
-    "sku",
-    "69码",
-    "商品条码",
-    "条形码",
-    "barcode",
-  ]);
+  // 与服务端 _IMPORT_FIELD_ALIASES 一致：组合行里这些列按组内成员逐个配勾选框。
+  // 需要记住列对应哪个字段——sku_id 导入的条目 sku_code 为空，比对错字段就匹配不上。
+  const MEMBER_COLUMN_FIELDS = [
+    {
+      field: "sku_code",
+      aliases: new Set([
+        "skucode",
+        "sku",
+        "69码",
+        "商品条码",
+        "条形码",
+        "barcode",
+      ]),
+    },
+    {
+      field: "sku_id",
+      aliases: new Set(["skuid", "sku编号", "skuid编码"]),
+    },
+  ];
 
   function halfwidth(text) {
     return String(text || "").replace(/[\uFF01-\uFF5E\u3000]/g, (char) =>
@@ -438,11 +679,14 @@
     return text;
   }
 
-  function isSkuColumn(col) {
-    return SKU_ALIASES.has(normalizeHeader(halfwidth(col.label || col.key)));
+  // 返回该列对应的成员标识字段名，非标识列返回空串
+  function memberColumnField(col) {
+    const header = normalizeHeader(halfwidth(col.label || col.key));
+    const hit = MEMBER_COLUMN_FIELDS.find((entry) => entry.aliases.has(header));
+    return hit ? hit.field : "";
   }
 
-  // 组合行的一个单元格：普通列去重取值逐行显示；69码 列给组内每个成员配勾选框
+  // 组合行的一个单元格：普通列去重取值逐行显示；标识列给组内每个成员配勾选框
   function renderGroupCell(col, group, checkedSet, prefix) {
     const values = [];
     group.items.forEach((item) => {
@@ -450,7 +694,8 @@
       const value = cellValue(item, col.key);
       if (values.indexOf(value) < 0) values.push(value);
     });
-    if (!isSkuColumn(col)) {
+    const memberField = memberColumnField(col);
+    if (!memberField) {
       const lines = values.filter((value) => value !== "");
       return (
         '<td class="wrap">' +
@@ -469,7 +714,7 @@
           item &&
           item.key &&
           !used.has(item.key) &&
-          normalizeIdentifier(item.sku_code) === normalizeIdentifier(value)
+          normalizeIdentifier(item[memberField]) === normalizeIdentifier(value)
       );
       if (member) {
         used.add(member.key);
@@ -716,10 +961,28 @@
   }
 
   async function clearList(which) {
-    if (busy) return;
+    if (busy || blockDuringMarkRecovery()) return;
+    const isOrdered = which === "ordered";
+    const listLabel = isOrdered ? "已下单 SKU" : "待下单 SKU";
+    const count = isOrdered ? ordered.length : pending.length;
     busy = true;
-    setStatus(which === "ordered" ? "清空已下单 SKU..." : "清空待下单 SKU...");
     try {
+      const message =
+        "将删除当前全部 " +
+        listLabel +
+        "（" +
+        count +
+        " 条），仅影响本地测试列表，不会取消外部订单。确定继续？";
+      const confirmed =
+        global.KsqDialog && global.KsqDialog.confirm
+          ? await global.KsqDialog.confirm({
+              title: "确认清空列表",
+              message: message,
+              confirmText: "清空列表",
+            })
+          : global.confirm(message);
+      if (!confirmed) return;
+      setStatus("清空" + listLabel + "...");
       const response = await fetch("/api/test-order/clear", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -735,7 +998,58 @@
         orderedSort = { key: "", dir: "" };
       }
       applyState(data);
-      setStatus(which === "ordered" ? "已清空已下单 SKU" : "已清空待下单 SKU");
+      setStatus("已清空" + listLabel);
+    } catch (error) {
+      setStatus(error.message || String(error), true);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function restoreChecked() {
+    if (busy || blockDuringMarkRecovery()) return;
+    syncCheckedFromDom(
+      "test-order-ordered-body",
+      checkedOrdered,
+      "ordered-check"
+    );
+    const keys = Array.from(checkedOrdered);
+    if (!keys.length) {
+      setStatus("请先勾选「已下单 SKU」列表中的药品", true);
+      return;
+    }
+    busy = true;
+    try {
+      const message =
+        "将把选中的 " +
+        keys.length +
+        " 条记录移回本地待下单列表；不会取消或修改已经创建的外部订单。确定继续？";
+      const confirmed =
+        global.KsqDialog && global.KsqDialog.confirm
+          ? await global.KsqDialog.confirm({
+              title: "恢复到待下单",
+              message: message,
+              confirmText: "恢复",
+            })
+          : global.confirm(message);
+      if (!confirmed) return;
+      setStatus("正在恢复到待下单...");
+      const response = await fetch("/api/test-order/restore", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ keys: keys }),
+      });
+      let data = {};
+      try {
+        data = await response.json();
+      } catch (_error) {
+        throw new Error("恢复响应格式无效");
+      }
+      if (!response.ok) throw new Error(data.error || "恢复失败");
+      checkedOrdered.clear();
+      orderedSort = { key: "", dir: "" };
+      applyState(data);
+      setStatus("已恢复 " + keys.length + " 条到待下单列表");
     } catch (error) {
       setStatus(error.message || String(error), true);
     } finally {
@@ -744,6 +1058,7 @@
   }
 
   async function loadState() {
+    restoreMarkRecovery();
     const response = await fetch("/api/test-order/state");
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "读取测试下单状态失败");
@@ -752,10 +1067,40 @@
   }
 
   async function generateList() {
-    if (busy) return;
+    if (busy || blockDuringMarkRecovery()) return;
+    syncCheckedFromDom(
+      "test-order-pending-body",
+      checkedPending,
+      "pending-check"
+    );
+    const existingPendingCount = pending.length;
+    const checkedPendingCount = checkedPending.size;
     busy = true;
-    setStatus("正在生成...");
     try {
+      if (existingPendingCount || checkedPendingCount) {
+        const confirmed =
+          global.KsqDialog && global.KsqDialog.confirm
+            ? await global.KsqDialog.confirm({
+                title: "确认重新生成",
+                message:
+                  "将替换当前待下单列表（" +
+                  existingPendingCount +
+                  " 条" +
+                  (checkedPendingCount
+                    ? "，其中已勾选 " + checkedPendingCount + " 条"
+                    : "") +
+                  "）。已下单列表和已经创建的外部订单不受影响。确定继续？",
+                confirmText: "替换并生成",
+                cancelText: "取消",
+              })
+            : global.confirm(
+                "将替换当前待下单列表（" +
+                  existingPendingCount +
+                  " 条），已下单列表和已经创建的外部订单不受影响。确定继续？"
+              );
+        if (!confirmed) return;
+      }
+      setStatus("正在生成...");
       const response = await fetch("/api/test-order/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -768,6 +1113,25 @@
       let message = "已生成待下单 SKU " + (data.pending_count || 0) + " 条";
       if (data.shortfall) message += "（少于配置数量 " + data.shortfall + "）";
       setStatus(message);
+    } catch (error) {
+      setStatus(error.message || String(error), true);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function saveSwitchConfig() {
+    if (busy) return;
+    busy = true;
+    try {
+      const response = await fetch("/api/test-order/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ config: readConfig() }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "保存测试下单开关失败");
+      applyState(data);
     } catch (error) {
       setStatus(error.message || String(error), true);
     } finally {
@@ -942,7 +1306,7 @@
   }
 
   async function onImportFileChosen(file) {
-    if (busy || !file) return;
+    if (busy || !file || blockDuringMarkRecovery()) return;
     let text = "";
     try {
       text = await readCsvFileText(file);
@@ -959,7 +1323,7 @@
   }
 
   async function importCsv() {
-    if (busy || !importDialogContext) return;
+    if (busy || blockDuringMarkRecovery() || !importDialogContext) return;
     const mode = importMode();
     const select = el("test-order-group-field");
     const groupField =
@@ -968,11 +1332,60 @@
       setStatus("组合模式请选择组合字段", true);
       return;
     }
-    const csvText = importDialogContext.csvText;
+    const importContext = importDialogContext;
+    const csvText = importContext.csvText;
+    syncCheckedFromDom(
+      "test-order-pending-body",
+      checkedPending,
+      "pending-check"
+    );
+    syncCheckedFromDom(
+      "test-order-ordered-body",
+      checkedOrdered,
+      "ordered-check"
+    );
+    const existingPendingCount = pending.length;
+    const existingOrderedCount = ordered.length;
+    const checkedPendingCount = checkedPending.size;
+    const checkedOrderedCount = checkedOrdered.size;
     busy = true;
-    closeImportDialog();
-    setStatus("正在解析导入 CSV...");
     try {
+      if (
+        existingPendingCount ||
+        existingOrderedCount ||
+        checkedPendingCount ||
+        checkedOrderedCount
+      ) {
+        const confirmed =
+          global.KsqDialog && global.KsqDialog.confirm
+            ? await global.KsqDialog.confirm({
+                title: "确认导入并替换列表",
+                message:
+                  "导入会替换待下单列表（" +
+                  existingPendingCount +
+                  " 条）并清空已下单列表（" +
+                  existingOrderedCount +
+                  " 条）" +
+                  (checkedPendingCount || checkedOrderedCount
+                    ? "，当前勾选 " +
+                      (checkedPendingCount + checkedOrderedCount) +
+                      " 条"
+                    : "") +
+                  "。这只改变本地测试列表，不会取消已经创建的外部订单。确定继续？",
+                confirmText: "替换并导入",
+                cancelText: "取消",
+              })
+            : global.confirm(
+                "导入会替换待下单列表（" +
+                  existingPendingCount +
+                  " 条）并清空已下单列表（" +
+                  existingOrderedCount +
+                  " 条），不会取消已经创建的外部订单。确定继续？"
+              );
+        if (!confirmed || importDialogContext !== importContext) return;
+      }
+      closeImportDialog();
+      setStatus("正在解析导入 CSV...");
       const response = await fetch("/api/test-order/import", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1008,7 +1421,19 @@
     }
   }
 
-  async function ensureToken() {
+  // 接口未返回结构化错误的异常（断网等）：行内提示 + 弹窗，避免静默重试
+  function reportUnexpectedOrderError(error) {
+    setStatus(error.message || String(error), true);
+    if (global.KsqDialog && global.KsqDialog.apiError) {
+      global.KsqDialog.apiError({
+        title: "无法下单",
+        payload: { error: error.message || String(error) },
+        fallback: "下单失败",
+      });
+    }
+  }
+
+  async function ensureToken(items) {
     const mode = dashboardMode();
     const response = await fetch(
       "/api/order/token?mode=" + encodeURIComponent(mode),
@@ -1020,26 +1445,47 @@
     );
     const data = await response.json();
     if (!response.ok) {
-      throw await reportOrderApiError(response, data, "获取 Token 失败");
+      throw await reportOrderApiError(response, data, "获取 Token 失败", items);
     }
   }
 
+  // 可下单行：缺商品编码/69码 或缺库位的行无法下单（导入 CSV 可能没有库位列）。
+  // 提交时必须以此为准同步 keys，否则订单已创建而 mark_ordered 因无效 key 失败。
+  function orderableRows(rows) {
+    return rows.filter(
+      (item) =>
+        item && global.KsqItemIdentity.pickItemId(item) && item.location_code
+    );
+  }
+
   function toOrderItems(rows) {
-    return rows
-      .filter(Boolean)
-      .map((item) => ({
-        item_id: item.out_item_id || item.sku_code,
-        location_code: item.location_code,
-        barcode: item.sku_code,
-        name: item.name,
-        quantity: 1,
-      }))
-      .filter((item) => item.item_id && item.location_code);
+    return orderableRows(rows).map((item) => ({
+      sku_id: item.sku_id || "",
+      item_id: global.KsqItemIdentity.pickItemId(item),
+      location_code: item.location_code,
+      barcode: item.sku_code,
+      name: item.name,
+      quantity: 1,
+      group_id: item.group_id || "",
+      group_field: item.group_id ? groupField : "",
+    }));
   }
 
   // 创建订单并返回响应数据（失败时已统一弹窗/状态提示）
   async function createOrder(items) {
-    await ensureToken();
+    const preflightResponse = await fetch("/api/order/preflight", {
+      method: "POST",
+    });
+    const preflightData = await preflightResponse.json();
+    if (!preflightResponse.ok) {
+      throw await reportOrderApiError(
+        preflightResponse,
+        preflightData,
+        "当前无法下单",
+        items
+      );
+    }
+    await ensureToken(items);
     const response = await fetch("/api/order/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1047,9 +1493,110 @@
     });
     const data = await response.json();
     if (!response.ok) {
-      throw await reportOrderApiError(response, data, "下单失败");
+      throw await reportOrderApiError(response, data, "下单失败", items);
+    }
+    if (!data.task_id) {
+      // Broker 未返回 task_id 即为下单未生效；绝不能把 SKU 移入已下单（假成功）。
+      throw await reportOrderApiError(
+        response,
+        Object.assign({}, data, { error: "Broker 未返回 task_id，下单未生效" }),
+        "下单失败",
+        items
+      );
     }
     return data;
+  }
+
+  async function markOrdered(payload) {
+    let response;
+    try {
+      response = await fetch("/api/test-order/mark-ordered", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (error) {
+      error.retryable = true;
+      throw error;
+    }
+    let parsed = null;
+    let data = {};
+    try {
+      parsed = await response.json();
+      data = parsed && typeof parsed === "object" ? parsed : {};
+    } catch (error) {
+      const parseError = new Error("列表同步响应格式无效");
+      parseError.httpStatus = response.status;
+      // A successful write can still be followed by a truncated/invalid
+      // response, so retry parsing failures just like network failures.
+      parseError.retryable = true;
+      throw parseError;
+    }
+    if (!response.ok) {
+      const markError = new Error(data.error || "移动到已下单 SKU 失败");
+      markError.httpStatus = response.status;
+      markError.payload = data;
+      markError.retryable = response.status >= 500;
+      throw markError;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      const shapeError = new Error("列表同步响应格式无效");
+      shapeError.httpStatus = response.status;
+      shapeError.retryable = true;
+      throw shapeError;
+    }
+    return data;
+  }
+
+  async function markOrderedWithRetry(payload) {
+    try {
+      return await markOrdered(payload);
+    } catch (error) {
+      if (!error.retryable && error.httpStatus && error.httpStatus < 500) {
+        throw error;
+      }
+      // The first request may have reached the server even when its response
+      // was lost; the server-side identity check makes this retry idempotent.
+      return await markOrdered(payload);
+    }
+  }
+
+  async function retryPendingMark() {
+    const recovery = pendingMarkRecovery;
+    if (!recovery || busy) return;
+    const userMatch = recoveryMatchesCurrentUser(recovery);
+    if (userMatch === false) {
+      clearMarkRecovery();
+      setStatus("登录用户已变化，已清除旧的同步任务，请重新下单。", true);
+      return;
+    }
+    if (userMatch === null) {
+      setStatus("正在确认登录用户，请稍后重试同步。", true);
+      return;
+    }
+    busy = true;
+    setStatus("正在同步已创建订单...");
+    try {
+      const markData = await markOrderedWithRetry(recovery.payload);
+      clearMarkRecovery();
+      checkedPending.clear();
+      applyState(markData);
+      setStatus(
+        "订单已创建并同步：" +
+          recovery.payload.keys.length +
+          " 个 SKU · task " +
+          (recovery.data.task_id || "-")
+      );
+      openDashboardAfterOrder(recovery.data, recovery.items);
+    } catch (error) {
+      const retryError = new Error(
+        "订单已创建，但列表同步仍失败；请稍后再次点击提交重试同步，不要重复创建订单。"
+      );
+      retryError.payload = error.payload;
+      reportUnexpectedOrderError(retryError);
+    } finally {
+      busy = false;
+    }
   }
 
   function openDashboardAfterOrder(data, items) {
@@ -1066,6 +1613,8 @@
             name: item.name || "",
             location_code: item.location_code,
             quantity: item.quantity || 1,
+            group_id: item.group_id || "",
+            group_field: item.group_field || "",
           })),
           source: "test-order",
         }
@@ -1077,6 +1626,10 @@
 
   async function submitChecked() {
     if (busy) return;
+    if (pendingMarkRecovery) {
+      await retryPendingMark();
+      return;
+    }
     // Prefer DOM checked state so UI ticks always match submit.
     syncCheckedFromDom(
       "test-order-pending-body",
@@ -1104,7 +1657,8 @@
     const pendingByKey = new Map(
       pending.filter((item) => item && item.key).map((item) => [item.key, item])
     );
-    const items = toOrderItems(keys.map((key) => pendingByKey.get(key)));
+    const rows = orderableRows(keys.map((key) => pendingByKey.get(key)));
+    const items = toOrderItems(rows);
     if (!items.length) {
       setStatus(
         "勾选的药品缺少商品编码或库位，无法下单（请确认 CSV 含 out_item_id/sku_code 与 location_code）",
@@ -1112,39 +1666,50 @@
       );
       return;
     }
+    // 只同步真正下单成功的行，不可下单的留在待下单列表
+    const orderedKeys = rows.map((item) => item.key);
+    const skippedCount = keys.length - orderedKeys.length;
     busy = true;
     setStatus("下单中（" + items.length + " 件）...");
     try {
       const data = await createOrder(items);
-      const markResponse = await fetch("/api/test-order/mark-ordered", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          keys: keys,
-          task_id: data.task_id || "",
-          order_no: (data.request_body && data.request_body.order_no) || "",
-        }),
-      });
-      const markData = await markResponse.json();
-      if (!markResponse.ok) throw new Error(markData.error || "移动到已下单 SKU 失败");
+      const markPayload = {
+        keys: orderedKeys,
+        task_id: data.task_id || "",
+        order_no: (data.request_body && data.request_body.order_no) || "",
+      };
+      let markData;
+      try {
+        markData = await markOrderedWithRetry(markPayload);
+      } catch (error) {
+        persistMarkRecovery({
+          payload: markPayload,
+          data: data,
+          items: items,
+        });
+        throw new Error(
+          "订单已创建，但列表同步失败；请再次点击提交重试同步，不要重复创建订单。"
+        );
+      }
+      clearMarkRecovery();
       checkedPending.clear();
       applyState(markData);
-      const queued = !!(
-        data.order_session && Number(data.order_session.queue_position) > 0
-      );
       setStatus(
-        (queued ? "下一单已进入等待队列：" : "下单成功：") +
+        "下单成功：" +
           "本订单 " +
-          keys.length +
+          orderedKeys.length +
           " 个 SKU · 累计订单 " +
           (markData.order_count || 0) +
           " · task " +
-          (data.task_id || "-")
+          (data.task_id || "-") +
+          (skippedCount
+            ? " · 跳过 " + skippedCount + " 条（缺商品编码或库位）"
+            : "")
       );
       openDashboardAfterOrder(data, items);
     } catch (error) {
       if (!error.orderApiReported) {
-        setStatus(error.message || String(error), true);
+        reportUnexpectedOrderError(error);
       }
     } finally {
       busy = false;
@@ -1153,7 +1718,7 @@
 
   // 已下单列表再次下单：只创建新订单，不改动两个列表的内容
   async function reorderKeys(keys) {
-    if (busy) return;
+    if (busy || blockDuringMarkRecovery()) return;
     if (!keys.length) {
       setStatus("请先勾选「已下单 SKU」列表中的药品或组合", true);
       return;
@@ -1170,11 +1735,8 @@
     setStatus("再次下单中（" + items.length + " 件）...");
     try {
       const data = await createOrder(items);
-      const queued = !!(
-        data.order_session && Number(data.order_session.queue_position) > 0
-      );
       setStatus(
-        (queued ? "下一单已进入等待队列：" : "再次下单成功：") +
+        "再次下单成功：" +
           "本订单 " +
           items.length +
           " 个 SKU · task " +
@@ -1183,7 +1745,7 @@
       openDashboardAfterOrder(data, items);
     } catch (error) {
       if (!error.orderApiReported) {
-        setStatus(error.message || String(error), true);
+        reportUnexpectedOrderError(error);
       }
     } finally {
       busy = false;
@@ -1193,7 +1755,8 @@
   function syncCheckedFromDom(bodyId, checkedSet, roleName) {
     const body = el(bodyId);
     if (!body) return;
-    checkedSet.clear();
+    // Keep selections that are temporarily hidden by search/filter.  Only
+    // reconcile keys represented in the current DOM.
     body
       .querySelectorAll(
         'input[type="checkbox"][data-role="' + roleName + '"]'
@@ -1203,7 +1766,9 @@
         const key = String(
           input.getAttribute("data-key") || input.dataset.key || ""
         ).trim();
-        if (key && input.checked) checkedSet.add(key);
+        if (!key) return;
+        if (input.checked) checkedSet.add(key);
+        else checkedSet.delete(key);
       });
   }
 
@@ -1377,6 +1942,7 @@
       exportOrdered.addEventListener("click", exportOrderedCsv);
     }
     el("test-order-submit").addEventListener("click", submitChecked);
+    el("test-order-restore").addEventListener("click", restoreChecked);
     el("test-order-select-all-pending").addEventListener("click", () => {
       toggleSelectAll(
         visiblePending(),
@@ -1440,7 +2006,12 @@
       "test-order-flag-packaging",
     ].forEach((id) => {
       const node = el(id);
-      if (node) node.addEventListener("change", syncOptionRows);
+      if (node) {
+        node.addEventListener("change", () => {
+          syncOptionRows();
+          saveSwitchConfig();
+        });
+      }
     });
     bindTable("test-order-pending-body", checkedPending, "pending-check");
     bindTable("test-order-ordered-body", checkedOrdered, "ordered-check");

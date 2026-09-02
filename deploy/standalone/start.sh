@@ -3,13 +3,15 @@ set -euo pipefail
 
 # 固定运行时镜像 + 独立应用包管理脚本。
 # 用法:
-#   bash start.sh start                 启动（默认）
+#   ./start.sh                           部署并启动（默认）
+#   ./start.sh start                     部署并启动
 #   bash start.sh restart               重建容器并启动
 #   bash start.sh update <应用包.bin>   更新应用包并重建容器（自动重置状态）
 #   bash start.sh rollback              回滚到上一个应用包
 #   bash start.sh version               查看当前应用包版本
 #   bash start.sh stop                  停止
 #   bash start.sh logs                  查看日志
+#   bash start.sh runtime-logs          查看自身服务运行日志文件
 #   bash start.sh pull-runtime          仅拉取运行时镜像
 #   bash start.sh reset-state           手动重置状态文件（保留 dashboard_settings.json）
 
@@ -22,7 +24,20 @@ APP_BIN="bin/knowledge_shelf_query.bin"
 APP_BIN_BACKUP="${APP_BIN}.bak"
 export RUNTIME_IMAGE
 export CONFIG_PNP_DIR="${CONFIG_PNP_DIR:-/home/nvidia/compiled/PNPApp_deploy/config_pnp}"
-export KNOWLEDGE_DIR="${KNOWLEDGE_DIR:-/home/nvidia/compiled/VfmApp_deploy/model/templates/knowledge}"
+# KNOWLEDGE_DIR is the mounted templates root; the application defaults to its
+# ``knowledge`` child and accepts any other child path from the load page.
+export KNOWLEDGE_DIR="${KNOWLEDGE_DIR:-/home/nvidia/compiled/VfmApp_deploy/model/templates}"
+
+# 兼容旧部署包：旧 .env 可能仍填写 templates/knowledge。新约定挂载
+# templates 根目录，检测到旧值时自动提升一级，避免默认路径变成 knowledge/knowledge。
+_knowledge_root_candidate="${KNOWLEDGE_DIR%/}"
+if [[ "${_knowledge_root_candidate##*/}" == "knowledge" \
+    && "$(basename "$(dirname "${_knowledge_root_candidate}")")" == "templates" \
+    && -d "$(dirname "${_knowledge_root_candidate}")" \
+    && ! -d "${_knowledge_root_candidate}/knowledge" ]]; then
+    echo "[WARN] KNOWLEDGE_DIR 使用旧的 templates/knowledge 路径，已改用其 templates 父目录"
+    export KNOWLEDGE_DIR="$(dirname "${_knowledge_root_candidate}")"
+fi
 
 die() { echo "[ERROR] $*" >&2; exit 1; }
 
@@ -81,7 +96,7 @@ compose_cli() {
 }
 
 ensure_files() {
-    mkdir -p config bin
+    mkdir -p config bin logs
     # 各文件写入正确的初始值（而非统一 {}）
     # test_order_state.json → {}（_load_state_file 缺失/空回退 _empty_state）
     _init_file "config/test_order_state.json" '{}'
@@ -98,6 +113,32 @@ ensure_files() {
         die "robot_keyboard.env 被误创建为目录，请删除后重试"
     fi
     [[ -f robot_keyboard.env ]] || touch robot_keyboard.env
+}
+
+ensure_feishu_rules_file() {
+    local target="config/feishu_rules.json"
+    [[ -d "${target}" ]] && die "${target} 被误创建为目录，请删除后重试（应为 JSON 文件）"
+    [[ -f "${target}" ]] && return 0
+    [[ -f "${APP_BIN}" ]] || return 0
+    if python3 - "${APP_BIN}" "${target}" <<'PY'
+import sys
+import zipfile
+from pathlib import Path
+
+archive_path = Path(sys.argv[1])
+target = Path(sys.argv[2])
+try:
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("ksq/feishu/rules.json")
+except (KeyError, OSError, zipfile.BadZipFile):
+    raise SystemExit(2)
+target.write_bytes(payload)
+PY
+    then
+        echo "[INFO] 已从应用包初始化 config/feishu_rules.json"
+    else
+        echo "[WARN] 未找到内置飞书规则文件，当前应用可能不支持外部规则配置"
+    fi
 }
 
 # 重置状态文件为干净初始值（不触碰 dashboard_settings.json）
@@ -128,8 +169,16 @@ ensure_paths() {
     if [[ "${missing}" -ne 0 ]]; then
         die "请设置: CONFIG_PNP_DIR=... KNOWLEDGE_DIR=... bash start.sh ${ACTION}"
     fi
-    [[ -f "${CONFIG_PNP_DIR}/sku-shelves.csv" ]] \
-        || echo "[WARN] ${CONFIG_PNP_DIR}/sku-shelves.csv 缺失，查询功能将不可用"
+    if ! compgen -G "${CONFIG_PNP_DIR}/sku-shelves*.csv" >/dev/null \
+        && ! compgen -G "${CONFIG_PNP_DIR}/etm_sku_locations_cache*.csv" >/dev/null; then
+        echo "[WARN] ${CONFIG_PNP_DIR} 中未找到库位表，查询功能将不可用"
+    fi
+    local default_knowledge="${KNOWLEDGE_DIR}/knowledge"
+    if [[ ! -d "${default_knowledge}" ]]; then
+        echo "[WARN] 默认 knowledge 目录不存在: ${default_knowledge}；可在页面填写 ${KNOWLEDGE_DIR} 下的其他目录"
+    elif ! compgen -G "${default_knowledge}/*.json" >/dev/null; then
+        echo "[WARN] ${default_knowledge} 中未找到 knowledge JSON，请确认目录内容"
+    fi
 }
 
 ensure_runtime_image() {
@@ -166,6 +215,8 @@ try:
             raise ValueError("缺少文件: " + "、".join(missing))
         if b"--config-pnp" not in archive.read("ksq/cli.py"):
             raise ValueError("应用包不支持 --config-pnp，不能使用当前挂载配置")
+        if b"--knowledge-root" not in archive.read("ksq/cli.py"):
+            raise ValueError("应用包不支持 --knowledge-root，不能使用当前 Knowledge 根目录挂载")
         json.loads(archive.read("KSQ_BUILD.json"))
 except Exception as error:
     print(error, file=sys.stderr)
@@ -182,7 +233,12 @@ show_version() {
 }
 
 restart_container() {
-    compose_cli up -d --force-recreate
+    if docker container inspect knowledge_shelf_query >/dev/null 2>&1; then
+        echo "[INFO] 检测到旧容器 knowledge_shelf_query，正在停止并替换"
+        docker stop knowledge_shelf_query >/dev/null
+        docker rm knowledge_shelf_query >/dev/null
+    fi
+    compose_cli up -d
 }
 
 wait_for_service() {
@@ -217,6 +273,7 @@ update_app_bin() {
         cp -p "${APP_BIN}" "${APP_BIN_BACKUP}"
     fi
     mv "${incoming}" "${APP_BIN}"
+    ensure_feishu_rules_file
 
     if ! restart_container || ! wait_for_service; then
         if [[ -f "${APP_BIN_BACKUP}" ]]; then
@@ -237,6 +294,7 @@ rollback_app_bin() {
     local current="${APP_BIN}.current"
     [[ -f "${APP_BIN}" ]] && cp -p "${APP_BIN}" "${current}"
     cp -p "${APP_BIN_BACKUP}" "${APP_BIN}"
+    ensure_feishu_rules_file
     [[ -f "${current}" ]] && mv "${current}" "${APP_BIN_BACKUP}"
     restart_container
     wait_for_service || die "已切换应用包，但服务未就绪，请查看日志"
@@ -250,8 +308,9 @@ case "${ACTION}" in
         ensure_files
         ensure_paths
         verify_app_bin "${APP_BIN}"
+        ensure_feishu_rules_file
         ensure_runtime_image
-        compose_cli up -d
+        restart_container
         wait_for_service || die "容器已创建，但服务未就绪，请执行 bash start.sh logs"
         show_version
         echo "[OK] 已启动，访问 http://<本机IP>:8765"
@@ -261,6 +320,7 @@ case "${ACTION}" in
         ensure_files
         ensure_paths
         verify_app_bin "${APP_BIN}"
+        ensure_feishu_rules_file
         ensure_runtime_image
         restart_container
         wait_for_service || die "容器已重建，但服务未就绪，请执行 bash start.sh logs"
@@ -289,6 +349,11 @@ case "${ACTION}" in
         ensure_docker
         docker logs -f knowledge_shelf_query
         ;;
+    runtime-logs)
+        ensure_files
+        touch logs/knowledge_shelf_query.log
+        tail -n 200 -f logs/knowledge_shelf_query.log
+        ;;
     reset-state)
         reset_state
         ;;
@@ -297,6 +362,6 @@ case "${ACTION}" in
         docker pull "${RUNTIME_IMAGE}"
         ;;
     *)
-        die "用法: bash start.sh {start|restart|update <应用包.bin>|rollback|version|stop|logs|pull-runtime|reset-state}"
+        die "用法: bash start.sh {start|restart|update <应用包.bin>|rollback|version|stop|logs|runtime-logs|pull-runtime|reset-state}"
         ;;
 esac

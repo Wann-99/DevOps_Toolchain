@@ -22,8 +22,19 @@ APP_BIN="${APP_DIR}/deploy/standalone/bin/knowledge_shelf_query.bin"
 
 COMPILED_DIR="${COMPILED_DIR:-/home/nvidia/compiled}"
 export CONFIG_PNP_DIR="${CONFIG_PNP_DIR:-${COMPILED_DIR}/PNPApp_deploy/config_pnp}"
-export KNOWLEDGE_DIR="${KNOWLEDGE_DIR:-${COMPILED_DIR}/VfmApp_deploy/model/templates/knowledge}"
+# KNOWLEDGE_DIR is the mounted templates root; default target is ./knowledge.
+export KNOWLEDGE_DIR="${KNOWLEDGE_DIR:-${COMPILED_DIR}/VfmApp_deploy/model/templates}"
 export RUNTIME_IMAGE="${RUNTIME_IMAGE:-hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime:v1.1.0}"
+
+# 兼容旧 .env：旧值通常是 templates/knowledge，新挂载约定需要 templates 根。
+_knowledge_root_candidate="${KNOWLEDGE_DIR%/}"
+if [[ "${_knowledge_root_candidate##*/}" == "knowledge" \
+    && "$(basename "$(dirname "${_knowledge_root_candidate}")")" == "templates" \
+    && -d "$(dirname "${_knowledge_root_candidate}")" \
+    && ! -d "${_knowledge_root_candidate}/knowledge" ]]; then
+    echo "[WARN] KNOWLEDGE_DIR 使用旧的 templates/knowledge 路径，已改用其 templates 父目录"
+    export KNOWLEDGE_DIR="$(dirname "${_knowledge_root_candidate}")"
+fi
 
 compose_cli() {
     if docker compose version >/dev/null 2>&1; then
@@ -108,6 +119,10 @@ ensure_paths() {
     if [[ ! -d "${KNOWLEDGE_DIR}" ]]; then
         echo "[ERROR] KNOWLEDGE_DIR 不存在: ${KNOWLEDGE_DIR}"
         missing=1
+    elif [[ ! -d "${KNOWLEDGE_DIR}/knowledge" ]]; then
+        echo "[WARN] 默认 knowledge 目录不存在: ${KNOWLEDGE_DIR}/knowledge；页面可选择根目录下其他目录"
+    elif ! compgen -G "${KNOWLEDGE_DIR}/knowledge/*.json" >/dev/null; then
+        echo "[WARN] ${KNOWLEDGE_DIR}/knowledge 中未找到 knowledge JSON，请确认目录内容"
     fi
     if [[ "${missing}" -ne 0 ]]; then
         echo "[INFO] 可设置: CONFIG_PNP_DIR=... KNOWLEDGE_DIR=... bash up.sh ${ACTION}"

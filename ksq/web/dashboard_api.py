@@ -7,13 +7,13 @@ import re
 import subprocess
 import time
 from copy import deepcopy
-from datetime import datetime, timezone
-from threading import Lock
+from datetime import datetime, timedelta, timezone
+from threading import Event, Lock, Thread
 from typing import Dict, List, Mapping, Optional, Tuple
 
 import urllib.error
 import urllib.request
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from ksq.constants import (
     DASHBOARD_ACTIVE_ORDER_FILE,
@@ -24,15 +24,13 @@ from ksq.constants import (
     ROBOT_KEYBOARD_ENV_FILE,
 )
 from ksq.safe_io import safe_write_text
-from ksq.feishu.form_payload import DEFAULT_SITE
+from ksq.runtime_logging import get_logger
+from ksq.feishu.rules import normalize_rule_id, public_rules
 from ksq.feishu.submit import (
-    describe_feishu_form,
-    fetch_feishu_site_options,
     maybe_submit_feishu_form,
     preview_feishu_form,
     should_submit_on_confirm,
     should_submit_on_human_prompt,
-    submit_feishu_form,
 )
 from ksq.web.logs_api import (
     LogServiceError,
@@ -45,8 +43,16 @@ ROBOT_SERVICE_ID = "0"
 ROBOT_SERVICE_NAME = "robot_workspace_move_test"
 _DEFAULT_KEYBOARD_DEVICE = "/dev/input/event1"
 _DEFAULT_DASHBOARD_MODE = "test"
+_RECOVERED_ORDER_TIMEZONE = timezone(timedelta(hours=8))
 _KEYBOARD_DEVICE_RE = re.compile(r"^/dev/input/event\d+$")
 _DASHBOARD_MODES = frozenset({"test", "prod"})
+_FEISHU_LOG_CACHE_MAX_LINES = 20000
+# A log tail is useful for recovering a process that restarted mid-order, but
+# an old tail must never become a new queue lock when the active-order file is
+# missing.  Robot workflows are normally measured in minutes; a half-hour
+# window also tolerates a slow/manual step without reviving yesterday's task.
+_LOG_ORDER_RECOVERY_MAX_AGE_SECONDS = 30 * 60
+LOGGER = get_logger("dashboard")
 
 _ANSI_RE = re.compile(
     r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-Z\\-_]"
@@ -63,14 +69,38 @@ _SEQ_ID_RE = re.compile(
     r"(?P<code>\d+)-(?P<idx>\d+))",
     re.I,
 )
+# 新版机器人日志的 start process object 字典：{'code': sku_id, 'barcode': 69码, ...}
+# 字段顺序与旧版不同，正则不假设相邻字段；barcode 单独提取（旧版没有该键）。
 _START_OBJECT_RE = re.compile(
-    r"start process object\s*\{'code':\s*'([^']+)',\s*'location_code':\s*'([^']*)'"
+    r"start process object\s*\{[^}]*'code':\s*'([^']+)'[^}]*'location_code':\s*'([^']*)'"
 )
-_ITEM_START_RE = re.compile(r"\bitem\s+(\d+)\s+process start time", re.I)
-_ITEM_END_RE = re.compile(r"\bitem\s+(\d+)\s+process end time", re.I)
+_START_OBJECT_BARCODE_RE = re.compile(
+    r"start process object\s*\{[^}]*'barcode':\s*'([^']+)'"
+)
+# 新版日志 item 行的编号是 sku_id（非纯数字），统一按非空白匹配。
+_ITEM_START_RE = re.compile(r"\bitem\s+(\S+)\s+process start time", re.I)
+_ITEM_END_RE = re.compile(r"\bitem\s+(\S+)\s+process end time", re.I)
 _ITEM_DURATION_RE = re.compile(
-    r"\bitem\s+(\d+)\s+process duration:\s*([0-9.]+)", re.I
+    r"\bitem\s+(\S+)\s+process duration:\s*([0-9.]+)", re.I
 )
+
+
+def _barcode_aliases(lines: List[str], base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """sku_id → 69码 映射，来自 start process object 行（新版日志同时携带两者）。
+
+    base 用于并入订单上已持久化的别名：起始行滚出日志窗口后，结束行仍能正确翻译。
+    """
+    aliases: Dict[str, str] = dict(base or {})
+    for line in lines:
+        match = _START_OBJECT_RE.search(line)
+        if match is None:
+            continue
+        code = match.group(1).strip()
+        barcode_match = _START_OBJECT_BARCODE_RE.search(line)
+        barcode = barcode_match.group(1).strip() if barcode_match else ""
+        if code and barcode and code != barcode:
+            aliases[code] = barcode
+    return aliases
 _PLACE_SUCCESS_RE = re.compile(r"place object pipeline success", re.I)
 
 # Align with PNP case_config speak texts (config.py): these prompts mean
@@ -86,6 +116,11 @@ _CONFIRM_PATTERNS = (
     "wait_for_key",
     "程序已暂停，等待按下目标按键",
     "等待按下目标按键",
+)
+_KEY_WAIT_RE = re.compile(
+    r"(?:等待|请|暂停).*?(?:按下|按|输入).*?(?:目标|指定|任意)?(?:按键|键盘|回车|键)"
+    r"|(?:wait(?:ing)?(?:\s+for)?|press).*?(?:target|specified|any|enter).*?key",
+    re.I,
 )
 _ERROR_CONFIRM_PATTERNS = (
     "报错，请求人工处理",
@@ -139,6 +174,8 @@ _BROKER_STATUS_LABELS = {
     "success": "完成",
     "error": "失败",
     "cancel": "已取消",
+    "manual_cancel": "人工取消",
+    "manual_canceled": "人工取消",
     "awaiting_pack": "等待打包",
     "manual_transferred_completed": "人工转单完成",
     "manual_transferred": "人工转单",
@@ -155,13 +192,14 @@ _BROKER_MANUAL_DONE = frozenset(
 
 # Broker statuses that mean the order has ended (or entered end-of-order human phase).
 _BROKER_ORDER_ENDED = (
-    frozenset({"success", "error", "cancel", "awaiting_pack"})
+    frozenset({"success", "error", "cancel", "manual_cancel", "manual_canceled", "awaiting_pack"})
     | _BROKER_MANUAL_HELD
     | _BROKER_MANUAL_DONE
 )
 # 人工持有态不算 terminal：后面还有「标记完成」一步。
 _BROKER_ORDER_TERMINAL = (
-    frozenset({"success", "error", "cancel"}) | _BROKER_MANUAL_DONE
+    frozenset({"success", "error", "cancel", "manual_cancel", "manual_canceled"})
+    | _BROKER_MANUAL_DONE
 )
 
 _ACTIVE_ORDER_LOCK = Lock()
@@ -171,7 +209,28 @@ _ACTIVE_ORDER: Optional[Dict[str, object]] = None
 _ACTIVE_ORDER_LOADED = False
 # Last persistence error, surfaced so a failing write is not silently invisible.
 _ACTIVE_ORDER_SAVE_ERROR: Optional[str] = None
-_ORDER_QUEUE_LIMIT = 2
+# Only one order may exist at a time.  Older state files may still contain
+# ``queued_orders``; those entries are ignored by the single-order flow.
+_ORDER_QUEUE_LIMIT = 1
+_BROKER_TASK_IDENTITY_CACHE_TTL_SECONDS = 3.0
+_BROKER_TASK_IDENTITY_CACHE_LOCK = Lock()
+_BROKER_TASK_IDENTITY_CACHE: Dict[str, Tuple[float, str]] = {}
+_DASHBOARD_MONITOR_TAIL = 2500
+_DASHBOARD_MONITOR_ACTIVE_SECONDS = 1.0
+_DASHBOARD_MONITOR_IDLE_SECONDS = 4.0
+_DASHBOARD_REFRESH_LOCK = Lock()
+_DASHBOARD_CACHE_LOCK = Lock()
+_DASHBOARD_CACHE: Optional[Dict[str, object]] = None
+_DASHBOARD_CACHE_GENERATION = 0
+_DASHBOARD_MONITOR_THREAD: Optional[Thread] = None
+_DASHBOARD_MONITOR_STOP: Optional[Event] = None
+
+
+def _invalidate_dashboard_snapshot_cache() -> None:
+    global _DASHBOARD_CACHE, _DASHBOARD_CACHE_GENERATION
+    with _DASHBOARD_CACHE_LOCK:
+        _DASHBOARD_CACHE = None
+        _DASHBOARD_CACHE_GENERATION += 1
 
 
 def active_order_save_error() -> Optional[str]:
@@ -202,7 +261,7 @@ def _save_active_order_unlocked() -> None:
     except OSError as error:
         # In-memory state stays authoritative, but record why disk is stale.
         _ACTIVE_ORDER_SAVE_ERROR = str(error)
-        print(f"[dashboard] 活动订单持久化失败：{error}", flush=True)
+        LOGGER.error("活动订单持久化失败：%s", error, exc_info=True)
         return
 
 
@@ -221,10 +280,32 @@ def _ensure_active_order_loaded() -> None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return
-    if isinstance(payload, dict) and (
+    if not isinstance(payload, dict):
+        return
+    current = payload if (
         payload.get("task_id") or payload.get("items") or payload.get("lifecycle")
-    ):
-        _ACTIVE_ORDER = payload
+    ) else None
+    # v1.3 and earlier could persist a second order in queued_orders.  The
+    # single-order flow no longer queues, but a queued Broker order may be the
+    # newest real order while the old active record is only a log projection.
+    legacy_queue = payload.get("queued_orders")
+    queued = (
+        [item for item in legacy_queue if isinstance(item, dict)]
+        if isinstance(legacy_queue, list)
+        else []
+    )
+    current_lifecycle = current.get("lifecycle") if isinstance(current, dict) else None
+    current_closed = bool(
+        isinstance(current_lifecycle, dict)
+        and current_lifecycle.get("closed")
+    )
+    if queued and (current is None or current_closed):
+        _ACTIVE_ORDER = deepcopy(queued[0])
+        # Drop the legacy queue so it cannot reappear after a later restart.
+        _save_active_order_unlocked()
+        return
+    if current is not None:
+        _ACTIVE_ORDER = current
 
 
 def _dismissed_fingerprint_from_order(order: Optional[Dict[str, object]]) -> str:
@@ -402,9 +483,12 @@ def _refresh_live_elapsed(
 
 def _discover_log_tasks(
     raw_logs: str,
+    aliases: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, Dict[str, List[str]], Dict[str, datetime]]:
     """Return (latest_task_id, task_id -> codes, task_id -> last timestamp)."""
     text = _strip_ansi(raw_logs)
+    if aliases is None:
+        aliases = _barcode_aliases(text.splitlines())
     latest_task_id = ""
     codes_by_task: Dict[str, List[str]] = {}
     seen_by_task: Dict[str, set] = {}
@@ -427,6 +511,7 @@ def _discover_log_tasks(
                 continue
             code = seq_match.group("code").strip()
             parent = seq_match.group("parent").strip()
+        code = aliases.get(code, code)
         if not parent or not code:
             continue
         latest_task_id = parent
@@ -462,10 +547,14 @@ def _stale_log_tasks(
         return frozenset()
     if registered_at.tzinfo is None:
         registered_at = registered_at.replace(tzinfo=timezone.utc)
-    active = str(order.get("task_id") or "").strip()
+    active_ids = {
+        str(order.get(key) or "").strip()
+        for key in ("task_id", "robot_task_id")
+        if str(order.get(key) or "").strip()
+    }
     stale = set()
     for task_id, seen in last_seen_by_task.items():
-        if not task_id or task_id == active or seen is None:
+        if not task_id or task_id in active_ids or seen is None:
             continue
         seen_dt = (
             seen if seen.tzinfo is not None else seen.replace(tzinfo=timezone.utc)
@@ -473,6 +562,28 @@ def _stale_log_tasks(
         if seen_dt < registered_at:
             stale.add(task_id)
     return frozenset(stale)
+
+
+def _has_recent_log_activity(
+    last_seen_by_task: Optional[Mapping[str, datetime]],
+    now: Optional[datetime] = None,
+) -> bool:
+    """Whether a timestamped log tail can safely recover an active order."""
+    if not last_seen_by_task:
+        return False
+    timestamps = [value for value in last_seen_by_task.values() if isinstance(value, datetime)]
+    if not timestamps:
+        # Untimestamped historical logs cannot prove that a task is current.
+        return False
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    latest = max(
+        value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        for value in timestamps
+    )
+    age = (current - latest).total_seconds()
+    return age <= _LOG_ORDER_RECOVERY_MAX_AGE_SECONDS
 
 
 def _build_order_from_log_task(
@@ -554,6 +665,49 @@ def _expand_order_items_from_log(
     return updated
 
 
+def _merged_code_aliases(
+    order: Optional[Dict[str, object]], raw_logs: str
+) -> Dict[str, str]:
+    """sku_id → 69码 别名：订单上已持久化的 ∪ 当前日志窗口新学到的。"""
+    persisted: Dict[str, str] = {}
+    if isinstance(order, dict):
+        for item in order.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            sku_id = str(item.get("sku_id") or "").strip()
+            barcode = str(item.get("barcode") or "").strip()
+            if sku_id and barcode:
+                persisted[sku_id] = barcode
+        raw = order.get("code_aliases")
+        if isinstance(raw, dict):
+            persisted.update({str(k): str(v) for k, v in raw.items()})
+    merged = dict(persisted)
+    merged.update(_barcode_aliases(_strip_ansi(raw_logs).splitlines()))
+    return merged
+
+
+def _persist_code_aliases(order: Optional[Dict[str, object]], aliases: Dict[str, str]) -> None:
+    """把别名写回当前工单持久化，滚出日志窗口后仍可用。"""
+    if not isinstance(order, dict) or not aliases:
+        return
+    task_id = str(order.get("task_id") or "").strip()
+    with _ACTIVE_ORDER_LOCK:
+        global _ACTIVE_ORDER
+        if _ACTIVE_ORDER is None:
+            return
+        if task_id and str(_ACTIVE_ORDER.get("task_id") or "") != task_id:
+            return
+        existing = _ACTIVE_ORDER.get("code_aliases")
+        if isinstance(existing, dict) and all(
+            existing.get(key) == value for key, value in aliases.items()
+        ):
+            return
+        merged = dict(existing) if isinstance(existing, dict) else {}
+        merged.update(aliases)
+        _ACTIVE_ORDER["code_aliases"] = merged
+        _save_active_order_unlocked()
+
+
 def _resolve_active_order(
     order: Optional[Dict[str, object]], raw_logs: str
 ) -> Optional[Dict[str, object]]:
@@ -563,7 +717,7 @@ def _resolve_active_order(
     """
     latest_task_id, codes_by_task, last_seen_by_task = _discover_log_tasks(raw_logs)
     if order is None:
-        if not latest_task_id:
+        if not latest_task_id or not _has_recent_log_activity(last_seen_by_task):
             return None
         return _build_order_from_log_task(
             latest_task_id, codes_by_task.get(latest_task_id, [])
@@ -582,13 +736,13 @@ def _resolve_active_order(
         if matched == latest_task_id:
             order = _expand_order_items_from_log(order, codes_by_task, matched)
             return order
-        # A registered waiting order owns the switch. Do not let log discovery
-        # overwrite queue metadata before Broker marks the current order terminal.
-        queued_orders = order.get("queued_orders")
-        if isinstance(queued_orders, list) and queued_orders:
-            return order
-        # Next order already visible in logs.
-        if ended or source == "log":
+        # Broker-created orders are authoritative.  The task_id in robot logs
+        # is an execution-internal id and must never replace the Broker id.
+        # Log-only orders may still follow the latest log task as before.
+        if source == "log" and not (
+            str(order.get("order_no") or "").strip()
+            or str(order.get("platform_order_no") or "").strip()
+        ):
             return _build_order_from_log_task(
                 latest_task_id, codes_by_task.get(latest_task_id, [])
             )
@@ -600,6 +754,227 @@ def _resolve_active_order(
         )
     if matched:
         order = _expand_order_items_from_log(order, codes_by_task, matched)
+    return order
+
+
+def _list_task_identity(task: object) -> Tuple[str, str]:
+    """Read order identity from either a Broker list row or its task_detail."""
+    nodes: List[Dict[str, object]] = []
+    if isinstance(task, dict):
+        nodes.append(task)
+        detail = task.get("task_detail")
+        if isinstance(detail, dict):
+            nodes.append(detail)
+    order_no = ""
+    platform_no = ""
+    for node in nodes:
+        order_no = order_no or _order_no_from_task_dict(node)
+        platform_no = platform_no or _platform_order_no_from_task_dict(node)
+    return order_no, platform_no
+
+
+def _recovered_order_registered_at(task: object) -> str:
+    """Use the upstream order time as the stale-log boundary after recovery."""
+    if not isinstance(task, dict):
+        return ""
+    detail = task.get("task_detail")
+    nodes = [task]
+    if isinstance(detail, dict):
+        nodes.append(detail)
+    for node in list(nodes):
+        params = node.get("params")
+        if isinstance(params, dict):
+            nodes.append(params)
+    for node in nodes:
+        for field in ("create_time", "order_time"):
+            parsed = _parse_ts(str(node.get(field) or ""))
+            if parsed is None:
+                continue
+            if parsed.tzinfo is None:
+                # Broker list times are explicitly requested in Asia/Shanghai.
+                parsed = parsed.replace(tzinfo=_RECOVERED_ORDER_TIMEZONE)
+            return str(_ts_to_iso(parsed) or "")
+    return ""
+
+
+def _reconcile_broker_task_id(
+    order: Optional[Dict[str, object]], mode: str
+) -> Optional[Dict[str, object]]:
+    """Replace a log-internal task id with the Broker id for the same order.
+
+    Robot logs have their own execution task id.  When an order was first
+    discovered from logs, the Broker id can only be recovered by matching the
+    stable order_no/platform_order_no in the Broker task list.
+    """
+    # Older deployments could persist a robot-internal task_id even for an
+    # order-created record.  The stable order_no is authoritative for every
+    # source, so repair that legacy state instead of limiting this to log-only.
+    if not isinstance(order, dict):
+        return order
+    order_no = str(order.get("order_no") or "").strip()
+    platform_no = str(order.get("platform_order_no") or "").strip()
+    current_id = str(order.get("task_id") or "").strip()
+    if not order_no or not current_id:
+        return order
+    cache_key = "|".join((str(mode or "test"), order_no, platform_no))
+    now = time.monotonic()
+    with _BROKER_TASK_IDENTITY_CACHE_LOCK:
+        cached = _BROKER_TASK_IDENTITY_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] <= _BROKER_TASK_IDENTITY_CACHE_TTL_SECONDS:
+            broker_id = cached[1]
+        else:
+            broker_id = ""
+    if cached is None or now - cached[0] > _BROKER_TASK_IDENTITY_CACHE_TTL_SECONDS:
+        try:
+            from ksq.order.broker import OrderBrokerError
+            from ksq.web import order_api
+
+            result = order_api.list_tasks(
+                mode=mode,
+                page=1,
+                page_size=50,
+                order_by="desc",
+                status="",
+                timezone_name="Asia/Shanghai",
+                refresh=False,
+            )
+            candidates: List[Tuple[int, str]] = []
+            for task in result.get("tasks", []) if isinstance(result, dict) else []:
+                if not isinstance(task, dict):
+                    continue
+                task_id = str(task.get("task_id") or "").strip()
+                if not task_id:
+                    continue
+                row_order_no, row_platform_no = _list_task_identity(task)
+                if row_order_no != order_no:
+                    continue
+                if platform_no and row_platform_no and row_platform_no != platform_no:
+                    continue
+                score = 1 + (2 if platform_no and row_platform_no == platform_no else 0)
+                if task_id == current_id:
+                    score += 10
+                candidates.append((score, task_id))
+            broker_id = max(candidates, default=(0, ""))[1]
+        except (OrderBrokerError, ValueError, FileNotFoundError, KeyError, TypeError, OSError):
+            broker_id = ""
+        with _BROKER_TASK_IDENTITY_CACHE_LOCK:
+            _BROKER_TASK_IDENTITY_CACHE[cache_key] = (time.monotonic(), broker_id)
+    if not broker_id or broker_id == current_id:
+        return order
+
+    updated = deepcopy(order)
+    updated["task_id"] = broker_id
+    updated["robot_task_id"] = current_id
+    updated["source"] = "order"
+    with _ACTIVE_ORDER_LOCK:
+        global _ACTIVE_ORDER
+        if _ACTIVE_ORDER is not None:
+            active_id = str(_ACTIVE_ORDER.get("task_id") or "").strip()
+            active_order_no = str(_ACTIVE_ORDER.get("order_no") or "").strip()
+            if active_id == current_id or active_order_no == order_no:
+                _ACTIVE_ORDER["task_id"] = broker_id
+                _ACTIVE_ORDER["robot_task_id"] = current_id
+                _ACTIVE_ORDER["source"] = "order"
+                _save_active_order_unlocked()
+                updated = deepcopy(_ACTIVE_ORDER)
+    return updated
+
+
+def _promote_latest_broker_order(order: Optional[Dict[str, object]], mode: str) -> Optional[Dict[str, object]]:
+    """Recover a newer running Broker order when the persisted active order is terminal.
+
+    A network/process restart can happen after Broker creates an order but
+    before the local active-order file is updated.  In that case the UI keeps
+    pointing at the old completed order and blocks the new one.  Read-only
+    Broker list data is enough to repair the single-active-order pointer.
+    """
+    if mode != "test":
+        return order
+    current_id = str(order.get("task_id") or "").strip() if isinstance(order, dict) else ""
+    current_broker: Dict[str, object] = {}
+    if current_id:
+        current_broker = _fetch_broker_order(current_id, mode)
+        if current_broker.get("ok") and not current_broker.get("terminal"):
+            return order
+        if (
+            not current_broker.get("ok")
+            and str(order.get("source") or "").strip() != "log"
+        ):
+            return order
+    try:
+        from ksq.web import order_api
+
+        result = order_api.list_tasks(
+            mode=mode,
+            page=1,
+            page_size=50,
+            order_by="desc",
+            status="",
+            timezone_name="Asia/Shanghai",
+            refresh=False,
+        )
+    except Exception:
+        return order
+    tasks = result.get("tasks", []) if isinstance(result, dict) else []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("task_id") or "").strip()
+        status = str(task.get("status") or "").strip().lower()
+        if not task_id or task_id == current_id or status not in (
+            {"pending", "dispatched", "running", "awaiting_pack"}
+            | _BROKER_MANUAL_HELD
+        ):
+            continue
+        promoted_order_no, promoted_platform_no = _list_task_identity(task)
+        detail = task.get("task_detail") if isinstance(task.get("task_detail"), dict) else {}
+        raw_items = detail.get("items") if isinstance(detail, dict) else None
+        if not isinstance(raw_items, list):
+            raw_items = task.get("items") if isinstance(task.get("items"), list) else []
+        items: List[Dict[str, object]] = []
+        for index, raw in enumerate(raw_items, 1):
+            if not isinstance(raw, dict):
+                continue
+            barcode = str(raw.get("barcode") or "").strip()
+            item_id = str(raw.get("item_id") or "").strip()
+            code = barcode or item_id
+            if not code:
+                continue
+            items.append(
+                {
+                    "index": index,
+                    "code": code,
+                    "item_id": item_id or code,
+                    "barcode": barcode or code,
+                    "name": str(raw.get("item_name") or raw.get("name") or "").strip(),
+                    "location_code": str(raw.get("location_code") or "").strip(),
+                    "quantity": raw.get("quantity") or 1,
+                }
+            )
+        candidate = _build_active_order(
+            {
+                "task_id": task_id,
+                "order_no": promoted_order_no,
+                "platform_order_no": promoted_platform_no,
+                "items": items,
+                "source": "order",
+            },
+            registered_at=_recovered_order_registered_at(task),
+        )
+        with _ACTIVE_ORDER_LOCK:
+            global _ACTIVE_ORDER
+            active_id = (
+                ""
+                if _ACTIVE_ORDER is None
+                else str(_ACTIVE_ORDER.get("task_id") or "").strip()
+            )
+            # A create request may replace the active order while Broker list is
+            # in flight. Never let that older refresh overwrite the new order.
+            if active_id != current_id:
+                return deepcopy(_ACTIVE_ORDER) if _ACTIVE_ORDER is not None else None
+            _ACTIVE_ORDER = candidate
+            _save_active_order_unlocked()
+        return candidate
     return order
 
 
@@ -657,11 +1032,17 @@ def parse_robot_log_text(
     focus_task_id: str = "",
     extra_allowed_codes: Optional[set] = None,
     stale_task_ids: Optional[frozenset] = None,
+    aliases: Optional[Dict[str, str]] = None,
 ) -> Dict[str, object]:
     text = _strip_ansi(raw_logs)
     lines = [line for line in text.splitlines() if line.strip()]
+    # 新版机器人日志的商品编号是 sku_id；start process object 行同时给出 69码，
+    # 先把 sku_id → 69码 映射建好，后续所有编号统一翻译成订单使用的 69码。
+    aliases = _barcode_aliases(lines) if aliases is None else aliases
     focus_task_id = str(focus_task_id or "").strip()
-    _latest_task_id, codes_by_task, _last_seen = _discover_log_tasks(raw_logs)
+    _latest_task_id, codes_by_task, _last_seen = _discover_log_tasks(
+        raw_logs, aliases=aliases
+    )
     allowed_codes = set(codes_by_task.get(focus_task_id, [])) if focus_task_id else set()
     if extra_allowed_codes:
         allowed_codes.update(str(code).strip() for code in extra_allowed_codes if str(code).strip())
@@ -725,7 +1106,7 @@ def parse_robot_log_text(
 
         item_task = _ITEM_TASK_RE.search(body)
         if item_task is not None:
-            code = item_task.group(1).strip()
+            code = aliases.get(item_task.group(1).strip(), item_task.group(1).strip())
             parent = item_task.group(2).strip()
             seq_id = item_task.group(3).strip()
             saw_any_task = True
@@ -748,7 +1129,7 @@ def parse_robot_log_text(
 
         seq_match = _SEQ_ID_RE.search(body)
         if seq_match is not None:
-            code = seq_match.group("code")
+            code = aliases.get(seq_match.group("code"), seq_match.group("code"))
             parent = seq_match.group("parent")
             seq_id = seq_match.group("seq")
             saw_any_task = True
@@ -771,7 +1152,7 @@ def parse_robot_log_text(
 
         start_object = _START_OBJECT_RE.search(body)
         if start_object is not None:
-            code = start_object.group(1).strip()
+            code = aliases.get(start_object.group(1).strip(), start_object.group(1).strip())
             if not _accept_code(code):
                 current_code = ""
                 continue
@@ -809,7 +1190,7 @@ def parse_robot_log_text(
 
         item_start = _ITEM_START_RE.search(body)
         if item_start is not None:
-            code = item_start.group(1).strip()
+            code = aliases.get(item_start.group(1).strip(), item_start.group(1).strip())
             if not _accept_code(code):
                 current_code = ""
                 continue
@@ -920,9 +1301,10 @@ def parse_robot_log_text(
                     current_code = resume_code
                 continue
 
-        confirm_hit = _match_any(body, _CONFIRM_PATTERNS)
+        key_wait_hit = _KEY_WAIT_RE.search(body)
+        confirm_hit = _match_any(body, _CONFIRM_PATTERNS) or key_wait_hit
         error_hit = _match_any(body, _ERROR_CONFIRM_PATTERNS)
-        pack_hit = _match_any(body, _PACK_CONFIRM_PATTERNS)
+        pack_hit = _match_any(body, _PACK_CONFIRM_PATTERNS) or key_wait_hit
         if confirm_hit or error_hit:
             if stale_marker_codes and not fresh_marker_codes:
                 # Only a previous order's execution is visible in the tail; its
@@ -1000,7 +1382,7 @@ def parse_robot_log_text(
 
         item_end = _ITEM_END_RE.search(body)
         if item_end is not None:
-            code = item_end.group(1).strip()
+            code = aliases.get(item_end.group(1).strip(), item_end.group(1).strip())
             if not _accept_code(code):
                 continue
             item = _ensure_item(items, code)
@@ -1023,7 +1405,7 @@ def parse_robot_log_text(
 
         duration_match = _ITEM_DURATION_RE.search(body)
         if duration_match is not None:
-            code = duration_match.group(1).strip()
+            code = aliases.get(duration_match.group(1).strip(), duration_match.group(1).strip())
             if not _accept_code(code):
                 continue
             item = _ensure_item(items, code)
@@ -1205,7 +1587,26 @@ def _infer_order_source(order_source: object, platform_order_no: object) -> str:
     return ""
 
 
-def _build_active_order(payload: Dict[str, object]) -> Dict[str, object]:
+def _normalize_order_quantity(raw: object, index: int) -> int:
+    """Normalize quantities from HTTP and Broker recovery payloads."""
+    if raw is None:
+        return 1
+    if isinstance(raw, bool):
+        raise ValueError(f"items[{index}].quantity 必须是正整数。")
+    if isinstance(raw, int):
+        quantity = raw
+    elif isinstance(raw, str) and re.fullmatch(r"[1-9][0-9]*", raw.strip()):
+        quantity = int(raw.strip())
+    else:
+        raise ValueError(f"items[{index}].quantity 必须是正整数。")
+    if quantity <= 0:
+        raise ValueError(f"items[{index}].quantity 必须是正整数。")
+    return quantity
+
+
+def _build_active_order(
+    payload: Dict[str, object], *, registered_at: object = ""
+) -> Dict[str, object]:
     task_id = str(payload.get("task_id") or "").strip()
     order_no = str(payload.get("order_no") or "").strip()
     platform_order_no = str(payload.get("platform_order_no") or "").strip()
@@ -1222,6 +1623,7 @@ def _build_active_order(payload: Dict[str, object]) -> Dict[str, object]:
         barcode = str(
             raw.get("barcode") or raw.get("code") or raw.get("sku_code") or ""
         ).strip()
+        sku_id = str(raw.get("sku_id") or "").strip()
         item_id = str(raw.get("item_id") or "").strip()
         code = barcode or item_id
         if not code:
@@ -1232,6 +1634,7 @@ def _build_active_order(payload: Dict[str, object]) -> Dict[str, object]:
                 "code": code,
                 "item_id": item_id or code,
                 "barcode": barcode or code,
+                "sku_id": sku_id,
                 "name": str(
                     raw.get("name")
                     or raw.get("common_name")
@@ -1239,9 +1642,14 @@ def _build_active_order(payload: Dict[str, object]) -> Dict[str, object]:
                     or ""
                 ).strip(),
                 "location_code": str(raw.get("location_code") or "").strip(),
-                "quantity": int(raw.get("quantity") or 1),
+                "quantity": _normalize_order_quantity(raw.get("quantity"), index),
+                "group_id": str(raw.get("group_id") or "").strip(),
+                "group_field": str(raw.get("group_field") or "").strip(),
             }
         )
+    registered_dt = _parse_ts(str(registered_at or ""))
+    if registered_dt is None:
+        registered_dt = datetime.now(timezone.utc)
     order = {
         "task_id": task_id,
         "order_no": order_no,
@@ -1250,7 +1658,7 @@ def _build_active_order(payload: Dict[str, object]) -> Dict[str, object]:
         "item_count": len(items),
         "items": items,
         "item_states": {},
-        "registered_at": _ts_to_iso(datetime.now(timezone.utc)),
+        "registered_at": _ts_to_iso(registered_dt),
         "source": str(payload.get("source") or "order").strip() or "order",
         "lifecycle": _default_lifecycle(),
         "ui": {"dismissed_fingerprint": ""},
@@ -1258,23 +1666,17 @@ def _build_active_order(payload: Dict[str, object]) -> Dict[str, object]:
     return order
 
 
-def set_active_order(payload: Dict[str, object]) -> Dict[str, object]:
-    order = _build_active_order(payload)
+def set_active_order(
+    payload: Dict[str, object], *, registered_at: object = ""
+) -> Dict[str, object]:
+    order = _build_active_order(payload, registered_at=registered_at)
     global _ACTIVE_ORDER, _ACTIVE_ORDER_LOADED
     with _ACTIVE_ORDER_LOCK:
         _ACTIVE_ORDER_LOADED = True
         _ACTIVE_ORDER = order
         _save_active_order_unlocked()
+    _invalidate_dashboard_snapshot_cache()
     return deepcopy(order)
-
-
-def _queued_orders_unlocked() -> List[Dict[str, object]]:
-    if not isinstance(_ACTIVE_ORDER, dict):
-        return []
-    raw = _ACTIVE_ORDER.get("queued_orders")
-    if not isinstance(raw, list):
-        return []
-    return [item for item in raw if isinstance(item, dict)]
 
 
 def _order_is_queue_terminal(order: Optional[Dict[str, object]]) -> bool:
@@ -1286,71 +1688,33 @@ def _order_is_queue_terminal(order: Optional[Dict[str, object]]) -> bool:
     return str(lifecycle.get("broker_status") or "").strip() in _BROKER_ORDER_TERMINAL
 
 
-def _promote_queued_order_unlocked() -> bool:
-    """Promote exactly one queued order after the current Broker task is terminal."""
-    global _ACTIVE_ORDER
-    if not _order_is_queue_terminal(_ACTIVE_ORDER):
-        return False
-    queued = _queued_orders_unlocked()
-    if not queued:
-        return False
-    promoted = deepcopy(queued[0])
-    remaining = deepcopy(queued[1:])
-    if remaining:
-        promoted["queued_orders"] = remaining
-    else:
-        promoted.pop("queued_orders", None)
-    _ACTIVE_ORDER = promoted
-    _save_active_order_unlocked()
-    return True
-
-
-def promote_queued_order_if_ready() -> bool:
-    with _ACTIVE_ORDER_LOCK:
-        _ensure_active_order_loaded()
-        return _promote_queued_order_unlocked()
-
-
 def order_queue_status() -> Dict[str, object]:
     with _ACTIVE_ORDER_LOCK:
         _ensure_active_order_loaded()
-        queued = _queued_orders_unlocked()
         current = _ACTIVE_ORDER
         return {
             "capacity": _ORDER_QUEUE_LIMIT,
-            "total": (1 if isinstance(current, dict) else 0) + len(queued),
-            "queued_count": len(queued),
-            "full": isinstance(current, dict) and len(queued) >= _ORDER_QUEUE_LIMIT - 1,
-            "queued": [
-                {
-                    "task_id": str(item.get("task_id") or ""),
-                    "order_no": str(
-                        item.get("order_no") or item.get("platform_order_no") or ""
-                    ),
-                    "item_count": int(item.get("item_count") or 0),
-                    "registered_at": item.get("registered_at"),
-                }
-                for item in queued
-            ],
+            "total": 1 if isinstance(current, dict) else 0,
+            "queued_count": 0,
+            "full": isinstance(current, dict) and not _order_is_queue_terminal(current),
+            "queued": [],
         }
 
 
 def ensure_order_queue_capacity() -> None:
     with _ACTIVE_ORDER_LOCK:
         _ensure_active_order_loaded()
-        _promote_queued_order_unlocked()
         if _ACTIVE_ORDER is None:
             return
-        if _order_is_queue_terminal(_ACTIVE_ORDER) and not _queued_orders_unlocked():
+        if _order_is_queue_terminal(_ACTIVE_ORDER):
             return
-        if len(_queued_orders_unlocked()) >= _ORDER_QUEUE_LIMIT - 1:
-            raise ValueError("当前已有两单（执行中 1 单、等待中 1 单），请等待当前单结束。")
+        raise ValueError("上一单尚未完成，请等待上一单完成后再下单。")
 
 
 def register_created_order(
     task_id: str, request_body: Dict[str, object], source: str
 ) -> Dict[str, object]:
-    """Register a Broker-created order as current or as the single waiting order."""
+    """Register a Broker-created order as the only active order."""
     items = request_body.get("items")
     if not isinstance(items, list):
         items = []
@@ -1367,33 +1731,21 @@ def register_created_order(
     with _ACTIVE_ORDER_LOCK:
         _ensure_active_order_loaded()
         _ACTIVE_ORDER_LOADED = True
-        _promote_queued_order_unlocked()
         active_id = "" if _ACTIVE_ORDER is None else str(_ACTIVE_ORDER.get("task_id") or "")
         if active_id and active_id == task_id:
             result = deepcopy(_ACTIVE_ORDER)
             result["queue_position"] = 0
             return result
-        queued = _queued_orders_unlocked()
-        for queued_order in queued:
-            if str(queued_order.get("task_id") or "") == task_id:
-                result = deepcopy(queued_order)
-                result["queue_position"] = 1
-                return result
-        if _ACTIVE_ORDER is None or (
-            _order_is_queue_terminal(_ACTIVE_ORDER) and not queued
-        ):
-            _ACTIVE_ORDER = candidate
-            position = 0
-        else:
-            if len(queued) >= _ORDER_QUEUE_LIMIT - 1:
-                raise ValueError("当前已有两单（执行中 1 单、等待中 1 单），请等待当前单结束。")
-            queued.append(candidate)
-            _ACTIVE_ORDER["queued_orders"] = queued
-            position = 1
+        if _ACTIVE_ORDER is not None and not _order_is_queue_terminal(_ACTIVE_ORDER):
+            raise ValueError("上一单尚未完成，请等待上一单完成后再下单。")
+        _ACTIVE_ORDER = candidate
         _save_active_order_unlocked()
+    _invalidate_dashboard_snapshot_cache()
     result = deepcopy(candidate)
-    result["queue_position"] = position
-    result["queued"] = position > 0
+    # Keep the legacy fields so older clients can consume the response while
+    # the server no longer creates a waiting order.
+    result["queue_position"] = 0
+    result["queued"] = False
     return result
 
 
@@ -1440,6 +1792,7 @@ def dismiss_await(fingerprint: object) -> Dict[str, object]:
             _ACTIVE_ORDER["ui"] = ui
         ui["dismissed_fingerprint"] = value
         _save_active_order_unlocked()
+    _invalidate_dashboard_snapshot_cache()
     return {"ok": True, "dismissed_fingerprint": value}
 
 
@@ -1447,14 +1800,11 @@ _TERMINAL_ITEM_STATUSES = frozenset({"success", "failed", "skipped"})
 
 
 def active_order_blocking_keys() -> List[str]:
-    """SKU keys tied to the current or waiting order (multi-device guard)."""
+    """SKU keys tied to the current order (multi-device guard)."""
     current = get_active_order()
     if current is None:
         return []
     orders = [current]
-    queued = current.get("queued_orders")
-    if isinstance(queued, list):
-        orders.extend(item for item in queued if isinstance(item, dict))
     keys: List[str] = []
     seen: set = set()
     for order in orders:
@@ -1484,6 +1834,35 @@ def active_order_blocking_keys() -> List[str]:
                     seen.add(value)
                     keys.append(value)
     return keys
+
+
+def active_order_requires_manual_completion() -> bool:
+    """Whether a previous key prompt is still unresolved for the active order.
+
+    仅单品级日志信号（item_states 中的待确认/报错）参与；订单 lifecycle 已
+    完全由 Broker 状态驱动，不再引用日志结束标记。
+    """
+    order = get_active_order()
+    if not isinstance(order, dict) or _order_is_queue_terminal(order):
+        return False
+    states = order.get("item_states")
+    return bool(
+        isinstance(states, dict)
+        and any(
+            isinstance(item, dict)
+            and (
+                bool(item.get("needs_confirm"))
+                or str(item.get("status") or "") in {"await_confirm", "await_error"}
+            )
+            for item in states.values()
+        )
+    )
+
+
+def active_order_blocks_new_order() -> bool:
+    """Whether any non-terminal active order must finish before a new one."""
+    order = get_active_order()
+    return isinstance(order, dict) and not _order_is_queue_terminal(order)
 
 
 def resolve_dashboard_mode(mode: object) -> str:
@@ -1570,10 +1949,40 @@ def _items_from_ob_params(params: object) -> List[Dict[str, object]]:
     return items
 
 
+# Broker 任务详情每次快照都实时拉一次（云端 HTTP 调用），是轮询延迟的主要来源。
+# 同一任务 2 秒内视为新鲜：播报/确认这类日志驱动的交互得以即时弹出，工单状态
+# 芯片最多滞后 2 秒，可接受。
+_BROKER_ORDER_CACHE_TTL_SECONDS = 2.0
+_BROKER_ORDER_CACHE: Dict[str, Tuple[float, Dict[str, object]]] = {}
+_BROKER_ORDER_CACHE_LOCK = Lock()
+
+
+def invalidate_broker_order_cache(task_id: str) -> None:
+    """写操作成功后丢弃 Broker 详情缓存，下一次轮询立即重拉。
+
+    传入具体 task_id 时按任务精准失效；传空串时全量清空（按 order_no
+    直发的操作无法反查 task_id，只能整体作废）。
+    """
+    task_id = str(task_id or "").strip()
+    with _BROKER_ORDER_CACHE_LOCK:
+        if not task_id:
+            _BROKER_ORDER_CACHE.clear()
+            return
+        stale = [key for key in _BROKER_ORDER_CACHE if key.endswith("|" + task_id)]
+        for key in stale:
+            _BROKER_ORDER_CACHE.pop(key, None)
+
+
 def _fetch_broker_order(task_id: str, mode: str = "test") -> Dict[str, object]:
     task_id = str(task_id or "").strip()
     if not task_id:
         return {"ok": False, "error": "无 task_id"}
+    cache_key = "%s|%s" % (mode, task_id)
+    now = time.monotonic()
+    with _BROKER_ORDER_CACHE_LOCK:
+        cached = _BROKER_ORDER_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < _BROKER_ORDER_CACHE_TTL_SECONDS:
+            return deepcopy(cached[1])
     try:
         from ksq.order.broker import OrderBrokerError
         from ksq.web import order_api
@@ -1605,7 +2014,7 @@ def _fetch_broker_order(task_id: str, mode: str = "test") -> Dict[str, object]:
                 order_source = _infer_order_source(
                     params.get("order_source"), platform_order_no
                 )
-        return {
+        result = {
             "ok": True,
             "http_status": status_code,
             "task_id": str(task.get("task_id") or task_id).strip(),
@@ -1624,6 +2033,9 @@ def _fetch_broker_order(task_id: str, mode: str = "test") -> Dict[str, object]:
             "raw": task,
             "source": "broker",
         }
+        with _BROKER_ORDER_CACHE_LOCK:
+            _BROKER_ORDER_CACHE[cache_key] = (time.monotonic(), deepcopy(result))
+        return result
     except OrderBrokerError as error:
         return {
             "ok": False,
@@ -1693,6 +2105,127 @@ def _etm_get_json(base_url: str, path: str) -> Dict[str, object]:
     if not isinstance(payload, dict):
         raise LogServiceError(f"ETM 响应格式无效：{url}", 502)
     return payload
+
+
+def _broker_item_location(entry: Dict[str, object]) -> str:
+    """从 Broker 条目里取库位：优先顶层 location_code，缺失时从 locations[0] 还原。"""
+    value = str(entry.get("location_code") or "").strip()
+    if value:
+        return value
+    locations = entry.get("locations")
+    if not isinstance(locations, list):
+        return ""
+    for location in locations:
+        if not isinstance(location, dict):
+            continue
+        customer = str(location.get("customer_location_code") or "").strip()
+        if customer:
+            return customer
+        parts = [
+            str(location.get(key) or "").strip()
+            for key in ("shelf_number", "level", "bin_unit")
+        ]
+        if all(parts):
+            return "".join(parts)
+    return ""
+
+
+def _broker_order_items(broker: Dict[str, object]) -> List[Dict[str, object]]:
+    """提取 Broker 带回的子任务条目（下单时提交、由 Broker 原样返回）。
+
+    单任务详情放在 params.items，列表行放在 task_detail.items，两者结构一致。
+    这里是名称与库位的权威来源：日志只能给出条码与状态，而本地下单快照的
+    名称/库位来自导入 CSV，CSV 往往没有这两列，取本地值会得到空。
+    """
+    if not broker.get("ok"):
+        return []
+    raw = broker.get("raw")
+    if not isinstance(raw, dict):
+        return []
+    container: Optional[List[object]] = None
+    for key in ("params", "task_detail"):
+        node = raw.get(key)
+        if isinstance(node, dict) and isinstance(node.get("items"), list):
+            container = node["items"]  # type: ignore[assignment]
+            break
+    if container is None and isinstance(raw.get("items"), list):
+        container = raw["items"]  # type: ignore[assignment]
+    if not container:
+        return []
+    items: List[Dict[str, object]] = []
+    for index, entry in enumerate(container, start=1):
+        if not isinstance(entry, dict):
+            continue
+        items.append(
+            {
+                "index": index,
+                "item_id": str(entry.get("item_id") or "").strip(),
+                "sku_id": str(entry.get("sku_id") or "").strip(),
+                "barcode": str(entry.get("barcode") or "").strip(),
+                "name": str(
+                    entry.get("item_name")
+                    or entry.get("common_name")
+                    or entry.get("alias")
+                    or ""
+                ).strip(),
+                "location_code": _broker_item_location(entry),
+                "quantity": entry.get("quantity") or 1,
+            }
+        )
+    return items
+
+
+# 日志/本地条目与 Broker 条目对齐时可用的标识，任一命中即视为同一个商品。
+_ITEM_MATCH_FIELDS = ("item_id", "sku_id", "barcode", "code")
+
+
+def _broker_item_index(
+    broker_items: List[Dict[str, object]]
+) -> Dict[str, Dict[str, object]]:
+    index: Dict[str, Dict[str, object]] = {}
+    for item in broker_items:
+        for key in ("item_id", "sku_id", "barcode"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                index.setdefault(value, item)
+    return index
+
+
+def _match_broker_item(
+    task: Dict[str, object], index: Dict[str, Dict[str, object]]
+) -> Optional[Dict[str, object]]:
+    for key in _ITEM_MATCH_FIELDS:
+        value = str(task.get(key) or "").strip()
+        if value and value in index:
+            return index[value]
+    return None
+
+
+def _apply_broker_item_details(
+    tasks: List[Dict[str, object]], broker: Dict[str, object]
+) -> None:
+    """用 Broker 带回的条目信息覆盖子任务的标识与展示字段。
+
+    只在 Broker 给出非空值时覆盖，不会把已有数据抹成空。状态与计时仍由
+    日志解析提供，两边按 item_id / sku_id / 条码 任一命中对齐。
+
+    barcode / sku_id / item_id 也按 Broker 为准覆盖：日志的 item 行编号可能是
+    sku_id，而上游的 barcode/item_id 字段又会回退成那个编号，导致「69码」里装的
+    是 sku_id。Broker 条目同时带真正的 barcode 和 sku_id，是这三个字段的权威来源，
+    比依赖日志里 sku_id->69码 别名的出现时序可靠。
+    """
+    index = _broker_item_index(_broker_order_items(broker))
+    if not index:
+        return
+    for task in tasks:
+        matched = _match_broker_item(task, index)
+        if matched is None:
+            continue
+        for field in ("name", "location_code", "barcode", "sku_id", "item_id"):
+            value = str(matched.get(field) or "").strip()
+            if value:
+                task[field] = value
+        task["broker_matched"] = True
 
 
 def _broker_from_etm_cloud(cloud: Dict[str, object], task_id: str) -> Dict[str, object]:
@@ -1773,7 +2306,8 @@ def _sync_order_from_etm(
                 "platform_order_no": platform_no,
                 "items": items,
                 "source": "etm",
-            }
+            },
+            registered_at=_recovered_order_registered_at(cloud),
         )
         return order, etm
     if order is None:
@@ -1784,7 +2318,8 @@ def _sync_order_from_etm(
                 "platform_order_no": platform_no,
                 "items": items,
                 "source": "etm",
-            }
+            },
+            registered_at=_recovered_order_registered_at(cloud),
         )
         return order, etm
     # Enrich current session without wiping remembered item_states.
@@ -1971,46 +2506,133 @@ def _persist_item_states(order: Optional[Dict[str, object]], tasks: List[Dict[st
         if task_id and active_id and active_id != task_id:
             return
         memory = _ACTIVE_ORDER.setdefault("item_states", {})
+        state_changed = False
         if not isinstance(memory, dict):
             memory = {}
             _ACTIVE_ORDER["item_states"] = memory
+            state_changed = True
         for task in tasks:
             code = str(task.get("code") or "").strip()
             if not code:
                 continue
             previous = memory.get(code) if isinstance(memory.get(code), dict) else None
-            memory[code] = _merge_item_state(previous, task)
+            merged = _merge_item_state(previous, task)
+            if previous != merged:
+                if previous is not None:
+                    previous_stable = {
+                        key: value
+                        for key, value in previous.items()
+                        if key != "elapsed_seconds"
+                    }
+                    merged_stable = {
+                        key: value
+                        for key, value in merged.items()
+                        if key != "elapsed_seconds"
+                    }
+                    if previous_stable == merged_stable:
+                        continue
+                memory[code] = merged
+                state_changed = True
         # Keep item list aligned with observed tasks.
         existing = {
             str(raw.get("code") or raw.get("barcode") or "").strip()
             for raw in (_ACTIVE_ORDER.get("items") or [])
             if isinstance(raw, dict)
         }
+        # 日志的 item 行编号可能是 sku_id（见 _ITEM_START_RE 处注释），而已有条目是按
+        # 69码 建的。code_aliases 是订单已记录的 sku_id -> 69码，先翻译再判重，
+        # 否则同一药品会以两种标识各存一条，虚增子任务数、让进度永远差一格。
+        # 注意：69码 与 sku_id 是两个不同字段，这里只做翻译，不把两者归入同一集合。
+        raw_aliases = _ACTIVE_ORDER.get("code_aliases")
+        aliases = raw_aliases if isinstance(raw_aliases, dict) else {}
         items = list(_ACTIVE_ORDER.get("items") or [])
         if not isinstance(items, list):
             items = []
-        changed = False
+        items_changed = False
         for task in tasks:
             code = str(task.get("code") or "").strip()
-            if not code or code in existing:
+            if not code:
                 continue
-            items.append(
-                {
-                    "index": len(items) + 1,
-                    "code": code,
-                    "item_id": task.get("item_id") or code,
-                    "barcode": task.get("barcode") or code,
-                    "name": task.get("name") or "",
-                    "location_code": task.get("location_code") or "",
-                    "quantity": task.get("quantity") or 1,
-                }
-            )
-            existing.add(code)
-            changed = True
-        if changed:
+            # code 命中别名表的键 ⇒ 它是 sku_id，对应值才是 69码。
+            sku_id = str(task.get("sku_id") or "").strip()
+            barcode_of_code = str(aliases.get(code) or "").strip()
+            if barcode_of_code:
+                sku_id = sku_id or code
+            resolved_code = barcode_of_code or code
+            if resolved_code in existing:
+                continue
+            entry = {
+                "index": len(items) + 1,
+                "code": resolved_code,
+                "item_id": task.get("item_id") or resolved_code,
+                "barcode": task.get("barcode") or resolved_code,
+                "name": task.get("name") or "",
+                "location_code": task.get("location_code") or "",
+                "quantity": task.get("quantity") or 1,
+            }
+            if sku_id:
+                entry["sku_id"] = sku_id
+            items.append(entry)
+            existing.add(resolved_code)
+            items_changed = True
+        if items_changed:
             _ACTIVE_ORDER["items"] = items
             _ACTIVE_ORDER["item_count"] = len(items)
+        if state_changed or items_changed:
+            _save_active_order_unlocked()
+
+
+def _merge_feishu_log_cache_lines(
+    previous: object, raw_logs: object, max_lines: int = _FEISHU_LOG_CACHE_MAX_LINES
+) -> List[str]:
+    """Accumulate log lines seen during polling without duplicating the tail."""
+    lines = [str(line) for line in previous if str(line).strip()] if isinstance(previous, list) else []
+    known = set(lines)
+    for line in str(raw_logs or "").splitlines():
+        value = str(line).strip()
+        if value and value not in known:
+            lines.append(value)
+            known.add(value)
+    return lines[-max_lines:]
+
+
+def _persist_feishu_log_cache(
+    order: Optional[Dict[str, object]], raw_logs: object
+) -> None:
+    """Keep the polling-time log window for the final Feishu document build."""
+    if order is None:
+        return
+    task_id = str(order.get("task_id") or "").strip()
+    if not task_id:
+        return
+    with _ACTIVE_ORDER_LOCK:
+        global _ACTIVE_ORDER
+        if _ACTIVE_ORDER is None:
+            return
+        active_id = str(_ACTIVE_ORDER.get("task_id") or "").strip()
+        if active_id and active_id != task_id:
+            return
+        old_cache = _ACTIVE_ORDER.get("feishu_log_cache")
+        old_lines = old_cache.get("lines") if isinstance(old_cache, dict) else []
+        lines = _merge_feishu_log_cache_lines(old_lines, raw_logs)
+        if isinstance(old_cache, dict) and lines == old_lines:
+            return
+        _ACTIVE_ORDER["feishu_log_cache"] = {
+            "task_id": task_id,
+            "lines": lines,
+            "updated_at": _ts_to_iso(datetime.now(timezone.utc)),
+        }
         _save_active_order_unlocked()
+
+
+def _public_order(order: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    """Hide internal listener/Feishu state from dashboard responses."""
+    if order is None:
+        return None
+    result = deepcopy(order)
+    result.pop("feishu_log_cache", None)
+    result.pop("pending_confirm", None)
+    return result
 
 
 def _prune_stale_item_states(
@@ -2058,8 +2680,6 @@ def _apply_order_lifecycle(
     if order is not None and isinstance(order.get("lifecycle"), dict):
         lifecycle.update(order["lifecycle"])  # type: ignore[arg-type]
 
-    human_seen = bool(parsed.get("human_confirm_seen"))
-    human_closed = bool(parsed.get("human_confirm_closed"))
     human_kind = str(parsed.get("human_confirm_kind") or "")
     order_await = bool(parsed.get("order_await_active"))
     broker_status = str(broker.get("status") or "").strip()
@@ -2078,33 +2698,13 @@ def _apply_order_lifecycle(
         in {"started", "processing", "await_confirm", "await_error"}
         for task in tasks
     )
-    has_pending_only = any(
+    statuses = [str(task.get("status") or "pending") for task in tasks]
+    has_failure = any(status == "failed" for status in statuses)
+    unfinished = has_live_work or any(
         str(task.get("status") or "") == "pending" for task in tasks
     )
-    has_pending_work = any(
-        str(task.get("status") or "") in {"pending", "started", "processing"}
-        for task in tasks
-    )
-    statuses = [str(task.get("status") or "pending") for task in tasks]
-    all_terminal = bool(statuses) and all(
-        status in {"success", "failed", "skipped"} for status in statuses
-    )
-    has_failure = any(status == "failed" for status in statuses)
-    unfinished = has_live_work or has_pending_only
     broker_terminal = bool(broker.get("ok") and broker.get("terminal"))
     broker_ended = bool(broker.get("ok") and broker.get("ended"))
-    broker_waiting_pack = bool(
-        broker.get("ok") and broker_status == "awaiting_pack"
-    )
-
-    # Broker awaiting_pack is authoritative even if the matching prompt has
-    # rolled out of the Docker log tail.
-    if broker_waiting_pack:
-        order_await = True
-        human_kind = "pack"
-    # Stale log-only pack wait must not stick while a later SKU is running.
-    elif has_robot_running and order_await and human_kind == "pack":
-        order_await = False
     item_needs_confirm = any(bool(task.get("needs_confirm")) for task in tasks)
     needs_confirm = item_needs_confirm or order_await
     has_error_wait = bool(
@@ -2112,178 +2712,44 @@ def _apply_order_lifecycle(
         or (needs_confirm and human_kind == "error")
         or (order_await and human_kind == "error")
     )
-    broker_owns_human_state = broker_terminal or broker_status in _BROKER_MANUAL_HELD
-    if broker_owns_human_state:
-        # Broker terminal/manual ownership wins over stale prompt lines in the log tail.
-        order_await = False
-        item_needs_confirm = False
-        needs_confirm = False
-        has_error_wait = False
     # Failure with no in-flight SKU: robot usually stopped; remaining pending
     # will not run unless a later start line reopens the order.
     stopped_on_failure = bool(
         has_failure and not has_live_work and not needs_confirm
     )
 
-    # Order-ending human gates: packing / error. Mid-item confirm must NOT
-    # close the whole order while later SKUs are still unfinished.
-    # Do not treat a past human_kind=="error" alone as an end gate.
-    order_end_gate = has_error_wait or (
-        order_await
-        and human_kind == "pack"
-        and not unfinished
-    )
-
-    # Re-open only when the robot is actively picking again. Error / pack
-    # awaits must keep the order ended and the timer frozen.
-    should_reopen = False
-    if has_robot_running and not broker_ended:
-        should_reopen = True
-    elif (
-        not broker_terminal
-        and has_pending_only
-        and not has_failure
-        and not broker_ended
-        and not has_error_wait
-    ):
-        should_reopen = True
-    if should_reopen:
-        lifecycle["ended"] = False
-        lifecycle["closed"] = False
-        lifecycle["end_reason"] = ""
-        lifecycle["end_source"] = ""
-        lifecycle["closed_at"] = None
-
+    # 订单 lifecycle（ended / closed / end_reason）只由 Broker 状态决定；
+    # 日志解析信号仅服务下方的展示层：label、aggregate、计时冻结与单品标记。
     now_iso = _ts_to_iso(datetime.now(timezone.utc))
     now_dt = datetime.now(timezone.utc)
 
-    # 1) Order-level packing / error confirm => order ended (awaiting key).
-    if order_end_gate:
-        lifecycle["ended"] = True
-        if human_kind == "error":
-            lifecycle["end_reason"] = "human_error"
-            lifecycle["end_source"] = "log"
-        else:
-            lifecycle["end_reason"] = "human_pack"
-            lifecycle["end_source"] = "log"
-        if not lifecycle.get("ended_at"):
-            lifecycle["ended_at"] = parsed.get("human_confirm_at") or parsed.get(
-                "await_at"
-            ) or now_iso
-
-    # 2) Broker order status can also mark ended (remaining pending are abandoned).
+    # Broker 订单状态是 lifecycle 的唯一来源：结束 = Broker 终态/人工持有态。
     # manual_transferred is an operator-owned waiting state, not a terminal state:
     # keep it as the current order until manual-complete reaches the Broker.
     if broker_ended:
         lifecycle["ended"] = True
-        if not lifecycle.get("end_source"):
-            lifecycle["end_source"] = "broker"
+        lifecycle["end_source"] = "broker"
         if broker_status == "error":
-            lifecycle["end_reason"] = lifecycle.get("end_reason") or "broker_error"
-        elif broker_status == "cancel":
-            lifecycle["end_reason"] = lifecycle.get("end_reason") or "broker_cancel"
+            lifecycle["end_reason"] = "broker_error"
+        elif broker_status in {"cancel", "manual_cancel", "manual_canceled"}:
+            lifecycle["end_reason"] = "broker_cancel"
         elif broker_status == "awaiting_pack":
-            lifecycle["end_reason"] = lifecycle.get("end_reason") or "broker_awaiting_pack"
+            lifecycle["end_reason"] = "broker_awaiting_pack"
         elif broker_status in _BROKER_MANUAL_DONE:
             lifecycle["end_reason"] = "broker_manual_completed"
         elif broker_status in _BROKER_MANUAL_HELD:
-            lifecycle["end_reason"] = (
-                lifecycle.get("end_reason") or "broker_transferred"
-            )
+            lifecycle["end_reason"] = "broker_transferred"
         elif broker_status == "success":
-            lifecycle["end_reason"] = lifecycle.get("end_reason") or "broker_success"
+            lifecycle["end_reason"] = "broker_success"
         if not lifecycle.get("ended_at"):
             lifecycle["ended_at"] = now_iso
 
-    # 3) Key pressed after packing/error closes the order. Mid-item confirm does not.
-    # Error confirm closes even if later SKUs never started.
-    if human_closed and human_kind in {"error", "pack"} and (
-        human_kind == "error" or not has_pending_work
-    ):
-        lifecycle["ended"] = True
-        lifecycle["closed"] = True
-        if not lifecycle.get("closed_at"):
-            lifecycle["closed_at"] = (
-                parsed.get("human_confirm_at")
-                or parsed.get("await_at")
-                or now_iso
-            )
-        if human_kind == "error":
-            lifecycle["end_reason"] = "human_error"
-        elif not lifecycle.get("end_reason"):
-            lifecycle["end_reason"] = "human_pack"
-
-    # 4) All sub-tasks finished: picking phase done, but do NOT close yet —
-    # packing confirm / broker terminal is the true order end.
-    if (
-        all_terminal
-        and not needs_confirm
-        and not has_live_work
-        and not has_pending_work
-        and not lifecycle.get("closed")
-    ):
-        lifecycle["ended"] = True
-        if not lifecycle.get("end_reason"):
-            if has_failure:
-                lifecycle["end_reason"] = "items_failed"
-            else:
-                lifecycle["end_reason"] = "items_done"
-        if not lifecycle.get("end_source"):
-            lifecycle["end_source"] = "tasks"
-        if not lifecycle.get("ended_at"):
-            latest_end = None
-            for task in tasks:
-                ended_at = task.get("ended_at")
-                if isinstance(ended_at, str) and ended_at:
-                    if latest_end is None or ended_at > latest_end:
-                        latest_end = ended_at
-            lifecycle["ended_at"] = latest_end or now_iso
-
-    # 4b) Failed item and nothing in flight: freeze as ended even if later
-    # SKUs remain pending (common after manual transfer / abort).
-    if stopped_on_failure and not lifecycle.get("closed"):
-        lifecycle["ended"] = True
-        if not lifecycle.get("end_reason"):
-            lifecycle["end_reason"] = "items_failed"
-        if not lifecycle.get("end_source"):
-            lifecycle["end_source"] = "tasks"
-        if not lifecycle.get("ended_at"):
-            latest_end = None
-            for task in tasks:
-                if str(task.get("status") or "") != "failed":
-                    continue
-                ended_at = task.get("ended_at")
-                if isinstance(ended_at, str) and ended_at:
-                    if latest_end is None or ended_at > latest_end:
-                        latest_end = ended_at
-            lifecycle["ended_at"] = latest_end or now_iso
-
-    # Broker terminal is authoritative. Log tails can retain an old processing
-    # line after completion; that stale line must not keep the order open.
-    if broker_terminal and not needs_confirm:
+    # Broker terminal is authoritative: ended + closed 的唯一来源。
+    if broker_terminal:
         lifecycle["ended"] = True
         lifecycle["closed"] = True
         if not lifecycle.get("closed_at"):
             lifecycle["closed_at"] = now_iso
-        if has_failure and not lifecycle.get("end_reason"):
-            lifecycle["end_reason"] = "items_failed"
-
-    # Safety: keep order open while the robot is actively picking,
-    # or while a success-path order still has untouched pending SKUs.
-    # Error awaits must not reopen the order.
-    if not has_error_wait and not broker_ended:
-        if has_robot_running:
-            lifecycle["ended"] = False
-            lifecycle["closed"] = False
-            lifecycle["closed_at"] = None
-        elif (
-            not lifecycle.get("closed")
-            and has_pending_only
-            and not has_failure
-            and not broker_ended
-            and not stopped_on_failure
-        ):
-            lifecycle["ended"] = False
 
     # Order timer: first 开始处理 → first *active* human-gate speak
     # (needs_confirm). Do not freeze on historical human_seen from old logs,
@@ -2416,7 +2882,8 @@ def _apply_order_lifecycle(
     elif needs_confirm:
         lifecycle["label"] = "待人工确认"
     else:
-        lifecycle["label"] = "工单进行中"
+        # 无工单且无任何子任务活动时应显示空闲，而不是“工单进行中”。
+        lifecycle["label"] = "工单进行中" if (order is not None or tasks) else "空闲"
 
     # Only skip never-started items when the order is truly closed.
     # Do not skip while later SKUs may still arrive on the same task.
@@ -2451,17 +2918,11 @@ def _apply_order_lifecycle(
                 task["active"] = False
                 task["needs_confirm"] = False
 
-    # An ended Broker state always stops stale robot activity. Only terminal or
-    # manually-owned states clear prompts; awaiting_pack is itself a live prompt.
-    # 人工流例外：转人工之后机器人还会自己报错并停在「请求人工处理」上，工单归人管了
-    # 不代表机器人不用放行。这里留着 needs_confirm，「确认处理」才按得下去；标签、计时器
-    # 用的是上面那个已被 broker_owns_human_state 清掉的局部变量，不受影响。
-    manual_flow = broker_status in (_BROKER_MANUAL_HELD | _BROKER_MANUAL_DONE)
+    # Broker only owns the order lifecycle. A matching robot log prompt remains
+    # actionable even after Broker changes state (manual transfer/terminal included).
     if broker_ended:
         for task in tasks:
             task["active"] = False
-            if broker_owns_human_state and not manual_flow:
-                task["needs_confirm"] = False
 
     if order is not None:
         order = deepcopy(order)
@@ -2473,13 +2934,21 @@ def _apply_order_lifecycle(
             if _ACTIVE_ORDER is not None and str(
                 _ACTIVE_ORDER.get("task_id") or ""
             ) == str(order.get("task_id") or ""):
-                _ACTIVE_ORDER["lifecycle"] = deepcopy(lifecycle)
-                if order.get("order_no"):
+                changed = _ACTIVE_ORDER.get("lifecycle") != lifecycle
+                if changed:
+                    _ACTIVE_ORDER["lifecycle"] = deepcopy(lifecycle)
+                if order.get("order_no") and _ACTIVE_ORDER.get("order_no") != order.get(
+                    "order_no"
+                ):
                     _ACTIVE_ORDER["order_no"] = order.get("order_no")
-                _save_active_order_unlocked()
+                    changed = True
+                if changed:
+                    _save_active_order_unlocked()
 
     aggregate = "idle"
-    if lifecycle["closed"]:
+    if needs_confirm:
+        aggregate = "await_error" if human_kind == "error" else "await_confirm"
+    elif lifecycle["closed"]:
         aggregate = (
             "failed"
             if (
@@ -2489,8 +2958,6 @@ def _apply_order_lifecycle(
             )
             else "success"
         )
-    elif needs_confirm:
-        aggregate = "await_error" if human_kind == "error" else "await_confirm"
     elif stopped_on_failure or (
         lifecycle["ended"]
         and (
@@ -2545,11 +3012,14 @@ def _merge_order_items(
                     "index": raw.get("index"),
                     "item_id": raw.get("item_id") or code,
                     "barcode": raw.get("barcode") or code,
+                    "sku_id": raw.get("sku_id") or "",
                     "name": raw.get("name") or "",
                     "location_code": raw.get("location_code")
                     or state.get("location_code")
                     or "",
                     "quantity": raw.get("quantity") or 1,
+                    "group_id": raw.get("group_id") or "",
+                    "group_field": raw.get("group_field") or "",
                     "from_order": True,
                     "code": code,
                 }
@@ -2646,7 +3116,7 @@ def _aggregate_from_tasks(tasks: List[Dict[str, object]]) -> str:
     return "processing"
 
 
-def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
+def _build_dashboard_snapshot(tail: int) -> Dict[str, object]:
     if tail < 50 or tail > 5000:
         raise LogServiceError("tail 必须在 50~5000 之间。", 400)
     settings = load_dashboard_settings()
@@ -2725,9 +3195,6 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
             "log_tail": tail,
             "error": "",
         }
-    # The previous poll persists Broker terminal status. Promote the waiting
-    # order before resolving logs so the dashboard follows Broker's queue.
-    promote_queued_order_if_ready()
     order = get_active_order()
     if mode == "prod":
         order, etm_status = _sync_order_from_etm(order, settings)
@@ -2737,7 +3204,7 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
         "service_status": info.get("status"),
         "service_message": info.get("message") or "",
         "polled_at": _ts_to_iso(datetime.now(timezone.utc)),
-        "order": order,
+        "order": _public_order(order),
         "order_queue": order_queue_status(),
         "dashboard_mode": mode,
         "auto_confirm": auto_confirm,
@@ -2746,6 +3213,11 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
     }
     if not info.get("running"):
         tasks = _merge_order_items(order, {"item_states": {}})
+        # 服务未启动也要把 Broker 带回的名称/库位填上，否则卡片仍是空的。
+        if broker_configured:
+            parent = "" if order is None else str(order.get("task_id") or "")
+            if parent:
+                _apply_broker_item_details(tasks, _fetch_broker_order(parent, mode))
         _persist_item_states(order, tasks)
         done = sum(1 for task in tasks if task.get("status") == "success")
         failed = sum(1 for task in tasks if task.get("status") == "failed")
@@ -2778,18 +3250,40 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
                     "active": 0,
                 },
                 "error": str(info.get("message") or "服务未启动"),
+                "log_available": False,
+                "log_error": "",
             }
         )
         return payload
 
-    logs_payload = fetch_logs(ROBOT_SERVICE_ID, tail, "")
-    raw_logs = str(logs_payload.get("logs") or "")
+    # 日志取不到时不能让整个仪表盘 502：Broker 状态与子任务卡片并不依赖日志，
+    # 仍应正常展示，只把「处理进度/当前子任务」标为不可用，避免把「抓不到日志」
+    # 误示为「尚未开始处理商品」。
+    log_available = True
+    log_error = ""
+    try:
+        logs_payload = fetch_logs(ROBOT_SERVICE_ID, tail, "")
+        raw_logs = str(logs_payload.get("logs") or "")
+    except LogServiceError as error:
+        log_available = False
+        log_error = str(error)
+        raw_logs = ""
+        LOGGER.warning("仪表盘读取机器人日志失败，仅展示 Broker 侧信息：%s", error)
+    payload["log_available"] = log_available
+    payload["log_error"] = log_error
     order = _resolve_active_order(order, raw_logs)
+    order = _reconcile_broker_task_id(order, mode)
+    order = _promote_latest_broker_order(order, mode)
     if mode == "prod":
         # After log discovery, try cloud enrich again for order_no / names.
         order, etm_status = _sync_order_from_etm(order, settings)
         payload["etm"] = etm_status
-    latest_task_id, codes_by_task, last_seen_by_task = _discover_log_tasks(raw_logs)
+    # sku_id → 69码 别名：订单持久化的 ∪ 当前窗口新学的，随后贯穿发现/匹配/解析，
+    # 并写回工单持久化——起始行滚出日志窗口后，结束行依然能归入正确子任务。
+    code_aliases = _merged_code_aliases(order, raw_logs)
+    latest_task_id, codes_by_task, last_seen_by_task = _discover_log_tasks(
+        raw_logs, aliases=code_aliases
+    )
     order_codes = _order_item_codes(order)
     focus_task_id = _match_log_task_for_order(
         order, codes_by_task, latest_task_id, last_seen_by_task
@@ -2802,9 +3296,13 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
         focus_task_id=focus_task_id,
         extra_allowed_codes=order_codes,
         stale_task_ids=stale_task_ids,
+        aliases=code_aliases,
     )
+    if code_aliases:
+        _persist_code_aliases(order, code_aliases)
     if order is None and focus_task_id:
         order = _resolve_active_order(None, raw_logs)
+    _persist_feishu_log_cache(order, raw_logs)
     tasks = _merge_order_items(order, parsed, focus_task_id=focus_task_id)
     # Broker still keyed by registered order task_id when present.
     parent_task_id = ""
@@ -2835,6 +3333,35 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
         except LogServiceError as error:
             etm_status["error"] = str(error)
             payload["etm"] = etm_status
+    # A log-discovered order may only learn its stable order identity from the
+    # first Broker detail response. Reconcile once more in that same snapshot,
+    # then fetch status using the corrected Broker task id.
+    if order is not None and broker.get("ok"):
+        changed_identity = False
+        with _ACTIVE_ORDER_LOCK:
+            global _ACTIVE_ORDER
+            if _ACTIVE_ORDER is not None and str(
+                _ACTIVE_ORDER.get("task_id") or ""
+            ) == str(order.get("task_id") or ""):
+                for key in ("order_no", "platform_order_no"):
+                    value = str(broker.get(key) or "").strip()
+                    if value and not _ACTIVE_ORDER.get(key):
+                        _ACTIVE_ORDER[key] = value
+                        order[key] = value
+                        changed_identity = True
+                if changed_identity:
+                    _save_active_order_unlocked()
+        reconciled = _reconcile_broker_task_id(order, mode)
+        if reconciled is not None:
+            order = reconciled
+        corrected_parent = str(order.get("task_id") or "").strip()
+        if corrected_parent and corrected_parent != parent_task_id:
+            parent_task_id = corrected_parent
+            broker = _fetch_broker_order(parent_task_id, mode)
+    # Broker 状态原值直出，不做本地覆盖。
+    # 子任务的名称/库位以 Broker 带回的下单信息为准，必须在生命周期与计时
+    # 处理之前回填，后续的 focus（大字区）从 tasks 里选，就能自动同源。
+    _apply_broker_item_details(tasks, broker)
     lifecycle, tasks, aggregate = _apply_order_lifecycle(
         order, parsed, broker, tasks
     )
@@ -2879,10 +3406,16 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
 
     focus_code = str(parsed.get("active_code") or "")
     focus = None
-    for task in tasks:
-        if focus_code and str(task.get("code") or "") == focus_code:
-            focus = task
-            break
+    if focus_code:
+        # 日志只能给出条码或编号，不保证是哪一种；任一标识命中就当作处理中。
+        for task in tasks:
+            identities = {
+                str(task.get(key) or "").strip()
+                for key in _ITEM_MATCH_FIELDS
+            }
+            if focus_code in identities:
+                focus = task
+                break
     if focus is None:
         focus = next((task for task in tasks if task.get("needs_confirm")), None)
     if focus is None:
@@ -2907,27 +3440,6 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
     skipped = sum(1 for task in tasks if task.get("status") == "skipped")
     active_count = sum(1 for task in tasks if task.get("active"))
     order_await = bool(parsed.get("order_await_active"))
-    human_kind = str(parsed.get("human_confirm_kind") or "")
-    broker_status = str(broker.get("status") or "")
-    broker_waiting_pack = bool(broker.get("ok") and broker_status == "awaiting_pack")
-    if broker_waiting_pack:
-        order_await = True
-        human_kind = "pack"
-    elif bool(broker.get("terminal")) or broker_status in _BROKER_MANUAL_HELD:
-        order_await = False
-    has_robot_running = any(
-        str(task.get("status") or "")
-        in {"started", "processing"}
-        for task in tasks
-    )
-    # Ignore a stale log-only pack wait while a later SKU is still running.
-    if (
-        has_robot_running
-        and order_await
-        and human_kind == "pack"
-        and not broker_waiting_pack
-    ):
-        order_await = False
     needs_confirm = any(task.get("needs_confirm") for task in tasks) or order_await
     if order_await and aggregate not in {"await_confirm", "await_error"}:
         aggregate = (
@@ -2939,18 +3451,12 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
     await_kind = str(parsed.get("await_kind") or "")
     if not await_kind and focus is not None:
         await_kind = str(focus.get("await_kind") or "")
-    if broker_waiting_pack:
-        await_kind = "pack"
     await_line = str(parsed.get("await_line") or "")
     if not await_line and focus is not None:
         await_line = str(focus.get("await_line") or "")
-    if broker_waiting_pack and not await_line:
-        await_line = "Broker 工单等待人工打包确认"
     await_at = parsed.get("await_at")
     if await_at is None and focus is not None:
         await_at = focus.get("await_at")
-    if broker_waiting_pack and await_at is None:
-        await_at = lifecycle.get("ended_at") or payload.get("polled_at")
     polled_at = str(payload.get("polled_at") or "")
     if not lifecycle.get("ended"):
         _refresh_live_elapsed(tasks, polled_at)
@@ -2971,20 +3477,35 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
             lifecycle["frozen_elapsed_seconds"] = order_elapsed
         else:
             order_elapsed = previous_value
+        expected_task_id = (
+            str(order.get("task_id") or "").strip()
+            if isinstance(order, dict)
+            else str(parent_task_id or "").strip()
+        )
         with _ACTIVE_ORDER_LOCK:
-            if _ACTIVE_ORDER is not None:
+            if _ACTIVE_ORDER is not None and (
+                not expected_task_id
+                or str(_ACTIVE_ORDER.get("task_id") or "").strip()
+                == expected_task_id
+            ):
                 life = _ACTIVE_ORDER.get("lifecycle")
                 if not isinstance(life, dict):
                     life = {}
                     _ACTIVE_ORDER["lifecycle"] = life
-                life["frozen_elapsed_seconds"] = lifecycle.get(
-                    "frozen_elapsed_seconds"
-                )
-                life["timer_stopped_at"] = lifecycle.get("timer_stopped_at")
-                life["timer_stop_reason"] = lifecycle.get("timer_stop_reason")
-                life["ended"] = lifecycle.get("ended")
-                life["closed"] = lifecycle.get("closed")
-                _save_active_order_unlocked()
+                changed = False
+                for key in (
+                    "frozen_elapsed_seconds",
+                    "timer_stopped_at",
+                    "timer_stop_reason",
+                    "ended",
+                    "closed",
+                ):
+                    value = lifecycle.get(key)
+                    if life.get(key) != value:
+                        life[key] = value
+                        changed = True
+                if changed:
+                    _save_active_order_unlocked()
     focus_elapsed = None if focus is None else focus.get("elapsed_seconds")
     dismissed_fingerprint = _dismissed_fingerprint_from_order(order)
     if not dismissed_fingerprint:
@@ -2992,13 +3513,16 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
             _ensure_active_order_loaded()
             dismissed_fingerprint = _dismissed_fingerprint_from_order(_ACTIVE_ORDER)
 
-    payload["order"] = order
+    payload["order"] = _public_order(order)
     payload["order_queue"] = order_queue_status()
     payload.update(
         {
             "status": aggregate,
             "status_label": status_label,
             "needs_confirm": needs_confirm,
+            # 提示被真实确认/关闭（日志出现「继续」类行）才为真；前端据此区分
+            # 「提示被处理」与「提示短暂滚出解析窗口」，避免误判锁死弹窗。
+            "confirm_closed": bool(parsed.get("human_confirm_closed")),
             "dismissed_fingerprint": dismissed_fingerprint,
             "await_kind": await_kind,
             "task_id": parent_task_id,
@@ -3025,6 +3549,7 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
             "etm": etm_status,
             "broker_order": {
                 "ok": bool(broker.get("ok")),
+                "task_id": broker.get("task_id") or "",
                 "status": broker.get("status") or "",
                 "status_label": broker.get("status_label") or "",
                 "ended": bool(broker.get("ended")),
@@ -3068,10 +3593,261 @@ def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
         refreshed = get_active_order()
         if isinstance(refreshed, dict):
             order = refreshed
-    payload["order"] = order
+    payload["order"] = _public_order(order)
     if feishu_result is not None:
         payload["feishu"] = feishu_result
     return payload
+
+
+def _confirmation_fingerprint(snapshot: Mapping[str, object]) -> str:
+    current = snapshot.get("current_item")
+    current = current if isinstance(current, dict) else {}
+    order = snapshot.get("order")
+    order = order if isinstance(order, dict) else {}
+    return "|".join(
+        str(value or "")
+        for value in (
+            order.get("task_id") or snapshot.get("task_id"),
+            snapshot.get("active_code"),
+            current.get("status") or snapshot.get("status"),
+            current.get("await_at") or snapshot.get("await_at"),
+            current.get("await_line") or snapshot.get("await_line"),
+        )
+    )
+
+
+def _reconcile_pending_confirmation(
+    snapshot: Dict[str, object],
+) -> Dict[str, object]:
+    """Persist a prompt until logs explicitly show that robot execution resumed."""
+    with _ACTIVE_ORDER_LOCK:
+        _ensure_active_order_loaded()
+        if _ACTIVE_ORDER is None:
+            return snapshot
+        active_task_id = str(_ACTIVE_ORDER.get("task_id") or "").strip()
+        snapshot_order = snapshot.get("order")
+        snapshot_task_id = str(
+            (
+                snapshot_order.get("task_id")
+                if isinstance(snapshot_order, dict)
+                else ""
+            )
+            or snapshot.get("task_id")
+            or ""
+        ).strip()
+        # A concurrent create invalidates this whole refresh. Do not copy an old
+        # prompt onto the newly-created order while the cache generation retries.
+        if active_task_id and snapshot_task_id and active_task_id != snapshot_task_id:
+            return snapshot
+
+        raw_pending = _ACTIVE_ORDER.get("pending_confirm")
+        pending = deepcopy(raw_pending) if isinstance(raw_pending, dict) else None
+        if pending is not None and str(pending.get("task_id") or "").strip() not in {
+            "",
+            active_task_id,
+        }:
+            _ACTIVE_ORDER.pop("pending_confirm", None)
+            _save_active_order_unlocked()
+            pending = None
+
+        if snapshot.get("confirm_closed"):
+            if pending is not None:
+                _ACTIVE_ORDER.pop("pending_confirm", None)
+                _save_active_order_unlocked()
+            snapshot["needs_confirm"] = False
+            snapshot.pop("confirm_fingerprint", None)
+            return snapshot
+
+        if snapshot.get("needs_confirm"):
+            current = snapshot.get("current_item")
+            current = current if isinstance(current, dict) else {}
+            status = str(snapshot.get("status") or "await_confirm")
+            if status not in {"await_confirm", "await_error"}:
+                status = (
+                    "await_error"
+                    if str(snapshot.get("await_kind") or "") == "error"
+                    else "await_confirm"
+                )
+            detected = {
+                "task_id": active_task_id or snapshot_task_id,
+                "status": status,
+                "kind": str(snapshot.get("await_kind") or current.get("await_kind") or ""),
+                "code": str(
+                    snapshot.get("active_code")
+                    or current.get("code")
+                    or snapshot.get("object_hint")
+                    or ""
+                ),
+                "at": snapshot.get("await_at") or current.get("await_at"),
+                "line": str(snapshot.get("await_line") or current.get("await_line") or ""),
+                "fingerprint": _confirmation_fingerprint(snapshot),
+            }
+            logical_keys = ("task_id", "status", "kind", "code", "line")
+            if isinstance(raw_pending, dict) and all(
+                raw_pending.get(key) == detected.get(key) for key in logical_keys
+            ):
+                pending = deepcopy(raw_pending)
+            else:
+                pending = detected
+            if raw_pending != pending:
+                _ACTIVE_ORDER["pending_confirm"] = deepcopy(pending)
+                _save_active_order_unlocked()
+
+        if pending is None:
+            return snapshot
+        active_order = deepcopy(_ACTIVE_ORDER)
+
+    # A log line may temporarily disappear while Docker reconnects or the tail
+    # rolls. Restore only the confirmation-facing fields; keep current service,
+    # Broker, progress, and timing data from this fresh snapshot.
+    snapshot["needs_confirm"] = True
+    snapshot["confirm_closed"] = False
+    snapshot["status"] = str(pending.get("status") or "await_confirm")
+    snapshot["status_label"] = _STATUS_LABELS.get(
+        str(snapshot["status"]), str(snapshot["status"])
+    )
+    snapshot["await_kind"] = str(pending.get("kind") or "")
+    snapshot["task_id"] = str(pending.get("task_id") or active_task_id)
+    snapshot["active_code"] = str(pending.get("code") or "")
+    snapshot["object_hint"] = str(pending.get("code") or "")
+    snapshot["await_at"] = pending.get("at")
+    snapshot["await_line"] = str(pending.get("line") or "")
+    snapshot["confirm_fingerprint"] = str(pending.get("fingerprint") or "")
+    snapshot["dismissed_fingerprint"] = _dismissed_fingerprint_from_order(active_order)
+    if snapshot.get("order") is None:
+        snapshot["order"] = _public_order(active_order)
+    current = snapshot.get("current_item")
+    if not isinstance(current, dict):
+        current = {"code": snapshot["active_code"]}
+        snapshot["current_item"] = current
+    current["await_kind"] = snapshot["await_kind"]
+    current["await_at"] = snapshot["await_at"]
+    current["await_line"] = snapshot["await_line"]
+    current["needs_confirm"] = True
+    return snapshot
+
+
+def _refresh_dashboard_snapshot(tail: int) -> Dict[str, object]:
+    global _DASHBOARD_CACHE
+    while True:
+        with _DASHBOARD_REFRESH_LOCK:
+            with _DASHBOARD_CACHE_LOCK:
+                generation = _DASHBOARD_CACHE_GENERATION
+            snapshot = _reconcile_pending_confirmation(
+                _build_dashboard_snapshot(tail)
+            )
+            with _DASHBOARD_CACHE_LOCK:
+                if generation != _DASHBOARD_CACHE_GENERATION:
+                    continue
+                _DASHBOARD_CACHE = deepcopy(snapshot)
+                return deepcopy(snapshot)
+
+
+def get_dashboard_snapshot(tail: int) -> Dict[str, object]:
+    """Build a fresh serialized snapshot (used by manual refresh and tests)."""
+    return _refresh_dashboard_snapshot(tail)
+
+
+def get_dashboard_monitor_snapshot(
+    tail: int, *, force: bool = False
+) -> Dict[str, object]:
+    """Read the resident listener cache; synchronously seed it on first request."""
+    if tail < 50 or tail > 5000:
+        raise LogServiceError("tail 必须在 50~5000 之间。", 400)
+    if force:
+        return _refresh_dashboard_snapshot(tail)
+    with _DASHBOARD_CACHE_LOCK:
+        cached = deepcopy(_DASHBOARD_CACHE)
+    if cached is not None:
+        return cached
+    # The worker may already be building. The refresh lock makes concurrent
+    # first requests wait for one builder instead of starting duplicate work.
+    with _DASHBOARD_REFRESH_LOCK:
+        with _DASHBOARD_CACHE_LOCK:
+            cached = deepcopy(_DASHBOARD_CACHE)
+        if cached is not None:
+            return cached
+    return _refresh_dashboard_snapshot(tail)
+
+
+def _dashboard_monitor_delay(snapshot: Optional[Mapping[str, object]]) -> float:
+    if not snapshot or snapshot.get("needs_confirm"):
+        return _DASHBOARD_MONITOR_ACTIVE_SECONDS
+    broker = snapshot.get("broker_order")
+    broker_status = (
+        str(broker.get("status") or "") if isinstance(broker, dict) else ""
+    )
+    if broker_status in {"pending", "dispatched", "running", "awaiting_pack"}:
+        return _DASHBOARD_MONITOR_ACTIVE_SECONDS
+    if str(snapshot.get("status") or "") in {
+        "started",
+        "processing",
+        "await_confirm",
+        "await_error",
+    }:
+        return _DASHBOARD_MONITOR_ACTIVE_SECONDS
+    return _DASHBOARD_MONITOR_IDLE_SECONDS
+
+
+def _dashboard_monitor_loop(stop_event: Event) -> None:
+    last_error = ""
+    while not stop_event.is_set():
+        snapshot: Optional[Dict[str, object]] = None
+        try:
+            snapshot = _refresh_dashboard_snapshot(_DASHBOARD_MONITOR_TAIL)
+            if last_error:
+                LOGGER.info("后台仪表盘监听已恢复。")
+                last_error = ""
+        except Exception as error:  # keep the resident listener alive
+            message = str(error) or error.__class__.__name__
+            if message != last_error:
+                LOGGER.warning("后台仪表盘监听失败，将自动重试：%s", message)
+                last_error = message
+            with _DASHBOARD_CACHE_LOCK:
+                snapshot = deepcopy(_DASHBOARD_CACHE)
+        stop_event.wait(_dashboard_monitor_delay(snapshot))
+
+
+def start_dashboard_monitor() -> None:
+    """Start the process-wide dashboard/log listener once."""
+    global _DASHBOARD_MONITOR_STOP, _DASHBOARD_MONITOR_THREAD
+    with _DASHBOARD_CACHE_LOCK:
+        thread = _DASHBOARD_MONITOR_THREAD
+        if thread is not None and thread.is_alive():
+            return
+        stop_event = Event()
+        thread = Thread(
+            target=_dashboard_monitor_loop,
+            args=(stop_event,),
+            name="ksq-dashboard-monitor",
+            daemon=True,
+        )
+        _DASHBOARD_MONITOR_STOP = stop_event
+        _DASHBOARD_MONITOR_THREAD = thread
+        try:
+            thread.start()
+        except Exception:
+            _DASHBOARD_MONITOR_STOP = None
+            _DASHBOARD_MONITOR_THREAD = None
+            raise
+
+
+def stop_dashboard_monitor(timeout: float = 5.0) -> None:
+    """Stop the resident listener without holding its state lock during join."""
+    global _DASHBOARD_MONITOR_STOP, _DASHBOARD_MONITOR_THREAD
+    with _DASHBOARD_CACHE_LOCK:
+        stop_event = _DASHBOARD_MONITOR_STOP
+        thread = _DASHBOARD_MONITOR_THREAD
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread.ident is not None:
+        thread.join(max(0.0, timeout))
+    with _DASHBOARD_CACHE_LOCK:
+        if _DASHBOARD_MONITOR_THREAD is thread and (
+            thread is None or not thread.is_alive()
+        ):
+            _DASHBOARD_MONITOR_THREAD = None
+            _DASHBOARD_MONITOR_STOP = None
 
 
 _LIST_DEVICES_SCRIPT = r"""
@@ -3204,101 +3980,228 @@ def _normalize_keyboard_device(raw: object) -> str:
     return value
 
 
+def _normalize_bool(raw: object, field: str) -> bool:
+    if not isinstance(raw, bool):
+        raise ValueError(f"{field} 必须是布尔值。")
+    return raw
+
+
 def _default_feishu_settings() -> Dict[str, object]:
     return {
         "enabled": False,
         "app_id": "",
         "app_secret": "",
-        "app_token": "",
-        "table_id": "",
-        "tester": "",
-        "site": DEFAULT_SITE,
-        "field_names": {},
         "forms": [],
-        "auto_form": "",
+        "selected_form": "",
+        "ai": {
+            "enabled": False,
+            "endpoint": "",
+            "api_key": "",
+            "model": "gpt-4o-mini",
+            "max_tokens": 180,
+        },
     }
 
 
-def _normalize_feishu_forms(raw: object) -> List[Dict[str, str]]:
-    """Extra hand-filled forms: {id, name, app_token, table_id}, id unique."""
+def _normalize_feishu_ai(
+    raw: object, previous: object = None, strict: bool = False
+) -> Dict[str, object]:
+    current = {
+        "enabled": False,
+        "endpoint": "",
+        "api_key": "",
+        "model": "gpt-4o-mini",
+        "max_tokens": 180,
+    }
+    if isinstance(previous, dict):
+        if isinstance(previous.get("enabled"), bool):
+            current["enabled"] = previous["enabled"]
+        for key in ("endpoint", "model"):
+            if key in previous:
+                current[key] = str(previous.get(key) or "").strip()
+        if str(previous.get("api_key") or "").strip():
+            current["api_key"] = str(previous.get("api_key") or "").strip()
+        try:
+            current["max_tokens"] = max(
+                64, min(1000, int(previous.get("max_tokens") or 180))
+            )
+        except (TypeError, ValueError):
+            pass
+    if not isinstance(raw, dict):
+        if strict and raw is not None:
+            raise ValueError("feishu.ai 必须是对象。")
+        return current
+    if "enabled" in raw:
+        if strict:
+            current["enabled"] = _normalize_bool(
+                raw.get("enabled"), "feishu.ai.enabled"
+            )
+        elif isinstance(raw.get("enabled"), bool):
+            current["enabled"] = raw["enabled"]
+    for key in ("endpoint", "model"):
+        if key in raw:
+            current[key] = str(raw.get(key) or "").strip()
+    if "api_key" in raw:
+        value = str(raw.get("api_key") or "").strip()
+        if value:
+            current["api_key"] = value
+    if "max_tokens" in raw:
+        try:
+            current["max_tokens"] = max(64, min(1000, int(raw.get("max_tokens") or 180)))
+        except (TypeError, ValueError):
+            pass
+    if not str(current.get("model") or "").strip():
+        current["model"] = "gpt-4o-mini"
+    return current
+
+
+def _parse_feishu_link(raw: object) -> Tuple[str, str]:
+    """Extract the Bitable app/table identifiers from a pasted Feishu URL."""
+    value = str(raw or "").strip()
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("飞书多维表格链接无效，应包含 /base/{app_token}?table={table_id}。")
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    try:
+        base_index = parts.index("base")
+    except ValueError:
+        base_index = -1
+    app_token = parts[base_index + 1].strip() if base_index >= 0 and len(parts) > base_index + 1 else ""
+    table_id = (parse_qs(parsed.query, keep_blank_values=True).get("table") or [""])[0].strip()
+    if not app_token or not table_id:
+        raise ValueError("飞书多维表格链接无效，应包含 /base/{app_token}?table={table_id}。")
+    return app_token, table_id
+
+
+def _canonical_feishu_link(app_token: str, table_id: str) -> str:
+    return "https://feishu.cn/base/%s?table=%s" % (
+        quote(app_token, safe=""),
+        quote(table_id, safe=""),
+    )
+
+
+def _normalize_feishu_forms(raw: object, strict: bool = False) -> List[Dict[str, str]]:
+    """Configured forms: a pasted Feishu link plus one registered payload rule."""
     forms: List[Dict[str, str]] = []
     seen = set()
+    seen_names = set()
+    if strict and not isinstance(raw, list):
+        raise ValueError("飞书 forms 必须是数组。")
     for entry in raw if isinstance(raw, list) else []:
         if not isinstance(entry, dict):
+            if strict:
+                raise ValueError("飞书表单配置格式无效。")
             continue
-        app_token = str(entry.get("app_token") or "").strip()
-        table_id = str(entry.get("table_id") or "").strip()
+        link = str(entry.get("url") or "").strip()
+        app_token = ""
+        table_id = ""
+        if link:
+            try:
+                app_token, table_id = _parse_feishu_link(link)
+            except ValueError:
+                if strict:
+                    raise
+                continue
+        else:
+            # Keep old settings readable; newly saved settings use url.
+            app_token = str(entry.get("app_token") or "").strip()
+            table_id = str(entry.get("table_id") or "").strip()
+            if app_token and table_id:
+                link = _canonical_feishu_link(app_token, table_id)
         name = str(entry.get("name") or "").strip()
         form_id = str(entry.get("id") or "").strip() or name
-        if not form_id or not app_token or not table_id or form_id in seen:
+        if not form_id or not name or not app_token or not table_id:
+            if strict:
+                raise ValueError("请完整填写表单名称和飞书多维表格链接。")
+            continue
+        if form_id in seen or name in seen_names:
+            if strict:
+                raise ValueError("飞书表单名称或 ID 重复：%s" % name)
             continue
         seen.add(form_id)
+        seen_names.add(name)
         forms.append(
             {
                 "id": form_id,
-                "name": name or form_id,
+                "name": name,
+                "url": link,
                 "app_token": app_token,
                 "table_id": table_id,
+                "rule": normalize_rule_id(entry.get("rule")),
             }
         )
     return forms
 
 
 def _normalize_feishu_settings(
-    raw: object, previous: Optional[Dict[str, object]]
+    raw: object, previous: Optional[Dict[str, object]], strict: bool = False
 ) -> Dict[str, object]:
     current = _default_feishu_settings()
     if isinstance(previous, dict):
-        current.update(previous)
+        if isinstance(previous.get("enabled"), bool):
+            current["enabled"] = previous["enabled"]
+        current["app_id"] = str(previous.get("app_id") or "").strip()
+        current["app_secret"] = str(previous.get("app_secret") or "").strip()
+        current["forms"] = _normalize_feishu_forms(previous.get("forms"))
+        current["selected_form"] = str(previous.get("selected_form") or "").strip()
+        current["ai"] = _normalize_feishu_ai(previous.get("ai"))
     if not isinstance(raw, dict):
-        site = str(current.get("site") or "").strip()
-        current["site"] = site if site else DEFAULT_SITE
+        if strict and raw is not None:
+            raise ValueError("feishu 必须是对象。")
+        current["forms"] = _normalize_feishu_forms(current.get("forms"))
+        current["ai"] = _normalize_feishu_ai(None, current.get("ai"))
         return current
     if "enabled" in raw:
-        current["enabled"] = bool(raw.get("enabled"))
-    for key in ("app_id", "app_token", "table_id", "tester", "site"):
-        if key in raw:
-            current[key] = str(raw.get(key) or "").strip()
-    site = str(current.get("site") or "").strip()
-    current["site"] = site if site else DEFAULT_SITE
+        if strict:
+            current["enabled"] = _normalize_bool(raw.get("enabled"), "feishu.enabled")
+        elif isinstance(raw.get("enabled"), bool):
+            current["enabled"] = raw["enabled"]
+    if "app_id" in raw:
+        current["app_id"] = str(raw.get("app_id") or "").strip()
     if "app_secret" in raw:
         secret = str(raw.get("app_secret") or "").strip()
-        # Empty secret keeps the previously saved value.
         if secret:
             current["app_secret"] = secret
-    if "field_names" in raw and isinstance(raw.get("field_names"), dict):
-        names: Dict[str, str] = {}
-        for key, value in raw["field_names"].items():  # type: ignore[union-attr]
-            text = str(value or "").strip()
-            if text:
-                names[str(key)] = text
-        current["field_names"] = names
     if "forms" in raw:
-        current["forms"] = _normalize_feishu_forms(raw.get("forms"))
+        forms = _normalize_feishu_forms(raw.get("forms"), strict)
     else:
-        current["forms"] = _normalize_feishu_forms(current.get("forms"))
-    if "auto_form" in raw:
-        current["auto_form"] = str(raw.get("auto_form") or "").strip()
+        forms = _normalize_feishu_forms(current.get("forms"))
+    current["forms"] = forms
+
+    if "selected_form" in raw:
+        current["selected_form"] = str(raw.get("selected_form") or "").strip()
+    if strict and "ai" in raw and raw.get("ai") is not None and not isinstance(raw.get("ai"), dict):
+        raise ValueError("feishu.ai 必须是对象。")
+    current["ai"] = _normalize_feishu_ai(
+        raw.get("ai"), current.get("ai"), strict=strict
+    )
     known = {str(form.get("id") or "") for form in current["forms"]}
-    if str(current.get("auto_form") or "") not in known:
-        # 指向已删除的表单时退回内置工单表，不会静默提交到不存在的表。
-        current["auto_form"] = ""
+    if str(current.get("selected_form") or "") not in known:
+        current["selected_form"] = str(current["forms"][0]["id"]) if current["forms"] else ""
+    if strict and current["enabled"]:
+        if not str(current.get("app_id") or "").strip() or not str(current.get("app_secret") or "").strip():
+            raise ValueError("启用飞书表单前请配置 App ID 和 App Secret。")
+        if not current["forms"]:
+            raise ValueError("启用飞书表单前请新增并选择一个表单。")
     return current
 
 
 def _public_feishu_settings(feishu: Mapping[str, object]) -> Dict[str, object]:
-    site = str(feishu.get("site") or "").strip() or DEFAULT_SITE
+    ai = feishu.get("ai") if isinstance(feishu.get("ai"), Mapping) else {}
     return {
         "enabled": bool(feishu.get("enabled")),
         "app_id": str(feishu.get("app_id") or ""),
-        "app_token": str(feishu.get("app_token") or ""),
-        "table_id": str(feishu.get("table_id") or ""),
-        "tester": str(feishu.get("tester") or ""),
-        "site": site,
         "has_app_secret": bool(str(feishu.get("app_secret") or "").strip()),
-        "field_names": deepcopy(feishu.get("field_names") or {}),
         "forms": deepcopy(feishu.get("forms") or []),
-        "auto_form": str(feishu.get("auto_form") or ""),
+        "selected_form": str(feishu.get("selected_form") or ""),
+        "form_rules": public_rules(),
+        "ai": {
+            "enabled": bool(ai.get("enabled")),
+            "endpoint": str(ai.get("endpoint") or ""),
+            "model": str(ai.get("model") or "gpt-4o-mini"),
+            "max_tokens": int(ai.get("max_tokens") or 180),
+            "has_api_key": bool(str(ai.get("api_key") or "").strip()),
+        },
     }
 
 
@@ -3311,9 +4214,16 @@ def load_dashboard_settings() -> Dict[str, object]:
         "feishu": _default_feishu_settings(),
     }
     path = DASHBOARD_SETTINGS_FILE
+    payload: object = {}
     if path.is_file():
-        with path.open(encoding="utf-8") as file:
-            payload = json.load(file)
+        try:
+            with path.open(encoding="utf-8") as file:
+                payload = json.load(file)
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            # A damaged settings file must not take down every dashboard/status
+            # endpoint.  Defaults keep the UI usable while the log identifies
+            # the repair target.
+            LOGGER.warning("读取仪表板配置失败，使用默认值 path=%s error=%s", path, error)
         if isinstance(payload, dict):
             try:
                 settings["keyboard_device"] = _normalize_keyboard_device(
@@ -3333,7 +4243,8 @@ def load_dashboard_settings() -> Dict[str, object]:
                 )
             except ValueError:
                 settings["etm_base_url"] = DEFAULT_ETM_BASE_URL
-            settings["auto_confirm"] = bool(payload.get("auto_confirm"))
+            if isinstance(payload.get("auto_confirm"), bool):
+                settings["auto_confirm"] = payload["auto_confirm"]
             settings["feishu"] = _normalize_feishu_settings(
                 payload.get("feishu"), None
             )
@@ -3375,6 +4286,7 @@ def clear_active_order() -> None:
         _ACTIVE_ORDER_LOADED = True
         _ACTIVE_ORDER = None
         _save_active_order_unlocked()
+    _invalidate_dashboard_snapshot_cache()
 
 
 def save_dashboard_settings(
@@ -3396,13 +4308,15 @@ def save_dashboard_settings(
                 payload.get("etm_base_url")
             )
         if "auto_confirm" in payload:
-            current["auto_confirm"] = bool(payload.get("auto_confirm"))
+            current["auto_confirm"] = _normalize_bool(
+                payload.get("auto_confirm"), "auto_confirm"
+            )
         if "feishu" in payload:
             previous_feishu = current.get("feishu")
             if not isinstance(previous_feishu, dict):
                 previous_feishu = _default_feishu_settings()
             current["feishu"] = _normalize_feishu_settings(
-                payload.get("feishu"), previous_feishu
+                payload.get("feishu"), previous_feishu, strict=True
             )
         feishu_settings = current.get("feishu")
         if not isinstance(feishu_settings, dict):
@@ -3453,6 +4367,7 @@ def save_dashboard_settings(
             settings["feishu"] if isinstance(settings.get("feishu"), dict) else {}
         ),
     }
+    _invalidate_dashboard_snapshot_cache()
     return {
         "ok": True,
         "settings": public_settings,
@@ -3640,39 +4555,6 @@ def preview_feishu_submission() -> Dict[str, object]:
         str(settings.get("mode") or _DEFAULT_DASHBOARD_MODE),
         settings,
     )
-
-
-def list_feishu_site_options() -> Dict[str, object]:
-    settings = load_dashboard_settings()
-    return fetch_feishu_site_options(settings)
-
-
-def list_feishu_forms() -> Dict[str, object]:
-    """Extra forms configured in 设置; adding one needs no code change."""
-    settings = load_dashboard_settings()
-    feishu = settings.get("feishu")
-    forms = feishu.get("forms") if isinstance(feishu, dict) else []
-    return {
-        "ok": True,
-        "forms": [
-            {"id": form.get("id", ""), "name": form.get("name", "")}
-            for form in forms if isinstance(form, dict)
-        ],
-    }
-
-
-def describe_feishu_form_by_id(form_id: str) -> Dict[str, object]:
-    settings = load_dashboard_settings()
-    return describe_feishu_form(settings, form_id, get_active_order(), [])
-
-
-def submit_feishu_form_by_id(
-    form_id: str, values: Mapping[str, object]
-) -> Dict[str, object]:
-    settings = load_dashboard_settings()
-    if not isinstance(values, Mapping):
-        raise ValueError("表单内容格式无效。")
-    return submit_feishu_form(settings, form_id, values, get_active_order())
 
 
 def submit_feishu_manual() -> Dict[str, object]:

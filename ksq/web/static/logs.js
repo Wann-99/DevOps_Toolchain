@@ -9,11 +9,14 @@
   const restartButton = document.getElementById("log-restart");
   const stopButton = document.getElementById("log-stop");
   const LOG_TAIL = 800;
+  // 保留策略：持续保留最近 5 分钟，且总数不超过硬上限（刷屏保护）。
+  const LOG_RETENTION_MS = 5 * 60 * 1000;
+  const LOG_MAX_LINES = 5000;
 
   let active = false;
   let eventSource = null;
   let controlBusy = false;
-  let renderedLines = [];
+  let renderedLines = [];  // { text, at }
 
   function escapeHtml(value) {
     return String(value == null ? "" : value)
@@ -35,6 +38,9 @@
   function setStatus(message, isError) {
     statusNode.className = isError ? "meta compact error" : "meta compact";
     statusNode.textContent = isError ? (message || "") : "";
+    if (isError && window.KsqStatus && window.KsqStatus.error) {
+      window.KsqStatus.error(message);
+    }
   }
 
   function selectedServiceLabel() {
@@ -114,7 +120,8 @@
   function lineNode(line) {
     const node = document.createElement("div");
     node.className = "term-line";
-    const cleaned = stripAnsi(line);
+    const value = line && typeof line === "object" ? line.text : line;
+    const cleaned = stripAnsi(value);
     node.innerHTML = cleaned
       ? colorizeLine(escapeHtml(cleaned))
       : "&nbsp;";
@@ -123,8 +130,11 @@
 
   function renderSnapshot(lines) {
     const stick = nearBottom();
+    const now = Date.now();
     renderedLines = Array.isArray(lines)
-      ? lines.map((line) => String(line == null ? "" : line)).slice(-LOG_TAIL)
+      ? lines
+          .map((line) => ({ text: String(line == null ? "" : line), at: now }))
+          .slice(-LOG_MAX_LINES)
       : [];
     bodyNode.innerHTML = "";
     if (!renderedLines.length) {
@@ -140,13 +150,23 @@
   function appendLine(line) {
     const stick = nearBottom();
     if (!renderedLines.length) bodyNode.innerHTML = "";
-    renderedLines.push(String(line == null ? "" : line));
+    renderedLines.push({ text: String(line == null ? "" : line), at: Date.now() });
     bodyNode.appendChild(lineNode(line));
-    while (renderedLines.length > LOG_TAIL) {
+    pruneLines(stick);
+    if (stick) bodyNode.scrollTop = bodyNode.scrollHeight;
+  }
+
+  // 修剪：超过 5 分钟的旧行只在贴底跟随时移除（上翻阅读时不动用户正在看的内容），
+  // 超过硬上限则无条件移除最旧行。
+  function pruneLines(stick) {
+    const now = Date.now();
+    while (renderedLines.length) {
+      const overCap = renderedLines.length > LOG_MAX_LINES;
+      const expired = now - renderedLines[0].at > LOG_RETENTION_MS;
+      if (!overCap && (!expired || !stick)) break;
       renderedLines.shift();
       if (bodyNode.firstChild) bodyNode.removeChild(bodyNode.firstChild);
     }
-    if (stick) bodyNode.scrollTop = bodyNode.scrollHeight;
   }
 
   function updateTermTitle() {
@@ -232,22 +252,23 @@
     if (controlBusy) return;
     const labels = { start: "启动", restart: "重启", stop: "停止" };
     const label = labels[action] || action;
+    const serviceId = String(serviceSelect.value || "");
     const serviceName = selectedServiceLabel();
-    const confirmed = await window.KsqDialog.confirm({
-      title: "确认" + label,
-      message: "确认对服务执行 " + label + "？\n" + serviceName,
-      confirmText: "确定",
-      cancelText: "取消",
-    });
-    if (!confirmed) return;
     controlBusy = true;
-    setControlEnabled(false);
-    setStatus("正在" + label + " " + serviceName + " ...");
     try {
+      setControlEnabled(false);
+      const confirmed = await window.KsqDialog.confirm({
+        title: "确认" + label,
+        message: "确认对服务执行 " + label + "？\n" + serviceName,
+        confirmText: "确定",
+        cancelText: "取消",
+      });
+      if (!confirmed) return;
+      setStatus("正在" + label + " " + serviceName + " ...");
       const response = await fetch("/api/logs/control", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ service: serviceSelect.value, action: action }),
+        body: JSON.stringify({ service: serviceId, action: action }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || label + "失败");
@@ -281,7 +302,9 @@
       } catch (error) {
         setStatus(error.message, true);
       }
-      connectStream(true);
+      // 不清空：新连接的 snapshot 一定先于 line 到达并整体替换内容，
+      // 提前清只会让重进页面时白闪一下。
+      connectStream(false);
     },
     deactivate: () => {
       active = false;

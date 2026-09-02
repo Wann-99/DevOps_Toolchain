@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Dict, List
 from uuid import uuid4
 
-from ksq.order.config import source_prefix
+from ksq.order.config import ORDER_SOURCES, source_prefix
 
 _ORDER_NO_SUFFIX_CHARS = string.ascii_uppercase + string.digits
 
@@ -77,9 +77,7 @@ def build_create_task_body(
     config: Dict[str, object], raw_items: object
 ) -> Dict[str, object]:
     items = normalize_order_items(raw_items)
-    order_source = str(config.get("order_source") or "").strip()
-    if not order_source:
-        raise ValueError("请先选择客户。")
+    order_source = secrets.choice([str(item["value"]) for item in ORDER_SOURCES])
     store_id = str(config.get("store_id") or "").strip()
     if not store_id:
         raise ValueError("store_id 未配置。")

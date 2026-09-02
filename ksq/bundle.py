@@ -8,7 +8,6 @@ from pathlib import Path
 from ksq.constants import (
     PICK_STRATEGY_FILE_NAME,
     SHELVES_FILE_NAME,
-    SHELVES_FILE_PREFIX,
     TOOL_MAPPING_FILE_NAME,
 )
 from ksq.models import BundlePaths
@@ -77,7 +76,8 @@ def extract_bundle_from_zip(zip_path: Path, destination: Path) -> BundlePaths:
         raise ValueError("压缩包中未找到 knowledge JSON 文件。")
     if shelves_file is None:
         raise ValueError(
-            f"压缩包中未找到库位表（文件名以 {SHELVES_FILE_PREFIX} 开头的 .csv）。"
+            "压缩包中未找到库位表（支持 sku-shelves*.csv 或 "
+            "etm_sku_locations_cache*.csv）。"
         )
     return BundlePaths(
         knowledge_directory=knowledge_directory,

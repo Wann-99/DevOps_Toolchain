@@ -30,7 +30,49 @@
   };
 
   let activeMethod = "path";
+  let loadBusy = false;
   let missingSort = { key: "", dir: "" };
+  const EXCLUDE_UNAVAILABLE_KEY = "ksq-exclude-unavailable";
+
+  const loadControls = Array.from(
+    document.querySelectorAll(
+      '#view-load button[type="submit"], #view-load #auto-load-btn, #view-load input[type="file"]'
+    )
+  );
+  const loadControlDisabledState = new WeakMap();
+
+  function setLoadBusy(next) {
+    loadBusy = Boolean(next);
+    loadControls.forEach((control) => {
+      if (loadBusy) {
+        if (!loadControlDisabledState.has(control)) {
+          loadControlDisabledState.set(control, Boolean(control.disabled));
+        }
+        control.disabled = true;
+        return;
+      }
+      if (!loadControlDisabledState.has(control)) return;
+      const wasDisabled = loadControlDisabledState.get(control);
+      loadControlDisabledState.delete(control);
+      // auth.js marks viewer-only controls with data-admin-only; do not
+      // accidentally re-enable those controls after an upload finishes.
+      if (!control.hasAttribute("data-admin-only")) {
+        control.disabled = wasDisabled;
+      }
+    });
+  }
+
+  function beginLoad() {
+    if (loadBusy) return false;
+    setLoadBusy(true);
+    return true;
+  }
+
+  try {
+    excludeUnavailable.checked = global.localStorage.getItem(EXCLUDE_UNAVAILABLE_KEY) === "1";
+  } catch (_error) {
+    // Keep the default when storage is unavailable.
+  }
 
   // 页面打开时的初始状态：任一加载方式成功后，其余面板恢复到该状态。
   const PATH_INPUT_IDS = [
@@ -175,6 +217,25 @@
       unavailableIds: [],
       hasUnavailable: false,
     };
+  }
+
+  function showLoadError(method, title, error) {
+    const message =
+      error && error.message ? String(error.message) : String(error || "操作失败");
+    clearPanelResult(method);
+    renderActivePanel();
+    if (global.KsqDialog && global.KsqDialog.notice) {
+      return global.KsqDialog.notice({
+        title: title,
+        message: message,
+        confirmText: "确认",
+        tone: "error",
+      });
+    }
+    panelState[method].statusHtml =
+      '<p class="error">' + escapeHtml(message) + "</p>";
+    renderActivePanel();
+    return Promise.resolve();
   }
 
   // 恢复面板到页面打开时的初始状态：清空结果卡片/缺少 knowledge 列表，
@@ -360,13 +421,15 @@
     link.remove();
   }
 
-  function exportMissing(kind) {
+  async function exportMissing(kind) {
     const state = panelState[activeMethod];
     const visible = visibleMissingRows(state);
     if (!visible.length) {
-      panelState[activeMethod].statusHtml =
-        '<p class="error">当前没有可导出的缺少 knowledge 药品</p>';
-      renderActivePanel();
+      await showLoadError(
+        activeMethod,
+        "无法导出",
+        new Error("当前没有可导出的缺少 knowledge 药品")
+      );
       return;
     }
     const exclude =
@@ -380,7 +443,14 @@
     );
   }
 
-  excludeUnavailable.addEventListener("change", renderMissingForActive);
+  excludeUnavailable.addEventListener("change", () => {
+    try {
+      global.localStorage.setItem(EXCLUDE_UNAVAILABLE_KEY, excludeUnavailable.checked ? "1" : "0");
+    } catch (_error) {
+      // The filter still applies for the current page.
+    }
+    renderMissingForActive();
+  });
 
   if (missingSection) {
     missingSection.addEventListener("click", (event) => {
@@ -454,6 +524,7 @@
 
   document.getElementById("path-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (!beginLoad()) return;
     clearPanelResult("path");
     renderProgress("path", "加载中...", 0, true);
     try {
@@ -468,60 +539,53 @@
         })
       );
     } catch (error) {
-      panelState.path.statusHtml =
-        '<p class="error">' + escapeHtml(error.message) + "</p>";
-      panelState.path.showNext = false;
-      renderActivePanel();
+      await showLoadError("path", "数据加载失败", error);
+    } finally {
+      setLoadBusy(false);
     }
   });
 
-  function setIfExists(id, value) {
-    if (value && typeof value === "string" && value.trim()) {
-      var el = document.getElementById(id);
-      if (el) el.value = value;
-    }
+  function setPathValue(id, value) {
+    if (typeof value !== "string") return;
+    var el = document.getElementById(id);
+    if (el) el.value = value;
   }
 
   document.getElementById("auto-load-btn").addEventListener("click", async () => {
+    if (!beginLoad()) return;
     clearPanelResult("path");
     renderProgress("path", "一键加载中...", 0, true);
     try {
-      var response = await fetch("/load-auto", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      var data = await response.json();
-      if (!response.ok) {
-        panelState.path.statusHtml =
-          '<p class="error">' + escapeHtml(data.error || "请求失败") + "</p>";
-        panelState.path.showNext = false;
-        renderActivePanel();
-        return;
-      }
+      var data = await postJson("/load-auto", {});
       if (data.paths) {
-        setIfExists("knowledge-path", data.paths.knowledge);
-        setIfExists("shelves-path", data.paths.shelves);
-        setIfExists("unavailable-path", data.paths.unavailable);
-        setIfExists("tool-mapping-path", data.paths.tool_mapping);
-        setIfExists("pick-strategy-path", data.paths.pick_strategy);
+        setPathValue("knowledge-path", data.paths.knowledge);
+        setPathValue("shelves-path", data.paths.shelves);
+        setPathValue("unavailable-path", data.paths.unavailable);
+        setPathValue("tool-mapping-path", data.paths.tool_mapping);
+        setPathValue("pick-strategy-path", data.paths.pick_strategy);
       }
       applyLoad("path", data);
     } catch (error) {
-      panelState.path.statusHtml =
-        '<p class="error">' + escapeHtml(error.message) + "</p>";
-      panelState.path.showNext = false;
-      renderActivePanel();
+      await showLoadError("path", "一键加载失败", error);
+    } finally {
+      setLoadBusy(false);
     }
   });
 
   document.getElementById("bundle-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (!beginLoad()) return;
     const zipFile = document.getElementById("bundle-zip").files[0];
     if (!zipFile) {
-      panelState.bundle.statusHtml = '<p class="error">请先选择配置压缩包</p>';
-      panelState.bundle.showNext = false;
-      renderActivePanel();
+      try {
+        await showLoadError(
+          "bundle",
+          "无法加载配置包",
+          new Error("请先选择配置压缩包")
+        );
+      } finally {
+        setLoadBusy(false);
+      }
       return;
     }
     const form = new FormData();
@@ -531,20 +595,27 @@
     try {
       applyLoad("bundle", await postForm("bundle", "/load-upload", form));
     } catch (error) {
-      panelState.bundle.statusHtml =
-        '<p class="error">' + escapeHtml(error.message) + "</p>";
-      panelState.bundle.showNext = false;
-      renderActivePanel();
+      await showLoadError("bundle", "配置包加载失败", error);
+    } finally {
+      setLoadBusy(false);
     }
   });
 
   document.getElementById("import-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (!beginLoad()) return;
     const input = document.getElementById("import-files");
     const files = Array.from((input && input.files) || []);
     if (!files.length) {
-      panelState.import.statusHtml = '<p class="error">请先选择压缩包或文件</p>';
-      renderActivePanel();
+      try {
+        await showLoadError(
+          "import",
+          "无法导入",
+          new Error("请先选择压缩包或文件")
+        );
+      } finally {
+        setLoadBusy(false);
+      }
       return;
     }
     const form = new FormData();
@@ -556,9 +627,9 @@
     try {
       applyImportResult(await postForm("import", "/api/import", form));
     } catch (error) {
-      panelState.import.statusHtml =
-        '<p class="error">' + escapeHtml(error.message) + "</p>";
-      renderActivePanel();
+      await showLoadError("import", "导入失败", error);
+    } finally {
+      setLoadBusy(false);
     }
   });
 

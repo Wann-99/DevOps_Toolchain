@@ -26,9 +26,9 @@ SESSION_COOKIE = "ksq_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
 _PBKDF2_ITERATIONS = 60000
 
-# 普通用户仅禁止「编辑类」操作：库位编辑保存、导入；设置配置保存由 PUT 拦截。
-# （工作模式切换由 handlers 单独做字段过滤放行；获取 Token 属下单运行时凭据
-# 刷新、不改配置，放行）；其余操作一律正常。
+# 普通用户可以查看地图和遥测，但不能触发底盘动作或修改底盘侧数据。
+# 设置配置保存由 PUT 统一拦截；工作模式切换等非底盘控制字段由 handlers
+# 单独做字段过滤放行。
 VIEWER_FORBIDDEN_POST_PATHS = frozenset(
     {
         "/api/edit/save",
@@ -152,7 +152,12 @@ def verify_credentials(username: str, password: str) -> Optional[Dict[str, str]]
     for entry in load_users():
         if entry["username"] != username:
             continue
-        candidate = _hash_password(password, entry["salt"])
+        try:
+            candidate = _hash_password(password, entry["salt"])
+        except (TypeError, ValueError):
+            # A hand-edited/corrupt salt is a bad credential record, not a
+            # server error.  Treat it as a failed login and keep the API 401.
+            return None
         if hmac.compare_digest(candidate, entry["password_hash"]):
             return dict(entry)
         return None

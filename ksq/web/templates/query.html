@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>筛选查询 - Knowledge 库位查询</title>
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/app.css?v=__APP_VERSION__">
 </head>
 <body>
 <main class="wide">
@@ -42,13 +42,14 @@
       </div>
       <div class="path-fields order-config-grid">
         <label class="path-field"><span>服务地址</span><input id="cfg-server" placeholder="http://localhost:8000"></label>
-        <label class="path-field"><span>客户</span>
-          <select id="cfg-customer">
-            <option value="">—</option>
+        <label class="path-field"><span>客户（可选预置值，也可手动输入）</span>
+          <input id="cfg-customer" list="cfg-customer-options" placeholder="输入客户标识">
+          <datalist id="cfg-customer-options">
             <option value="dashenlin">大参林</option>
             <option value="yaoshibang">药师帮</option>
             <option value="shuyu">漱玉</option>
-          </select>
+            <option value="noematrix">穹彻智能</option>
+          </datalist>
         </label>
         <label class="path-field"><span>Client ID</span><input id="cfg-client-id"></label>
         <label class="path-field"><span>Client Secret</span><input id="cfg-client-secret" type="password" placeholder="已保存则留空不改"></label>
@@ -97,18 +98,10 @@
       </div>
     </div>
 
-    <section id="order-result-panel" class="order-result-panel" hidden>
-      <h2>下单结果</h2>
-      <p class="meta compact" id="order-result-meta"></p>
-      <div class="actions">
-        <input id="last-task-id" placeholder="task_id" style="max-width:420px">
-        <button id="btn-task-detail" class="secondary" type="button">详情</button>
-      </div>
-      <pre class="response-box" id="order-result-body" hidden></pre>
-    </section>
   </section>
 </main>
-<script src="/static/dialog.js"></script>
-<script src="/static/query.js"></script>
+<script src="/static/dialog.js?v=__APP_VERSION__"></script>
+<script src="/static/status.js?v=__APP_VERSION__"></script>
+<script src="/static/query.js?v=__APP_VERSION__"></script>
 </body>
 </html>

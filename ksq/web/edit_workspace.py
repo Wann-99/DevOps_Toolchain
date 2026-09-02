@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from ksq import safe_io
 from ksq.models import Dataset, ShelfEntry
-from ksq.shelves import format_shelf_location, parse_shelf_locations
+from ksq.shelves import format_shelf_location, parse_shelf_locations, shelf_row_id
 from ksq.web import state
 from ksq.web.logs_api import services_for_written_files
 
@@ -32,12 +32,27 @@ SIDE_FILE_KEYS = {
 }
 
 
+def _validate_item_id(item_id: str) -> str:
+    """Keep an item id a single filename component before it reaches disk."""
+    value = str(item_id or "").strip()
+    if (
+        not value
+        or value in {".", ".."}
+        or Path(value).name != value
+        or "/" in value
+        or "\\" in value
+    ):
+        raise ValueError("id 包含无效路径字符。")
+    return value
+
+
 def _read_csv_rows(path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
     with path.open("r", encoding="utf-8-sig", newline="") as file:
         reader = csv.DictReader(file)
         if reader.fieldnames is None:
             raise ValueError("库位表缺少表头。")
-        fieldnames = list(reader.fieldnames)
+        fieldnames = [name.lstrip("\ufeff") for name in reader.fieldnames]
+        reader.fieldnames = fieldnames
         rows = [{key: (row.get(key) or "") for key in fieldnames} for row in reader]
     return fieldnames, rows
 
@@ -92,7 +107,9 @@ def init_workspace_from_loaded() -> None:
         item_id = str(record.get("id") or "").strip()
         if not item_id:
             continue
-        knowledge_by_id[item_id] = deepcopy(dict(record))
+        # Match query rendering: when duplicate records share an id, the
+        # first deterministic record is the one users see and edit.
+        knowledge_by_id.setdefault(item_id, deepcopy(dict(record)))
 
     fieldnames, rows = _read_csv_rows(state.configured_shelves)
     side_files: Dict[str, object] = {}
@@ -319,7 +336,21 @@ def _yes_no_to_bool(text: str) -> bool:
 
 def _rows_for_sku(workspace: Dict[str, object], item_id: str) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = workspace["shelf_rows"]  # type: ignore[assignment]
-    return [row for row in rows if (row.get("sku_code") or "").strip() == item_id]
+    return [row for row in rows if shelf_row_id(row) == item_id]
+
+
+def _side_item_id(
+    workspace: Dict[str, object], item_id: str, existing_ids: object
+) -> str:
+    candidates = [item_id]
+    candidates.extend(
+        str(row.get("sku_code") or "").strip()
+        for row in _rows_for_sku(workspace, item_id)
+    )
+    return next(
+        (candidate for candidate in dict.fromkeys(candidates) if candidate in existing_ids),
+        item_id,
+    )
 
 
 def _row_location(row: Dict[str, str]) -> str:
@@ -362,14 +393,14 @@ def save_field(
     value: str,
     location: Optional[str] = None,
 ) -> Dict[str, object]:
-    item_id = str(item_id or "").strip()
+    item_id = _validate_item_id(item_id)
     field = str(field or "").strip()
     location_text = str(location or "").strip()
     if not item_id:
         raise ValueError("id 不能为空。")
     if not field:
         raise ValueError("field 不能为空。")
-    if field in {"id", "药品名称", "商品编码"}:
+    if field in {"id", "69码", "药品名称", "商品编码"}:
         raise ValueError(f"不允许修改 {field}。")
 
     workspace = state.edit_workspace
@@ -456,23 +487,25 @@ def save_field(
                 )
     elif field == "使用工具":
         mapping: Dict[str, str] = workspace["tool_mapping"]  # type: ignore[assignment]
+        side_item_id = _side_item_id(workspace, item_id, mapping)
         cleaned = text.strip()
         if cleaned in {"", "-"}:
-            mapping.pop(item_id, None)
+            mapping.pop(side_item_id, None)
         else:
-            mapping[item_id] = cleaned
+            mapping[side_item_id] = cleaned
         side = workspace["side_files"]
         if isinstance(side, dict):
             side["obj_tool_mapping.json"] = dict(mapping)
         dirty_tools: Set[str] = workspace["dirty_tool_ids"]  # type: ignore[assignment]
-        dirty_tools.add(item_id)
+        dirty_tools.add(side_item_id)
         workspace["side_dirty"] = True
     elif field == "是否闭环":
         closed: set = workspace["closed_loop_ids"]  # type: ignore[assignment]
+        side_item_id = _side_item_id(workspace, item_id, closed)
         if _yes_no_to_bool(text):
-            closed.add(item_id)
+            closed.add(side_item_id)
         else:
-            closed.discard(item_id)
+            closed.discard(side_item_id)
         side = workspace["side_files"]
         if isinstance(side, dict):
             current = side.get("pick_strategy_obj.json")
@@ -481,14 +514,15 @@ def save_field(
                 current["closed_loop"] = sorted(closed)
                 side["pick_strategy_obj.json"] = current
         dirty_closed: Set[str] = workspace["dirty_closed_loop_ids"]  # type: ignore[assignment]
-        dirty_closed.add(item_id)
+        dirty_closed.add(side_item_id)
         workspace["side_dirty"] = True
     elif field == "是否不可处理":
         unavailable: set = workspace["unavailable_ids"]  # type: ignore[assignment]
+        side_item_id = _side_item_id(workspace, item_id, unavailable)
         if _yes_no_to_bool(text):
-            unavailable.add(item_id)
+            unavailable.add(side_item_id)
         else:
-            unavailable.discard(item_id)
+            unavailable.discard(side_item_id)
         side = workspace["side_files"]
         if isinstance(side, dict):
             current = side.get("unavailabel_obj.json")
@@ -499,7 +533,7 @@ def save_field(
             else:
                 side["unavailabel_obj.json"] = {"unavailable_obj": sorted(unavailable)}
         dirty_unavailable: Set[str] = workspace["dirty_unavailable_ids"]  # type: ignore[assignment]
-        dirty_unavailable.add(item_id)
+        dirty_unavailable.add(side_item_id)
         workspace["side_dirty"] = True
     else:
         record = knowledge_by_id.get(item_id)
@@ -527,18 +561,16 @@ def save_field(
 
 
 def _find_original_shelf_row(
-    rows: List[Dict[str, str]], sku_code: str, location: str
+    rows: List[Dict[str, str]], item_id: str, location: str
 ) -> Dict[str, str]:
-    sku_rows = [
-        row for row in rows if (row.get("sku_code") or "").strip() == sku_code
-    ]
+    sku_rows = [row for row in rows if shelf_row_id(row) == item_id]
     if not sku_rows:
-        raise ValueError(f"库位表中未找到商品编码（sku_code）：{sku_code}")
+        raise ValueError(f"库位表中未找到 SKU：{item_id}")
     if location:
         return _find_row_by_location(sku_rows, location)
     if len(sku_rows) == 1:
         return sku_rows[0]
-    raise ValueError(f"商品 {sku_code} 有多个库位，写回时必须指定库位。")
+    raise ValueError(f"商品 {item_id} 有多个库位，写回时必须指定库位。")
 
 
 def _persist_shelves(workspace: Dict[str, object]) -> Optional[Dict[str, object]]:
@@ -657,14 +689,20 @@ def _persist_knowledge(workspace: Dict[str, object]) -> List[Dict[str, object]]:
         raise ValueError("未配置 knowledge 目录，无法写回。")
     if not knowledge_dir.is_dir():
         raise FileNotFoundError(f"knowledge 目录不存在：{knowledge_dir}")
+    knowledge_root = knowledge_dir.resolve()
     knowledge_by_id: Dict[str, Dict[str, object]] = workspace["knowledge_by_id"]  # type: ignore[assignment]
     indent = int(workspace.get("knowledge_json_indent") or 4)
     results: List[Dict[str, object]] = []
     for item_id, fields in sorted(dirty_fields.items()):
+        item_id = _validate_item_id(item_id)
         record = knowledge_by_id.get(item_id)
         if record is None:
             raise ValueError(f"内存中缺少商品 {item_id} 的 knowledge。")
-        path = knowledge_dir / f"{item_id}.json"
+        path = (knowledge_root / f"{item_id}.json").resolve()
+        try:
+            path.relative_to(knowledge_root)
+        except ValueError as error:
+            raise ValueError("knowledge 目标路径超出配置目录。") from error
         if path.is_file():
             payload, file_indent = _read_json_file(path)
             if not isinstance(payload, dict):
@@ -893,7 +931,7 @@ def build_missing_knowledge_template(item_id: str) -> Dict[str, object]:
 def build_missing_rows_csv_bytes(rows: List[Tuple[str, str, str]]) -> bytes:
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
-    writer.writerow(["sku_code", "name", "locations"])
+    writer.writerow(["id", "name", "locations"])
     for sku, name, locations in rows:
         writer.writerow([sku, name, locations])
     return buffer.getvalue().encode("utf-8-sig")

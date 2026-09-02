@@ -7,7 +7,6 @@ import zipfile
 from io import TextIOWrapper
 from pathlib import Path
 
-from ksq.constants import SHELVES_FILE_PREFIX
 from ksq.knowledge import load_knowledge_from_mapping, load_knowledge_records
 from ksq.models import Dataset, LoadReport, ShelfEntry, ShelfParseResult
 from ksq.naming import is_knowledge_member, is_shelves_file_name
@@ -26,6 +25,7 @@ def build_load_report(
     mapped_row_count: int,
     ignored_knowledge_files: list[str],
     shelf_merge_conflicts: tuple[str, ...] = (),
+    shelf_location_warnings: tuple[str, ...] = (),
 ) -> LoadReport:
     knowledge_ids = {
         str(record["id"])
@@ -51,6 +51,7 @@ def build_load_report(
         shelves_without_knowledge=shelves_without_knowledge,
         ignored_knowledge_files=tuple(ignored_knowledge_files),
         shelf_merge_conflicts=tuple(shelf_merge_conflicts),
+        shelf_location_warnings=tuple(shelf_location_warnings),
     )
 
 
@@ -76,6 +77,7 @@ def build_dataset(knowledge_directory: Path, shelves_file: Path) -> Dataset:
         shelves.mapped_row_count,
         ignored_knowledge_files,
         shelves.merge_conflicts,
+        shelves.missing_location_warnings,
     )
     return Dataset(
         knowledge_records=tuple(knowledge_records),
@@ -114,7 +116,8 @@ def load_dataset_from_zip(zip_path: Path) -> Dataset:
         raise ValueError("压缩包中未找到 knowledge JSON 文件。")
     if shelves is None:
         raise ValueError(
-            f"压缩包中未找到库位表（文件名以 {SHELVES_FILE_PREFIX} 开头的 .csv）。"
+            "压缩包中未找到库位表（支持 sku-shelves*.csv 或 "
+            "etm_sku_locations_cache*.csv）。"
         )
 
     (
@@ -136,6 +139,7 @@ def load_dataset_from_zip(zip_path: Path) -> Dataset:
         shelves.mapped_row_count,
         [],
         shelves.merge_conflicts,
+        shelves.missing_location_warnings,
     )
     return Dataset(
         knowledge_records=tuple(knowledge_records),

@@ -23,6 +23,7 @@ class ShelfEntry:
     shelf_attribute: str
     baffle_height: str
     out_item_id: str
+    sku_code: str = ""
 
 
 class ShelfParseResult(NamedTuple):
@@ -31,6 +32,7 @@ class ShelfParseResult(NamedTuple):
     row_count: int
     mapped_row_count: int
     merge_conflicts: tuple[str, ...]
+    missing_location_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,7 @@ class LoadReport:
     shelves_without_knowledge: tuple[str, ...]
     ignored_knowledge_files: tuple[str, ...]
     shelf_merge_conflicts: tuple[str, ...] = ()
+    shelf_location_warnings: tuple[str, ...] = ()
 
     def summary(self) -> str:
         parts = [
@@ -70,6 +73,10 @@ class LoadReport:
             parts.append(f"已忽略非 knowledge 文件 {len(self.ignored_knowledge_files)}")
         if self.shelf_merge_conflicts:
             parts.append(f"库位行字段冲突 {len(self.shelf_merge_conflicts)}")
+        if self.shelf_location_warnings:
+            parts.append(
+                f"缺少库位字段 {len(self.shelf_location_warnings)} 行（已按空库位加载）"
+            )
         return "；".join(parts) + "。"
 
 

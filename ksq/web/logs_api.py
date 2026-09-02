@@ -14,8 +14,6 @@ from typing import Dict, Iterator, List, Optional, Tuple
 LOG_SERVICES: List[Dict[str, object]] = [
     {"id": "0", "name": "robot_workspace_move_test"},
     {"id": "1", "name": "percept"},
-    {"id": "2", "name": "robotd"},
-    {"id": "3", "name": "CAMID_0"},
 ]
 
 _NAME_BY_ID = {str(item["id"]): str(item["name"]) for item in LOG_SERVICES}
@@ -39,7 +37,10 @@ _DOCKER_ERROR_PREFIXES = (
     "permission denied while trying to connect",
 )
 _FOLLOW_BUFFER_LINES = 5000
-_INITIAL_FOLLOW_TAIL = 800
+_INITIAL_FOLLOW_TAIL = 2500
+# ponytail: 损坏历史的回退窗口与内存上限一致；需要跨损坏段无损回放时改用
+# Docker logging driver/API，CLI 无法同时绕过旧损坏段并保证无限历史。
+_CORRUPT_RESUME_TAIL = _FOLLOW_BUFFER_LINES
 _FOLLOW_RETRY_DELAYS = (1.0, 2.0, 5.0)
 _SSE_HEARTBEAT_SECONDS = 15.0
 _FOLLOWERS_LOCK = threading.Lock()
@@ -176,6 +177,8 @@ def _follow_command(name: str, source: str, checkpoint: str = "") -> List[str]:
         command.extend(["--tail", str(_INITIAL_FOLLOW_TAIL)])
     elif source == "resume" and checkpoint:
         command.extend(["--since", checkpoint])
+    elif source == "resume_tail" and checkpoint:
+        command.extend(["--tail", str(_CORRUPT_RESUME_TAIL)])
     else:
         command.extend(["--tail", "0"])
     command.extend(["--timestamps", name])
@@ -229,7 +232,9 @@ def _consume_follow_process(
 
 
 def _next_corruption_source(source: str) -> str:
-    if source in {"logs", "resume"}:
+    if source == "resume":
+        return "resume_tail"
+    if source in {"logs", "resume_tail"}:
         return "tail0"
     return "attach"
 
@@ -243,9 +248,13 @@ def _next_follow_source(
 ) -> str:
     if corrupt:
         return _next_corruption_source(source)
-    if source in {"tail0", "resume"} and return_code != 0 and appended == 0:
+    if (
+        source in {"tail0", "resume", "resume_tail"}
+        and return_code != 0
+        and appended == 0
+    ):
         return "attach"
-    if source in {"logs", "tail0", "resume"} and has_checkpoint:
+    if source in {"logs", "tail0", "resume", "resume_tail"} and has_checkpoint:
         return "resume"
     return source
 
@@ -288,7 +297,7 @@ def _follow_supervisor(name: str, state: Dict[str, object]) -> None:
             state["generation"] = int(state.get("generation") or 0) + 1
             generation = int(state["generation"])
         command_source = source
-        replay_after = checkpoint if source == "resume" else ""
+        replay_after = checkpoint if source in {"resume", "resume_tail"} else ""
         command = _follow_command(name, command_source, checkpoint)
         try:
             process = _start_follow_process(command)

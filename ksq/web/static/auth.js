@@ -27,6 +27,10 @@
     // 数据查询：库位编辑与保存
     "#view-query [data-role='btn-toggle-edit']",
     "#view-query [data-role='btn-save-edit']",
+    // 测试下单配置由管理员维护；服务端 PUT 同步要求 admin。
+    "#view-test-order #test-order-flag-closed-loop",
+    "#view-test-order #test-order-flag-tool",
+    "#view-test-order #test-order-flag-packaging",
     // 设置：除工作模式切换外的全部配置项（折叠开关除外）
     "#view-settings input:not(#settings-mode-toggle)",
     "#view-settings select",
@@ -57,7 +61,7 @@
     );
     const importForm = document.getElementById("import-form");
     addViewerBanner(
-      importForm ? importForm.closest(".load-panel") : null,
+      importForm ? importForm.closest(".panel") : null,
       "当前为普通用户：导入方式需管理员权限，请使用本机路径或包加载。"
     );
   }

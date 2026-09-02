@@ -160,17 +160,22 @@ async function loadConfig() {
   fillConfigForm(data);
 }
 
+async function saveOrderConfig() {
+  const response = await fetch("/api/order/config", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(readConfigForm()),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "保存失败");
+  fillConfigForm(data);
+  return data;
+}
+
 document.getElementById("btn-save-config").addEventListener("click", async () => {
   setStatus(configStatus, "保存中...");
   try {
-    const response = await fetch("/api/order/config", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(readConfigForm()),
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "保存失败");
-    fillConfigForm(data);
+    await saveOrderConfig();
     setStatus(configStatus, "配置已保存");
   } catch (error) {
     setStatus(configStatus, error.message, true);
@@ -180,11 +185,7 @@ document.getElementById("btn-save-config").addEventListener("click", async () =>
 document.getElementById("btn-test-token").addEventListener("click", async () => {
   setStatus(configStatus, "获取 Token...");
   try {
-    await fetch("/api/order/config", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(readConfigForm()),
-    });
+    await saveOrderConfig();
     const response = await fetch("/api/order/token", { method: "POST" });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "Token 失败");
@@ -239,11 +240,7 @@ document.getElementById("btn-create-order").addEventListener("click", async () =
   setStatus(orderStatus, "创建中...");
   orderResponse.hidden = true;
   try {
-    await fetch("/api/order/config", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(readConfigForm()),
-    });
+    await saveOrderConfig();
     const items = cart.map((item) => ({
       item_id: item.item_id,
       barcode: item.barcode,
@@ -260,16 +257,8 @@ document.getElementById("btn-create-order").addEventListener("click", async () =
     if (!response.ok) throw new Error(data.error || "创建失败");
     showBox(orderResponse, data);
     if (data.task_id) {
-      const queued = !!(
-        data.order_session && Number(data.order_session.queue_position) > 0
-      );
       taskIdInput.value = data.task_id;
-      setStatus(
-        orderStatus,
-        queued
-          ? "下一单已排队，当前单结束后自动执行：task_id=" + data.task_id
-          : "创建成功：task_id=" + data.task_id
-      );
+      setStatus(orderStatus, "创建成功：task_id=" + data.task_id);
     } else {
       setStatus(orderStatus, "已返回响应，请检查是否包含 task_id");
     }

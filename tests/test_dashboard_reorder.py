@@ -71,6 +71,13 @@ class StaleLogTasksTests(unittest.TestCase):
         self.assertIn(TASK_A, stale)
         self.assertNotIn(TASK_B, stale)
 
+    def test_reconciled_robot_task_is_never_stale(self) -> None:
+        order = _order_b()
+        order["robot_task_id"] = TASK_A
+        _latest, _codes, last_seen = dashboard_api._discover_log_tasks(LOG_A)
+        stale = dashboard_api._stale_log_tasks(order, last_seen)
+        self.assertNotIn(TASK_A, stale)
+
     def test_missing_timestamps_keep_legacy_behaviour(self) -> None:
         order = _order_b()
         plain = f"MedicinePickUpTaskItem(code={CODE_1}, task_id={TASK_A}, seq_id=1)"
@@ -108,6 +115,18 @@ class MatchLogTaskTests(unittest.TestCase):
         )
         # No timestamp information: keep the legacy overlap behaviour.
         self.assertEqual(matched, TASK_A)
+
+    def test_broker_order_id_is_not_replaced_by_robot_log_id(self) -> None:
+        order = _order_b()
+        order["lifecycle"] = {"ended": True, "closed": True}
+        log_task = "robot-internal-task"
+        logs = (
+            f"2026-08-17T10:16:35.000Z MedicinePickUpTaskItem(code={CODE_1}, "
+            f"task_id={log_task}, seq_id=1-{log_task}-{CODE_1}-1)"
+        )
+        resolved = dashboard_api._resolve_active_order(order, logs)
+        self.assertEqual(resolved["task_id"], TASK_B)
+        self.assertEqual(resolved["order_no"], "TEST20260817101628822FJ")
 
 
 class ParseWithStaleTasksTests(unittest.TestCase):
@@ -197,6 +216,86 @@ class MergeItemStateTests(unittest.TestCase):
         }
         merged = dashboard_api._merge_item_state(remembered, fresh)
         self.assertEqual(merged["status"], "success")
+
+
+# 新版机器人日志格式：code 是 sku_id、task_id 是 ETM 侧 id，
+# start process object 行同时给出 barcode（69码）。
+NEW_FORMAT_LOG = "\n".join(
+    [
+        "2026-08-18T21:34:23.389Z [INFO] [FVR] TaskItem: MedicinePickUpTaskItem(code=sku-aaa, task_id=8302f452-9b09-11f1-9649-d7a8da00e18f, seq_id=1787060063174.1116-8302f452-9b09-11f1-9649-d7a8da00e18f-sku-aaa-0) succeeded at step: wrapper",
+        "2026-08-18T21:34:23.400Z [INFO] [FVR.NavigateFunc] task_id: 1787060063174.1116-8302f452-9b09-11f1-9649-d7a8da00e18f-sku-aaa-0; current_event: start process object {'code': 'sku-aaa', 'barcode': '6924364520087', 'location_code': '560402'}",
+        "2026-08-18T21:35:00.000Z [INFO] [FVR] item sku-aaa process end time: 1787060100.0",
+        "2026-08-18T21:35:00.100Z [INFO] [FVR] item sku-aaa process duration: 36.6",
+    ]
+)
+
+
+class NewLogFormatTests(unittest.TestCase):
+    """新版机器人日志：sku_id 编号经 barcode 别名翻译成订单的 69码。"""
+
+    def test_sku_id_translated_to_barcode(self) -> None:
+        parsed = dashboard_api.parse_robot_log_text(
+            NEW_FORMAT_LOG,
+            focus_task_id="8302f452-9b09-11f1-9649-d7a8da00e18f",
+            extra_allowed_codes={"6924364520087"},
+        )
+        states = parsed.get("item_states") or {}
+        self.assertIn("6924364520087", states)
+        self.assertNotIn("sku-aaa", states)
+        item = states["6924364520087"]
+        self.assertEqual(item.get("status"), "success")
+        self.assertAlmostEqual(float(item.get("duration_seconds") or 0), 36.6)
+        self.assertEqual(item.get("parent_task_id"), "8302f452-9b09-11f1-9649-d7a8da00e18f")
+
+    def test_discover_tasks_uses_barcode_codes(self) -> None:
+        latest, codes_by_task, _seen = dashboard_api._discover_log_tasks(NEW_FORMAT_LOG)
+        self.assertEqual(latest, "8302f452-9b09-11f1-9649-d7a8da00e18f")
+        self.assertIn("6924364520087", codes_by_task.get("8302f452-9b09-11f1-9649-d7a8da00e18f", []))
+
+    def test_alias_survives_after_start_line_rolls_out(self) -> None:
+        # 起始行已滚出当前窗口、订单上持久化了别名：结束行仍归入 69码 子任务，
+        # 不再产生 sku_id 影子子任务（2 个商品的订单不会显示成 3 个）。
+        order = {"task_id": "T", "code_aliases": {"sku-aaa": "6924364520087"}}
+        late_log = (
+            "2026-08-18T21:40:00.000Z [INFO] [FVR] "
+            "item sku-aaa process end time: 1787060100.0"
+        )
+        aliases = dashboard_api._merged_code_aliases(order, late_log)
+        self.assertEqual(aliases.get("sku-aaa"), "6924364520087")
+        parsed = dashboard_api.parse_robot_log_text(
+            late_log,
+            focus_task_id="8302f452-9b09-11f1-9649-d7a8da00e18f",
+            extra_allowed_codes={"6924364520087"},
+            aliases=aliases,
+        )
+        states = parsed.get("item_states") or {}
+        self.assertIn("6924364520087", states)
+        self.assertNotIn("sku-aaa", states)
+
+    def test_merged_aliases_union_persisted_and_current(self) -> None:
+        order = {"task_id": "T", "code_aliases": {"sku-old": "6911111111111"}}
+        merged = dashboard_api._merged_code_aliases(order, NEW_FORMAT_LOG)
+        self.assertEqual(merged.get("sku-old"), "6911111111111")
+        self.assertEqual(merged.get("sku-aaa"), "6924364520087")
+
+
+class KeyboardPromptCompatibilityTests(unittest.TestCase):
+    def test_target_key_prompt_variants_are_detected(self) -> None:
+        for prompt in (
+            "程序暂停，请按下指定按键 1 后继续",
+            "等待输入目标键 1",
+            "Waiting for the target key 1",
+            "Press any key to continue",
+        ):
+            with self.subTest(prompt=prompt):
+                parsed = dashboard_api.parse_robot_log_text(prompt)
+                self.assertTrue(parsed["needs_confirm"])
+                self.assertTrue(parsed["order_await_active"])
+                self.assertEqual(parsed["await_kind"], "pack")
+
+    def test_unrelated_keyboard_log_does_not_trigger_popup(self) -> None:
+        parsed = dashboard_api.parse_robot_log_text("keyboard device connected")
+        self.assertFalse(parsed["needs_confirm"])
 
 
 if __name__ == "__main__":

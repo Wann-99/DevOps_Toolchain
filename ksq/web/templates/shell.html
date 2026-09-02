@@ -4,14 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>DevOps Toolchain</title>
-  <link rel="icon" type="image/png" href="/static/logo.png">
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="icon" type="image/png" href="/static/logo.png?v=__APP_VERSION__">
+  <link rel="stylesheet" href="/static/app.css?v=__APP_VERSION__">
 </head>
 <body class="app-body">
 <div class="app-shell">
   <aside class="sidebar">
     <div class="sidebar-brand">
-      <img class="sidebar-logo" src="/static/logo.png" alt="DevOps Toolchain">
+      <img class="sidebar-logo" src="/static/logo.png?v=__APP_VERSION__" alt="DevOps Toolchain">
       <div class="sidebar-brand-text">
         <span>DevOps Toolchain</span>
         <small class="sidebar-version">__APP_VERSION__</small>
@@ -34,6 +34,10 @@
         <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="9.5" cy="19.5" r="1.4"/><circle cx="16.5" cy="19.5" r="1.4"/><path d="M3.5 4.5h2l2.3 10.6a1.2 1.2 0 0 0 1.2.9h7.6a1.2 1.2 0 0 0 1.2-.9l1.6-7.1H6"/></svg>
         <span class="nav-label">药品下单</span>
       </button>
+      <button type="button" class="nav-item" data-view="order-ops" title="订单操作">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.2 4.2 0 0 0-5.6 5.6l-5 5a1.6 1.6 0 0 0 2.2 2.2l5-5a4.2 4.2 0 0 0 5.6-5.6l-2.7 2.7-2.2-2.2z"/></svg>
+              <span class="nav-label">订单操作</span>
+            </button>
       <button type="button" class="nav-item" data-view="map" title="地图导航">
         <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-7-6.1-7-11.5A7 7 0 0 1 19 9.5C19 14.9 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.4"/></svg>
         <span class="nav-label">地图导航</span>
@@ -116,7 +120,6 @@
             <div class="dash-order-tags">
               <span class="dash-order-tag" id="dash-order-life">进行中</span>
               <span class="dash-order-tag is-broker" id="dash-order-broker">工单状态 —</span>
-              <span class="dash-order-tag is-queue" id="dash-order-queue" hidden>下一单等待中</span>
             </div>
           </div>
           <div class="dash-order-progress">
@@ -202,11 +205,15 @@
               <option value="dispatched">已拆单</option>
               <option value="running">运行中</option>
               <option value="awaiting_pack">等待打包</option>
+              <option value="manual_claimed_in_progress">人工处理中</option>
+              <option value="manual_claimed_completed">人工处理完成</option>
               <option value="manual_transferred">人工转单</option>
               <option value="manual_transferred_completed">人工转单完成</option>
               <option value="success">完成</option>
               <option value="error">失败</option>
               <option value="cancel">已取消</option>
+              <option value="manual_cancel">人工取消</option>
+              <option value="manual_canceled">人工取消（manual_canceled）</option>
             </select>
             <select id="dash-order-list-size" aria-label="每页数量">
               <option value="10" selected>10 条</option>
@@ -241,16 +248,118 @@
         <div class="dash-feed-list" id="dash-events"></div>
       </div>
 
-      <div id="dash-confirm-modal" class="dash-modal" hidden>
-        <div class="dash-modal-panel" role="dialog" aria-modal="true" aria-labelledby="dash-modal-title">
-          <div class="dash-modal-badge" id="dash-modal-badge">待确认</div>
-          <h2 id="dash-modal-title">需要人工确认</h2>
-          <p class="meta" id="dash-modal-body">日志检测到确认/报错请求，点击确认将继续流程。</p>
-          <pre class="dash-modal-line" id="dash-modal-line"></pre>
-          <div class="actions">
-            <button id="dash-modal-dismiss" class="secondary" type="button">稍后处理</button>
-            <button id="dash-modal-confirm" class="primary" type="button">确认</button>
+    </section>
+
+<section id="view-order-ops" class="view" hidden>
+      <h1>订单操作</h1>
+
+      <div class="ops-card collapsed" id="ops-card-update">
+        <div class="ops-card-header" data-ops-toggle="ops-card-update">
+          <div class="ops-header-left"><span class="ops-method ops-method-put">PUT</span><h2>更新订单任务，下发零售单信息 <span class="ops-opt">(可选)</span></h2></div>
+          <div class="ops-header-right"><span class="ops-arrow">&#9660;</span></div>
+        </div>
+        <div class="ops-card-body">
+          <div class="ops-form-row">
+            <label class="ops-field"><span>task_id <b class="ops-req">*</b></span><input id="ops-update-task-id" type="text" placeholder="任务 ID"></label>
+            <label class="ops-field"><span>retail_order_id</span><input id="ops-retail-order-id" type="text" placeholder="零售单号"></label>
+            <label class="ops-field"><span>retail_order_time</span><input id="ops-retail-order-time" type="text" placeholder="零售单时间"></label>
           </div>
+          <button id="ops-update-submit" class="secondary" type="button">发送请求</button>
+          <div class="ops-response" id="ops-resp-update" hidden></div>
+        </div>
+      </div>
+
+      <div class="ops-card collapsed" id="ops-card-cancel">
+        <div class="ops-card-header" data-ops-toggle="ops-card-cancel">
+          <div class="ops-header-left"><span class="ops-method ops-method-post">POST</span><h2>取消任务 <span class="ops-opt">(可选)</span></h2></div>
+          <div class="ops-header-right"><span class="ops-arrow">&#9660;</span></div>
+        </div>
+        <div class="ops-card-body">
+          <div class="ops-form-row">
+            <label class="ops-field"><span>task_id <b class="ops-req">*</b></span><input id="ops-cancel-task-id" type="text" placeholder="任务 ID"></label>
+            <label class="ops-field"><span>cancel_type（取消类型）</span><input id="ops-cancel-type" type="text" value="user"></label>
+            <label class="ops-field" style="flex:2"><span>cancel_reason（取消原因）</span><input id="ops-cancel-reason" type="text" value="直接取消"></label>
+          </div>
+          <button id="ops-cancel-submit" class="secondary" type="button">取消任务</button>
+          <div class="ops-response" id="ops-resp-cancel" hidden></div>
+        </div>
+      </div>
+
+      <div class="ops-card collapsed" id="ops-card-claim">
+        <div class="ops-card-header" data-ops-toggle="ops-card-claim">
+          <div class="ops-header-left"><span class="ops-method ops-method-post">POST</span><h2>人工转单 <span class="ops-opt">(可选)</span></h2></div>
+          <div class="ops-header-right"><span class="ops-arrow">&#9660;</span></div>
+        </div>
+        <div class="ops-card-body">
+          <div class="ops-form-row">
+            <label class="ops-field"><span>order_no <b class="ops-req">*</b></span><input id="ops-claim-order-no" type="text" placeholder="订单号"></label>
+          </div>
+          <button id="ops-claim-submit" class="secondary" type="button">发送请求</button>
+          <div class="ops-response" id="ops-resp-claim" hidden></div>
+        </div>
+      </div>
+
+      <div class="ops-card collapsed" id="ops-card-complete">
+        <div class="ops-card-header" data-ops-toggle="ops-card-complete">
+          <div class="ops-header-left"><span class="ops-method ops-method-post">POST</span><h2>人工完成订单 <span class="ops-opt">(可选)</span></h2></div>
+          <div class="ops-header-right"><span class="ops-arrow">&#9660;</span></div>
+        </div>
+        <div class="ops-card-body">
+          <div class="ops-form-row">
+            <label class="ops-field"><span>order_no <b class="ops-req">*</b></span><input id="ops-complete-order-no" type="text" placeholder="订单号"></label>
+          </div>
+          <button id="ops-complete-submit" class="secondary" type="button">发送请求</button>
+          <div class="ops-response" id="ops-resp-complete" hidden></div>
+        </div>
+      </div>
+
+      <div class="ops-card collapsed" id="ops-card-modes">
+        <div class="ops-card-header" data-ops-toggle="ops-card-modes">
+          <div class="ops-header-left"><span class="ops-method ops-method-get">GET</span><h2>获取所有业务模式 <span class="ops-opt">(与门店无关)</span></h2></div>
+          <div class="ops-header-right"><span class="ops-arrow">&#9660;</span></div>
+        </div>
+        <div class="ops-card-body">
+          <button id="ops-modes-submit" class="secondary" type="button">查询</button>
+          <div class="ops-response" id="ops-resp-modes" hidden></div>
+        </div>
+      </div>
+
+      <div class="ops-card collapsed" id="ops-card-config-get">
+        <div class="ops-card-header" data-ops-toggle="ops-card-config-get">
+          <div class="ops-header-left"><span class="ops-method ops-method-get">GET</span><h2>获取门店业务配置</h2></div>
+          <div class="ops-header-right"><span class="ops-arrow">&#9660;</span></div>
+        </div>
+        <div class="ops-card-body">
+          <div class="ops-form-row">
+            <label class="ops-field"><span>store_id</span><input id="ops-config-get-store-id" type="text" placeholder="门店 ID（留空用配置门店）"></label>
+          </div>
+          <button id="ops-config-get-submit" class="secondary" type="button">查询</button>
+          <div class="ops-response" id="ops-resp-config-get" hidden></div>
+        </div>
+      </div>
+
+      <div class="ops-card collapsed" id="ops-card-config-put">
+        <div class="ops-card-header" data-ops-toggle="ops-card-config-put">
+          <div class="ops-header-left"><span class="ops-method ops-method-put">PUT</span><h2>更新门店业务配置</h2></div>
+          <div class="ops-header-right"><span class="ops-arrow">&#9660;</span></div>
+        </div>
+        <div class="ops-card-body">
+          <div class="ops-form-row">
+            <label class="ops-field"><span>store_id</span><input id="ops-config-store-id" type="text" placeholder="门店 ID（留空用配置门店）"></label>
+            <label class="ops-field"><span>business_mode_code</span><select id="ops-config-mode"><option value="">不修改</option></select></label>
+            <label class="ops-field"><span>is_accepting_orders</span>
+              <select id="ops-config-accepting">
+                <option value="">不修改</option>
+                <option value="true">true — 接单</option>
+                <option value="false">false — 不接单</option>
+              </select>
+            </label>
+          </div>
+          <div class="ops-actions">
+            <button id="ops-config-fill" class="secondary" type="button">查询并回填当前配置</button>
+            <button id="ops-config-submit" class="secondary" type="button">发送请求</button>
+          </div>
+          <div class="ops-response" id="ops-resp-config-put" hidden></div>
         </div>
       </div>
     </section>
@@ -268,7 +377,7 @@
             <p class="meta compact">从本机路径加载后可使用全部功能（查询、编辑、下单等）。</p>
             <div class="path-fields">
               <label class="path-field"><span>Knowledge 目录</span><input id="knowledge-path" value="__KNOWLEDGE__" required></label>
-              <label class="path-field"><span>库位表（sku-shelves*.csv）</span><input id="shelves-path" value="__SHELVES__" required></label>
+              <label class="path-field"><span>库位表（sku-shelves* / etm_sku_locations_cache*）</span><input id="shelves-path" value="__SHELVES__" required></label>
               <label class="path-field"><span>不可处理列表</span><input id="unavailable-path" value="__UNAVAILABLE__"></label>
               <label class="path-field"><span>工具映射</span><input id="tool-mapping-path" value="__TOOL_MAPPING__"></label>
               <label class="path-field"><span>闭环吸取列表</span><input id="pick-strategy-path" value="__PICK_STRATEGY__"></label>
@@ -345,7 +454,7 @@
         <div class="missing-table-wrap">
           <table>
             <thead><tr>
-                  <th><button type="button" class="th-sort" data-sort-key="0">69码<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
+                  <th><button type="button" class="th-sort" data-sort-key="0">SKU ID / 69码<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
                   <th><button type="button" class="th-sort" data-sort-key="1">药品名称<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
                   <th><button type="button" class="th-sort" data-sort-key="2">库位<span class="sort-ind" aria-hidden="true"><span class="sort-up"></span><span class="sort-down"></span></span></button></th>
                 </tr></thead>
@@ -491,16 +600,6 @@
             <button data-role="next-page" class="secondary" type="button">下一页</button>
           </div>
         </div>
-        <div data-role="order-result-panel" class="order-result-panel" hidden>
-          <h2>下单结果</h2>
-          <p class="meta compact" data-role="order-result-meta"></p>
-          <p class="order-status-line" data-role="order-status-line" hidden></p>
-          <div class="actions">
-            <input data-role="last-task-id" placeholder="task_id" style="max-width:420px">
-            <button data-role="btn-task-detail" class="secondary" type="button">刷新状态</button>
-          </div>
-          <pre class="response-box" data-role="order-result-body" hidden></pre>
-        </div>
       </div>
     </section>
 
@@ -573,7 +672,7 @@
           </div>
           <div class="toolbar-right">
             <button id="test-order-select-all-pending" class="secondary" type="button">全选</button>
-            <button id="test-order-clear-pending" class="secondary" type="button">清空选择</button>
+            <button id="test-order-clear-pending" class="secondary" type="button">清空待下单 SKU</button>
           </div>
         </div>
         <div class="table-wrap table-wrap-sticky-x test-order-table-wrap" data-sticky-table>
@@ -600,7 +699,8 @@
           <div class="toolbar-right">
             <button id="test-order-export-ordered" class="secondary" type="button">导出已下单 SKU</button>
             <button id="test-order-select-all-ordered" class="secondary" type="button">全选</button>
-            <button id="test-order-clear-ordered" class="secondary" type="button">清空选择</button>
+            <button id="test-order-restore" class="secondary" type="button">恢复到待下单</button>
+            <button id="test-order-clear-ordered" class="secondary" type="button">清空已下单 SKU</button>
           </div>
         </div>
         <div class="table-wrap table-wrap-sticky-x test-order-table-wrap" data-sticky-table>
@@ -686,16 +786,17 @@
           </div>
           <div class="path-fields order-config-grid">
             <label class="path-field"><span>服务地址</span><input id="settings-cfg-server" placeholder="http://localhost:8000"></label>
-            <label class="path-field"><span>客户</span>
-              <select id="settings-cfg-customer">
-                <option value="">—</option>
+            <label class="path-field"><span>客户（可选预置值，也可手动输入）</span>
+              <input id="settings-cfg-customer" list="settings-customer-options" placeholder="输入客户标识">
+              <datalist id="settings-customer-options">
                 <option value="dashenlin">大参林</option>
                 <option value="yaoshibang">药师帮</option>
                 <option value="shuyu">漱玉</option>
-              </select>
+                <option value="noematrix">穹彻智能</option>
+              </datalist>
             </label>
             <label class="path-field"><span id="settings-cfg-id-label">Client ID</span><input id="settings-cfg-client-id"></label>
-            <label class="path-field"><span id="settings-cfg-secret-label">Client Secret</span><input id="settings-cfg-client-secret" type="password" placeholder="已保存则留空不改"></label>
+            <label class="path-field"><span id="settings-cfg-secret-label">Client Secret</span><span class="secret-field"><input id="settings-cfg-client-secret" type="password" placeholder="已保存则留空不改"><button type="button" class="secret-toggle" id="settings-cfg-secret-toggle" aria-label="显示密钥" aria-pressed="false" title="显示密钥">👁</button></span></label>
             <label class="path-field"><span>门店</span>
               <select id="settings-cfg-store-select"><option value="">— 手动填写 store_id 或先获取门店 —</option></select>
             </label>
@@ -751,31 +852,41 @@
           </label>
         </div>
         <div class="settings-fold-body" data-fold-body hidden>
-          <div class="path-fields order-config-grid">
-            <label class="path-field">
-              <span>测试场地（选项）</span>
-              <select id="settings-feishu-site">
-                <option value="药师帮-广州">药师帮-广州</option>
-              </select>
-            </label>
-            <label class="path-field"><span>测试人员 open_id（可选）</span><input id="settings-feishu-tester" placeholder="ou_xxx，人员字段不能填姓名"></label>
-            <label class="path-field"><span>App ID</span><input id="settings-feishu-app-id" placeholder="cli_xxx"></label>
-            <label class="path-field"><span>App Secret</span><input id="settings-feishu-app-secret" type="password" placeholder="已保存则留空不改"></label>
-            <label class="path-field"><span>多维表格 app_token</span><input id="settings-feishu-app-token" placeholder="bascn..."></label>
-            <label class="path-field"><span>数据表 table_id</span><input id="settings-feishu-table-id" placeholder="tbl..."></label>
+          <div class="feishu-settings-stack">
+            <fieldset class="feishu-settings-group">
+              <legend>连接凭据</legend>
+              <p class="feishu-settings-help">只需配置一次，用于调用飞书接口。</p>
+              <div class="path-fields order-config-grid">
+                <label class="path-field"><span>App ID</span><input id="settings-feishu-app-id" placeholder="cli_xxx"></label>
+                <label class="path-field"><span>App Secret</span><input id="settings-feishu-app-secret" type="password" placeholder="已保存则留空不改"></label>
+              </div>
+            </fieldset>
+
+            <fieldset class="feishu-settings-group">
+              <legend>表单管理</legend>
+              <p class="feishu-settings-help">填写表单名称并粘贴飞书多维表格链接，系统会自动读取 app_token 和 table_id；字段不同的表单可选择对应填写规则。</p>
+              <div class="feishu-form-list" id="settings-feishu-form-list"></div>
+              <div class="feishu-form-actions">
+                <button id="settings-feishu-add-form" class="secondary" type="button" title="新增表单">+ 新增表单</button>
+              </div>
+              <label class="path-field">
+                <span>当前表单</span>
+                <select id="settings-feishu-selected-form"><option value="">请先新增表单</option></select>
+              </label>
+            </fieldset>
+
+            <details class="feishu-optional-group" id="settings-feishu-ai-options">
+              <summary>可选：异常 AI 分析</summary>
+              <p class="feishu-settings-help">仅异常场景调用 AI；未配置时 AI 字段留空，其余确定性字段仍可提交。</p>
+              <label class="inline-check feishu-ai-toggle"><input id="settings-feishu-ai-enabled" type="checkbox"><span>启用异常 AI 分析（仅 Warning/失败调用）</span></label>
+              <div class="path-fields order-config-grid">
+                <label class="path-field"><span>AI 接口（OpenAI 兼容，可选）</span><input id="settings-feishu-ai-endpoint" placeholder="留空使用默认接口"></label>
+                <label class="path-field"><span>AI 模型</span><input id="settings-feishu-ai-model" placeholder="gpt-4o-mini"></label>
+                <label class="path-field"><span>AI API Key</span><input id="settings-feishu-ai-api-key" type="password" placeholder="已保存则留空不改"></label>
+              </div>
+            </details>
           </div>
-          <label class="path-field">
-            <span>其他表单（每行一个：名称|app_token|table_id）</span>
-            <textarea id="settings-feishu-forms" rows="3" placeholder="药房功能测试|bascn...|tbl..."></textarea>
-          </label>
-          <label class="path-field">
-            <span>自动提交到（工单内容写入哪张表）</span>
-            <select id="settings-feishu-auto-form">
-              <option value="">工单表（内置）</option>
-            </select>
-          </label>
           <div class="actions">
-            <button id="settings-feishu-sync-sites" class="secondary" type="button">同步场地</button>
             <button id="settings-feishu-submit" class="secondary" type="button">提交当前工单</button>
             <button id="settings-feishu-save" class="primary" type="button">保存配置</button>
           </div>
@@ -949,6 +1060,7 @@
         </aside>
       </div>
     </section>
+
     <section id="view-logs" class="view" hidden>
       <h1>日志查询</h1>
       <div class="card">
@@ -959,8 +1071,6 @@
               <select id="log-service">
                 <option value="0">robot_workspace_move_test</option>
                 <option value="1">percept</option>
-                <option value="2">robotd</option>
-                <option value="3">CAMID_0</option>
               </select>
             </label>
             <span id="log-service-status" class="meta compact log-service-status">—</span>
@@ -988,17 +1098,31 @@
     </section>
   </div>
 </div>
-<script src="/static/dialog.js"></script>
-<script src="/static/status.js"></script>
-<script src="/static/auth.js"></script>
-<script src="/static/shell.js"></script>
-<script src="/static/load.js"></script>
-<script src="/static/catalog.js"></script>
-<script src="/static/test-order.js"></script>
-<script src="/static/logs.js"></script>
-<script src="/static/dashboard.js"></script>
-<script src="/static/map.js"></script>
-<script src="/static/settings.js"></script>
-<script src="/static/app-init.js"></script>
+<div id="dash-confirm-modal" class="dash-modal" hidden>
+  <div class="dash-modal-panel" role="dialog" aria-modal="true" aria-labelledby="dash-modal-title">
+    <div class="dash-modal-badge" id="dash-modal-badge">待确认</div>
+    <h2 id="dash-modal-title">需要人工确认</h2>
+    <p class="meta" id="dash-modal-body">日志检测到确认/报错请求，点击确认将继续流程。</p>
+    <pre class="dash-modal-line" id="dash-modal-line"></pre>
+    <div class="actions">
+      <button id="dash-modal-dismiss" class="secondary" type="button">稍后处理</button>
+      <button id="dash-modal-confirm" class="primary" type="button">确认</button>
+    </div>
+  </div>
+</div>
+<script src="/static/dialog.js?v=__APP_VERSION__"></script>
+<script src="/static/status.js?v=__APP_VERSION__"></script>
+<script src="/static/auth.js?v=__APP_VERSION__"></script>
+<script src="/static/shell.js?v=__APP_VERSION__"></script>
+<script src="/static/load.js?v=__APP_VERSION__"></script>
+<script src="/static/item-identity.js?v=__APP_VERSION__"></script>
+<script src="/static/catalog.js?v=__APP_VERSION__"></script>
+<script src="/static/test-order.js?v=__APP_VERSION__"></script>
+<script src="/static/logs.js?v=__APP_VERSION__"></script>
+<script src="/static/dashboard.js?v=__APP_VERSION__"></script>
+<script src="/static/map.js?v=__APP_VERSION__"></script>
+<script src="/static/order-ops.js?v=__APP_VERSION__"></script>
+<script src="/static/settings.js?v=__APP_VERSION__"></script>
+<script src="/static/app-init.js?v=__APP_VERSION__"></script>
 </body>
 </html>

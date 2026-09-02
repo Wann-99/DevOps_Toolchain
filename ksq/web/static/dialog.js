@@ -1,5 +1,6 @@
 (function (global) {
   let root = null;
+  let panelNode = null;
   let titleNode = null;
   let bodyNode = null;
   let fieldWrap = null;
@@ -44,6 +45,7 @@
       "</div>" +
       "</div>";
     document.body.appendChild(root);
+    panelNode = root.querySelector(".ksq-dialog-panel");
     titleNode = root.querySelector("#ksq-dialog-title");
     bodyNode = root.querySelector("#ksq-dialog-body");
     fieldWrap = root.querySelector("#ksq-dialog-field");
@@ -111,8 +113,11 @@
       previous(mode === "prompt" ? null : false);
     }
     mode = nextMode;
+    panelNode.classList.toggle("is-error", opts.tone === "error");
+    panelNode.setAttribute("role", opts.tone === "error" ? "alertdialog" : "dialog");
     titleNode.textContent =
       opts.title != null ? String(opts.title) : nextMode === "prompt" ? "请输入" : "请确认";
+    titleNode.setAttribute("aria-label", titleNode.textContent);
     bodyNode.textContent = opts.message != null ? String(opts.message) : "";
     bodyNode.hidden = !bodyNode.textContent;
     metaNode.textContent = opts.meta != null ? String(opts.meta) : "";
@@ -204,30 +209,80 @@
     const upstream = source.upstream && typeof source.upstream === "object"
       ? source.upstream
       : {};
+    const hint = String(source.hint || "").trim();
+    const hintTitle = hint.split(/[：:]/, 1)[0].trim();
     return String(
-      source.error ||
+      (source.upstream_code && hintTitle) ||
+        source.user_message ||
+        source.error ||
         firstValue(upstream, ["msg", "message", "detail", "error", "error_message"]) ||
         fallback ||
         "操作失败"
     );
   }
 
+  function missingProductSummary(payload, items) {
+    const source = payload && typeof payload === "object" ? payload : {};
+    if (String(source.upstream_code || "").trim() !== "4552") return "";
+    if (!Array.isArray(items)) return "";
+    let displayItems = items;
+    let upstreamText = "";
+    try {
+      upstreamText = JSON.stringify(source.upstream || {});
+    } catch (_error) {
+      upstreamText = String(source.upstream || "");
+    }
+    const errorText = String(
+      source.error || source.user_message || ""
+    ) + " " + upstreamText;
+    const matchedItems = items.filter((item) => {
+      if (!item || typeof item !== "object") return false;
+      return [
+        item.item_id,
+        item.out_item_id,
+        item.barcode,
+        item.sku_code,
+        item.sku_id,
+      ].some((value) => {
+        const token = String(value || "").trim();
+        return token.length >= 4 && errorText.indexOf(token) >= 0;
+      });
+    });
+    if (matchedItems.length) displayItems = matchedItems;
+    const lines = [];
+    const seen = new Set();
+    displayItems.forEach((item) => {
+      if (!item || typeof item !== "object") return;
+      const name = String(item.name || item.product_name || "").trim();
+      const barcode = String(
+        item.barcode || item.sku_code || item.code || ""
+      ).trim();
+      const fallback = String(
+        item.item_id || item.out_item_id || item.sku_id || ""
+      ).trim();
+      if (!name && !barcode && !fallback) return;
+      const label = name || fallback || "未知商品";
+      const line = label + "（69码：" + (barcode || "未提供") + "）";
+      if (!seen.has(line)) {
+        seen.add(line);
+        lines.push(line);
+      }
+    });
+    return lines.join("\n");
+  }
+
   function apiError(options) {
     const opts = options && typeof options === "object" ? options : {};
     const payload = opts.payload && typeof opts.payload === "object" ? opts.payload : {};
-    const meta = [];
-    if (opts.httpStatus) meta.push("浏览器 HTTP " + opts.httpStatus);
-    if (payload.upstream_status) meta.push("上游 HTTP " + payload.upstream_status);
-    if (payload.upstream_code !== undefined && payload.upstream_code !== null && payload.upstream_code !== "") {
-      meta.push("业务码 " + payload.upstream_code);
-    }
-    if (payload.request_id) meta.push("请求标识 " + payload.request_id);
+    const previousOrderBlocked =
+      payload.error_code === "PREVIOUS_ORDER_REQUIRES_COMPLETION";
+    const message = errorSummary(payload, opts.fallback);
+    const productSummary = missingProductSummary(payload, opts.items);
     return notice({
-      title: opts.title || "操作失败",
-      message: errorSummary(payload, opts.fallback),
-      meta: meta.join(" · "),
-      details: payload.upstream || payload,
-      confirmText: "关闭",
+      title: previousOrderBlocked ? "请先完成上一单" : opts.title || "操作失败",
+      message: productSummary ? message + "\n\n" + productSummary : message,
+      confirmText: "确认",
+      tone: "error",
     });
   }
 
@@ -237,5 +292,6 @@
     notice: notice,
     apiError: apiError,
     errorSummary: errorSummary,
+    isOpen: () => !!(root && !root.hidden),
   };
 })(window);

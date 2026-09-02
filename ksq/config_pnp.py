@@ -18,7 +18,12 @@ from __future__ import annotations
 import ast
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
+
+from ksq.runtime_logging import get_logger
+
+
+LOGGER = get_logger("config_pnp")
 
 # Maps ``config.scene.*`` attribute names to KSQ internal result keys.
 SCENE_KEY_MAP: Dict[str, str] = {
@@ -102,13 +107,18 @@ def load_config_pnp_paths(config_pnp_dir: Path) -> Dict[str, Path]:
         source = config_py.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(config_py))
     except Exception as exc:
+        # Keep the operator-visible stderr warning promised by this fallback;
+        # logging remains useful when the application has configured a file
+        # handler, but should not be the only notification.
         print(f"警告：解析 config.py 失败：{exc}", file=sys.stderr)
+        LOGGER.warning("解析 config.py 失败：%s", exc, exc_info=True)
         return {}
 
     resolved_dir = config_pnp_dir.resolve()
-    dir_prefix = str(resolved_dir)
-    result: Dict[str, Path] = {}
 
+    # 后一次赋值覆盖前一次；别名保留为引用，最后再递归展开。
+    # 真实配置会让 sku_shelf_export_csv 引用另一个 config.scene 键。
+    assignments: Dict[str, Tuple[str, str]] = {}
     for node in tree.body:
         # Only top-level simple assignments are considered.
         if not isinstance(node, ast.Assign) or len(node.targets) != 1:
@@ -116,15 +126,33 @@ def load_config_pnp_paths(config_pnp_dir: Path) -> Dict[str, Path]:
         scene_key = _scene_attr_key(node.targets[0])
         if scene_key is None:
             continue
-        result_key = SCENE_KEY_MAP.get(scene_key)
-        if result_key is None:
-            continue
         filename = _config_pnp_path_literal(node.value)
+        if filename:
+            assignments[scene_key] = ("path", filename)
+            continue
+        alias_key = _scene_attr_key(node.value)
+        if alias_key:
+            assignments[scene_key] = ("alias", alias_key)
+
+    def resolve(scene_key: str, seen: frozenset[str] = frozenset()) -> str | None:
+        assignment = assignments.get(scene_key)
+        if assignment is None or scene_key in seen:
+            return None
+        kind, value = assignment
+        if kind == "path":
+            return value
+        return resolve(value, seen | {scene_key})
+
+    result: Dict[str, Path] = {}
+    for scene_key, result_key in SCENE_KEY_MAP.items():
+        filename = resolve(scene_key)
         if not filename:
             continue
         path = (config_pnp_dir / filename).resolve()
         # Reject paths that escape config_pnp_dir (e.g. "../../etc/passwd").
-        if not str(path).startswith(dir_prefix):
+        try:
+            path.relative_to(resolved_dir)
+        except ValueError:
             continue
         result[result_key] = path
 

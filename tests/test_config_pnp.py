@@ -61,6 +61,41 @@ class LoadConfigPnpPathsTests(unittest.TestCase):
             set(result), {"shelves", "tool_mapping", "unavailable", "pick_strategy"}
         )
 
+    def test_scene_alias_reference_is_resolved(self) -> None:
+        # 设备真实写法：sku_shelf_export_csv 别名引用另一个 scene 键
+        self.write_config(
+            'config.scene.etm_sku_locations_cache_csv = config_pnp_path(\n    "etm_sku_locations_cache.csv"\n)\n'
+            "config.scene.sku_shelf_export_csv = config.scene.etm_sku_locations_cache_csv\n"
+        )
+        result = config_pnp.load_config_pnp_paths(self.directory)
+        self.assertEqual(
+            result.get("shelves"),
+            (self.directory / "etm_sku_locations_cache.csv").resolve(),
+        )
+
+    def test_later_alias_overrides_earlier_direct_assignment(self) -> None:
+        self.write_config(
+            'config.scene.sku_shelf_export_csv = config_pnp_path("old.csv")\n'
+            "config.scene.sku_shelf_export_csv = config.scene.latest\n"
+            'config.scene.latest = config_pnp_path("new.csv")\n'
+        )
+
+        result = config_pnp.load_config_pnp_paths(self.directory)
+
+        self.assertEqual(result["shelves"], (self.directory / "new.csv").resolve())
+
+    def test_alias_chain_resolves_without_depth_limit(self) -> None:
+        self.write_config(
+            "config.scene.sku_shelf_export_csv = config.scene.level_one\n"
+            "config.scene.level_one = config.scene.level_two\n"
+            "config.scene.level_two = config.scene.level_three\n"
+            'config.scene.level_three = config_pnp_path("chain.csv")\n'
+        )
+
+        result = config_pnp.load_config_pnp_paths(self.directory)
+
+        self.assertEqual(result["shelves"], (self.directory / "chain.csv").resolve())
+
     def test_partial_config_py_only_returns_set_keys(self) -> None:
         self.write_config(
             'config.scene.sku_shelf_export_csv = config_pnp_path("my-shelves.csv")\n'

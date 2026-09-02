@@ -33,6 +33,7 @@ DEFAULT_TOOL_RATIO = 0.3
 DEFAULT_PACKAGING_RATIO = 0.2
 
 CSV_EXPORT_FIELDS = (
+    "sku_id",
     "out_item_id",
     "location_code",
     "sku_code",
@@ -46,6 +47,7 @@ CSV_EXPORT_FIELDS = (
 # 生成清单时的固定展示列（key 与 public_item 输出字段一致）。
 # 导入 CSV 时改为文件自身的表头，见 parse_import_csv_full。
 DEFAULT_COLUMNS: List[Dict[str, str]] = [
+    {"key": "sku_id", "label": "SKU ID"},
     {"key": "out_item_id", "label": "商品编码"},
     {"key": "location_display", "label": "库位"},
     {"key": "sku_code", "label": "69码"},
@@ -155,15 +157,33 @@ def closed_loop_label(item: Dict[str, str]) -> str:
     return "是" if item.get("is_small") == "1" else "否"
 
 
+def item_identity(item: Dict[str, str]) -> str:
+    # 回退到商品编码：导入 CSV 只填「商品编码+库位」时也要有非空标识，
+    # 否则 key 形如 "|520701"，_parse_key 会判为非法而无法下单/移动。
+    return str(
+        item.get("sku_id") or item.get("sku_code") or item.get("out_item_id") or ""
+    ).strip()
+
+
 def item_key(item: Dict[str, str]) -> Tuple[str, str]:
-    return (item["sku_code"], item["location_code"])
+    return (item_identity(item), item["location_code"])
 
 
 def public_item(item: Dict[str, str]) -> Dict[str, str]:
+    location_parts = [
+        str(item.get(key) or "").strip()
+        for key in ("shelf_number", "level", "bin_unit")
+    ]
+    location_display = (
+        "-".join(location_parts)
+        if all(location_parts)
+        else format_location_display(item.get("location_code", ""))
+    )
     public = {
+        "sku_id": item.get("sku_id", ""),
         "out_item_id": item.get("out_item_id", ""),
         "location_code": item.get("location_code", ""),
-        "location_display": format_location_display(item.get("location_code", "")),
+        "location_display": location_display,
         "sku_code": item.get("sku_code", ""),
         "name": item.get("name", ""),
         "推荐工具": item.get("推荐工具", ""),
@@ -178,7 +198,7 @@ def public_item(item: Dict[str, str]) -> Dict[str, str]:
         "is_code_pusher": item.get("is_code_pusher", "0"),
         # 组合模式下同一 69码 可能属于多个组合，key 追加组合标识保证唯一
         "key": (
-            f"{item.get('sku_code', '')}|{item.get('location_code', '')}"
+            f"{item_identity(item)}|{item.get('location_code', '')}"
             + (
                 f"|{str(item.get('group_id') or '').strip()}"
                 if str(item.get("group_id") or "").strip()
@@ -212,24 +232,35 @@ def load_candidates(
     candidates: List[Dict[str, str]] = []
     seen: Set[Tuple[str, str, str]] = set()
     with shelves_csv.open(encoding="utf-8-sig", newline="") as file:
-        for row in csv.DictReader(file):
+        reader = csv.DictReader(file)
+        if reader.fieldnames is not None:
+            reader.fieldnames = [name.lstrip("\ufeff") for name in reader.fieldnames]
+        for row in reader:
+            sku_id = (row.get("sku_id") or "").strip()
             sku = (row.get("sku_code") or "").strip()
-            if not sku:
+            identity = sku_id or sku
+            if not identity:
                 continue
-            if sku in unavailable:
+            identifiers = tuple(value for value in (sku_id, sku) if value)
+            if any(value in unavailable for value in identifiers):
                 continue
             attr = (row.get("shelf_attribute") or "").strip()
             loc = location_code(row)
             if not loc:
                 continue
-            key = (sku, loc, (row.get("out_item_id") or "").strip())
+            key = (identity, loc, (row.get("out_item_id") or "").strip())
             if key in seen:
                 continue
             seen.add(key)
-            tool = tools.get(sku, DEFAULT_TOOL)
-            pkg = packaging.get(sku, "")
+            tool = next(
+                (tools[value] for value in identifiers if value in tools), DEFAULT_TOOL
+            )
+            pkg = next(
+                (packaging[value] for value in identifiers if value in packaging), ""
+            )
             candidates.append(
                 {
+                    "sku_id": sku_id,
                     "out_item_id": (row.get("out_item_id") or "").strip(),
                     "location_code": loc,
                     "sku_code": sku,
@@ -240,7 +271,9 @@ def load_candidates(
                     "shelf_number": (row.get("shelf_number") or "").strip(),
                     "level": (row.get("level") or "").strip(),
                     "bin_unit": (row.get("bin_unit") or "").strip(),
-                    "is_small": "1" if sku in small_skus else "0",
+                    "is_small": (
+                        "1" if any(value in small_skus for value in identifiers) else "0"
+                    ),
                     "is_special": "1" if tool in SPECIAL_TOOLS else "0",
                     "is_code_pusher": "1" if attr == CODE_PUSHER else "0",
                 }
@@ -263,7 +296,7 @@ def sort_key(row: Dict[str, str]) -> tuple:
         num(shelf),
         num(level),
         num(unit),
-        row.get("sku_code", ""),
+        item_identity(row),
         row.get("out_item_id", ""),
     )
 
@@ -279,12 +312,12 @@ def _pick_one(
     unused = [item for item in pool if item_key(item) not in selected_keys]
     if not unused:
         return None
-    fresh = [item for item in unused if item["sku_code"] not in used_skus]
+    fresh = [item for item in unused if item_identity(item) not in used_skus]
     choices = fresh or unused
     item = random.choice(choices)
     selected.append(item)
     selected_keys.add(item_key(item))
-    used_skus.add(item["sku_code"])
+    used_skus.add(item_identity(item))
     return item
 
 
@@ -569,11 +602,12 @@ def normalize_import_location(raw: str) -> str:
             )
     digits = "".join(char for char in text if char.isdigit())
     if len(digits) >= 6:
-        return digits[:6]
+        return digits
     return text.replace("-", "")
 
 
 _IMPORT_FIELD_ALIASES = {
+    "sku_id": frozenset({"skuid", "sku编号", "skuid编码"}),
     "out_item_id": frozenset(
         {"outitemid", "itemid", "商品编码", "商品id", "货品编码"}
     ),
@@ -621,7 +655,12 @@ def _normalize_import_identifier(raw: object) -> str:
 
 
 def _import_identifiers(row: Dict[str, str]) -> Dict[str, str]:
-    values = {"out_item_id": "", "location_code": "", "sku_code": ""}
+    values = {
+        "sku_id": "",
+        "out_item_id": "",
+        "location_code": "",
+        "sku_code": "",
+    }
     for raw_key, raw_value in row.items():
         field = _canonical_import_field(raw_key)
         if not field or values[field]:
@@ -639,39 +678,94 @@ def _lookup_maps(
     Dict[str, List[Dict[str, str]]],
     Dict[str, List[Dict[str, str]]],
     Dict[str, List[Dict[str, str]]],
+    Dict[str, List[Dict[str, str]]],
 ]:
+    by_id: Dict[str, List[Dict[str, str]]] = defaultdict(list)
     by_sku: Dict[str, List[Dict[str, str]]] = defaultdict(list)
     by_out: Dict[str, List[Dict[str, str]]] = defaultdict(list)
     by_location: Dict[str, List[Dict[str, str]]] = defaultdict(list)
     for item in candidates:
+        sku_id = item.get("sku_id") or ""
         loc = item.get("location_code") or ""
         sku = item.get("sku_code") or ""
         out_id = item.get("out_item_id") or ""
+        if sku_id:
+            by_id[sku_id].append(item)
         if sku:
             by_sku[sku].append(item)
         if out_id:
             by_out[out_id].append(item)
         if loc:
             by_location[loc].append(item)
-    return dict(by_sku), dict(by_out), dict(by_location)
+    return dict(by_id), dict(by_sku), dict(by_out), dict(by_location)
+
+
+def _item_from_identifiers(
+    values: Dict[str, str],
+    tools: Dict[str, str],
+    small_skus: Set[str],
+    packaging: Dict[str, str],
+) -> Dict[str, str]:
+    """候选数据里没有这一行时，按 CSV 自身内容成条目。
+
+    只补能从工具映射/闭环列表/包装类型查到的属性，其余留空；商品是否真实存在
+    交给下单接口判定并弹窗报错，不在导入阶段拦截。
+    """
+    identifiers = [
+        value
+        for value in (
+            values["sku_id"],
+            values["sku_code"],
+            values["out_item_id"],
+        )
+        if value
+    ]
+    tool = next(
+        (tools[value] for value in identifiers if value in tools), DEFAULT_TOOL
+    )
+    pkg = next((packaging[value] for value in identifiers if value in packaging), "")
+    # shelf_number/level/bin_unit 留空，public_item 会用 location_code 格式化展示
+    return {
+        "sku_id": values["sku_id"],
+        "out_item_id": values["out_item_id"],
+        "location_code": values["location_code"],
+        "sku_code": values["sku_code"],
+        "name": "",
+        "推荐工具": tool,
+        "包装类型": pkg,
+        "shelf_attribute": "",
+        "shelf_number": "",
+        "level": "",
+        "bin_unit": "",
+        "is_small": (
+            "1" if any(value in small_skus for value in identifiers) else "0"
+        ),
+        "is_special": "1" if tool in SPECIAL_TOOLS else "0",
+        "is_code_pusher": "0",
+    }
 
 
 def _build_item_from_import_row(
     row: Dict[str, str],
+    by_id: Dict[str, List[Dict[str, str]]],
     by_sku: Dict[str, List[Dict[str, str]]],
     by_out: Dict[str, List[Dict[str, str]]],
     by_location: Dict[str, List[Dict[str, str]]],
+    tools: Dict[str, str],
+    small_skus: Set[str],
+    packaging: Dict[str, str],
     identifiers: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, str], str]:
     values = identifiers if identifiers is not None else _import_identifiers(row)
     criteria = [
+        ("SKU ID", values["sku_id"], by_id),
         ("商品编码", values["out_item_id"], by_out),
         ("库位", values["location_code"], by_location),
         ("69码", values["sku_code"], by_sku),
     ]
     provided = [(label, value, mapping) for label, value, mapping in criteria if value]
     if not provided:
-        raise ValueError("商品编码、库位、69码至少填写一项")
+        raise ValueError("商品编码、库位、69码至少填写一项，也支持 SKU ID")
 
     matches: Optional[List[Dict[str, str]]] = None
     for _, value, mapping in provided:
@@ -682,8 +776,8 @@ def _build_item_from_import_row(
         current_ids = {id(item) for item in current}
         matches = [item for item in matches if id(item) in current_ids]
     if not matches:
-        detail = "、".join(f"{label}={value}" for label, value, _ in provided)
-        raise ValueError(f"当前候选数据中未找到：{detail}")
+        # 候选数据里没有 → 按原文件内容导入，不拦截
+        return _item_from_identifiers(values, tools, small_skus, packaging), ""
 
     warning = ""
     if len(matches) > 1:
@@ -749,24 +843,35 @@ def parse_import_csv_full(
     column_fields = [_canonical_import_field(column["label"]) for column in columns]
     recognized_headers = set(column_fields)
     if not recognized_headers.intersection(
-        {"out_item_id", "location_code", "sku_code"}
+        {"sku_id", "out_item_id", "location_code", "sku_code"}
     ):
         header_text = "、".join(
             column["label"] for column in columns if column["label"]
         )
         detail = f"（识别到的表头：{header_text}）" if header_text else ""
         raise ValueError(
-            "CSV 表头至少需要商品编码、库位、69码中的一项。" + detail
+            "CSV 表头至少需要商品编码、库位、69码中的一项，也支持 SKU ID。"
+            + detail
         )
     group_field = str(group_field or "").strip()
     if group_field and group_field not in {column["key"] for column in columns}:
         raise ValueError(f"CSV 表头中不存在组合字段：{group_field}")
-    by_sku, by_out, by_location = _lookup_maps(candidates)
-    sku_keys = [
-        column["key"]
-        for column, field in zip(columns, column_fields)
-        if field == "sku_code"
-    ]
+    by_id, by_sku, by_out, by_location = _lookup_maps(candidates)
+    # 宽表：同一个标识字段出现多列（如两个 69码 或两个 SKU ID）才表示
+    # 一行含多个药品。「一个 sku_id + 一个 69码」是同一药品的两种标识，
+    # 不能拆，所以这里按字段分组而不是把两类列掘到一起数。
+    member_field = ""
+    member_keys: List[str] = []
+    for field in ("sku_code", "sku_id"):
+        keys_for_field = [
+            column["key"]
+            for column, column_field in zip(columns, column_fields)
+            if column_field == field
+        ]
+        if len(keys_for_field) > 1:
+            member_field = field
+            member_keys = keys_for_field
+            break
     selected: List[Dict[str, str]] = []
     selected_keys: Set[Tuple[str, ...]] = set()
     errors: List[str] = []
@@ -777,23 +882,33 @@ def parse_import_csv_full(
             )
             for offset, column in enumerate(columns)
         }
-        # 宽表：一行含多个 69码 列时，每个非空 69码 拆成一条药品
+        # 宽表：一行含多个同类标识列时，每个非空取值拆成一条药品
         identifiers_per_row: List[Optional[Dict[str, str]]]
-        if len(sku_keys) > 1:
+        if member_keys:
             identifiers_per_row = []
-            for sku_key in sku_keys:
-                sku_value = _normalize_import_identifier(display.get(sku_key, ""))
-                if not sku_value:
+            for member_key in member_keys:
+                member_value = _normalize_import_identifier(
+                    display.get(member_key, "")
+                )
+                if not member_value:
                     continue
                 values = _import_identifiers(display)
-                values["sku_code"] = sku_value
+                values[member_field] = member_value
                 identifiers_per_row.append(values)
         else:
             identifiers_per_row = [None]
         for identifiers in identifiers_per_row:
             try:
                 item, warning = _build_item_from_import_row(
-                    display, by_sku, by_out, by_location, identifiers=identifiers
+                    display,
+                    by_id,
+                    by_sku,
+                    by_out,
+                    by_location,
+                    tools,
+                    small_skus,
+                    packaging,
+                    identifiers=identifiers,
                 )
             except ValueError as error:
                 errors.append(f"第 {index} 行：{error}")

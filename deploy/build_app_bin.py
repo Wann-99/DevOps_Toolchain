@@ -106,7 +106,15 @@ def main() -> None:
         raise RuntimeError("应用包版本为空。")
     os.environ["KSQ_APP_VERSION"] = version
 
-    from ksq.cli import main as application_main
+    from ksq.runtime_logging import configure as configure_runtime_logging
+    from ksq.runtime_logging import get_logger
+
+    configure_runtime_logging()
+    try:
+        from ksq.cli import main as application_main
+    except BaseException:
+        get_logger("bootstrap").exception("服务启动失败")
+        raise
 
     application_main()
 

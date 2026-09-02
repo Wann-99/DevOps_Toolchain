@@ -92,6 +92,7 @@
 
   const BASE_COLUMNS = [
     "id",
+    "69码",
     "商品编码",
     "药品名称",
     "库位",
@@ -103,6 +104,7 @@
   ];
   const ORDER_COLUMNS = [
     "id",
+    "69码",
     "商品编码",
     "药品名称",
     "库位",
@@ -114,7 +116,7 @@
     "是否不可处理",
   ];
   const WRAP_COLUMNS = new Set(["药品名称", "库位", "货架属性", "包装类型", "表面结构"]);
-  const READONLY_COLUMNS = new Set(["id", "商品编码", "药品名称"]);
+  const READONLY_COLUMNS = new Set(["id", "69码", "商品编码", "药品名称"]);
   const LOCATION_SCOPED_COLUMNS = new Set(["库位", "货架属性", "挡板高度"]);
   const CHOICE_COLUMNS = new Set([
     "货架属性",
@@ -221,6 +223,7 @@
 
     function recordValue(record, field) {
     if (field === "id") return record.id;
+    if (field === "69码") return record.sku_code;
     if (field === "商品编码") return record.out_item_id;
     if (field === "药品名称") return record.name;
     if (field === "库位") return record.locations;
@@ -268,9 +271,9 @@
     value = value.replace(/^[A-Za-z]+-/, "");
     value = value.replace(/^[A-Za-z]+(?=\d)/, "");
     value = value.replace(/\s+/g, "");
-    let match = value.match(/^(\d{1,3})-(\d{1,3})-(\d{1,3})$/);
+    let match = value.match(/^(\d{1,4})-(\d{1,3})-(\d{1,3})$/);
     if (match) return normalizeLocation(match[1] + "-" + match[2] + "-" + match[3]);
-    match = value.match(/^(\d{2})(\d{2})(\d{2})$/);
+    match = value.match(/^(\d{2}|\d{4})(\d{2})(\d{2})$/);
     if (match) return match[1] + "-" + match[2] + "-" + match[3];
     const digits = value.replace(/\D/g, "");
     if (digits.length === 6) {
@@ -329,6 +332,9 @@
     let timerId = 0;
     let scanTimerId = 0;
     let selectedOrders = new Map();
+    let orderBusy = false;
+    let saveBusy = false;
+    let reloadBusy = false;
     let storeOptions = [];
     let tokenReady = false;
     let activeEdit = null;
@@ -399,7 +405,7 @@
         setEditMode(false);
       }
       if (editToggleBtn) {
-        editToggleBtn.disabled = !canEdit;
+        editToggleBtn.disabled = saveBusy || !canEdit;
         editToggleBtn.title = canEdit
           ? "点击后可编辑单元格"
           : capabilityMessage || "当前加载方式不支持编辑";
@@ -409,7 +415,8 @@
       }
       const orderBtn = role("btn-quick-order");
       if (orderBtn) {
-        orderBtn.disabled = !canOrder;
+        orderBtn.disabled =
+          !canOrder || (isOrder && (selectedOrders.size < 1 || orderBusy));
         orderBtn.title = canOrder
           ? ""
           : capabilityMessage || "当前加载方式不支持下单";
@@ -423,7 +430,7 @@
       }
       return locationTokens(record.locations).map((code) => ({
         location_code: code,
-        item_id: record.out_item_id,
+        item_id: global.KsqItemIdentity.pickItemId(record),
         name: record.name,
         shelf_attribute: record.shelf_attribute,
         baffle_height: record.baffle_height,
@@ -459,12 +466,14 @@
       if (button) {
         button.classList.toggle("is-active", editMode);
         button.setAttribute("aria-pressed", editMode ? "true" : "false");
+        button.disabled = saveBusy || !canEdit;
       }
       if (label) label.textContent = editMode ? "编辑中" : "编辑";
       root.classList.toggle("edit-mode-on", editMode);
     }
 
     function setEditMode(enabled) {
+      if (saveBusy) return;
       const next = Boolean(enabled);
       if (editMode === next) return;
       if (!next && activeEdit) cancelEdit(true);
@@ -643,7 +652,7 @@
       setStatus(escapeHtml(message), true);
     }
 
-    async function reportOrderApiError(response, data, fallback) {
+    async function reportOrderApiError(response, data, fallback, items) {
       const message =
         global.KsqDialog && global.KsqDialog.errorSummary
           ? global.KsqDialog.errorSummary(data, fallback)
@@ -655,6 +664,7 @@
           payload: data,
           httpStatus: response.status,
           fallback: fallback,
+          items: items,
         });
       }
       const error = new Error(message);
@@ -697,7 +707,7 @@
       const hasLocationPrefix = /^[A-Za-z]+-/.test(value) || /^[A-Za-z]+\d/.test(value);
       const location = parseScannedLocation(value);
       if (location) {
-        const plainLocation = /^\d{1,3}-\d{1,3}-\d{1,3}$/.test(value);
+        const plainLocation = /^\d{1,4}-\d{1,3}-\d{1,3}$/.test(value);
         if (hasLocationPrefix || plainLocation || knownLocations.has(location)) {
           return { type: "location", value: location, raw: value };
         }
@@ -714,7 +724,9 @@
         );
       }
       const target = normalizeText(query.value);
-      return String(record.id) === query.value || normalizeText(record.id) === target;
+      return [record.id, record.sku_code].some(
+        (value) => String(value || "") === query.value || normalizeText(value) === target
+      );
     }
 
     function locationPartsValue(value) {
@@ -1119,7 +1131,7 @@
       const list = role("selected-list");
       const emptyHint = role("selected-list-empty");
       const count = selectedOrders.size;
-      if (orderBtn) orderBtn.disabled = count < 1;
+      if (orderBtn) orderBtn.disabled = !canOrder || count < 1 || orderBusy;
       if (badge) {
         if (count < 1) {
           badge.hidden = true;
@@ -1280,7 +1292,9 @@
       const badge = role("save-edit-badge");
       if (!button) return;
       const count = pendingCount();
-      button.disabled = count === 0;
+      button.disabled = saveBusy || !canEdit || count === 0;
+      const editToggleBtn = role("btn-toggle-edit");
+      if (editToggleBtn) editToggleBtn.disabled = saveBusy || !canEdit;
       if (badge) {
         if (count > 0) {
           badge.hidden = false;
@@ -1341,8 +1355,20 @@
       const key = pendingKey(itemId, field, location);
       const cell = activeEdit.cell;
       const record = activeEdit.record;
+      const pending = pendingEdits.get(key);
       if (value.trim() === original.trim()) {
         pendingEdits.delete(key);
+        // The record is mutated while a pending edit is staged.  Restore the
+        // baseline before dropping the pending marker, otherwise the UI and
+        // the eventual payload retain a hidden ghost value.
+        if (pending) {
+          applyPendingToRecord(
+            record,
+            field,
+            pending.original === "-" ? "" : pending.original,
+            location
+          );
+        }
         activeEdit = null;
         if (cell && cell.isConnected) {
           cell.classList.remove("editing", "has-pending");
@@ -1386,6 +1412,7 @@
     }
 
     function beginEdit(cell, record, column) {
+      if (saveBusy) return;
       if (!editMode) {
         setStatus("请先点击「编辑」进入编辑模式", true);
         return;
@@ -1472,6 +1499,7 @@
     }
 
     async function saveActiveEdit() {
+      if (saveBusy || reloadBusy) return;
       if (activeEditDirty()) stashActiveEdit();
       else if (activeEdit) cancelEdit(true);
       const count = pendingEdits.size;
@@ -1480,22 +1508,26 @@
         syncSaveButton();
         return;
       }
-      const confirmed = await window.KsqDialog.confirm({
-        title: "确认保存",
-        message:
-          "确认将 " +
-          count +
-          " 处修改写回原文件？\n写回前会按 原文件名.bak日期_时间 备份，并仅按商品编码增量更新改动项。",
-        confirmText: "确定写回",
-        cancelText: "取消",
-      });
-      if (!confirmed) {
-        setStatus("已取消保存");
-        return;
-      }
-      setStatus("保存中...");
-      const edits = Array.from(pendingEdits.values());
+      saveBusy = true;
+      const reloadWasDisabled = reloadButton ? reloadButton.disabled : false;
+      if (reloadButton) reloadButton.disabled = true;
+      syncSaveButton();
       try {
+        const confirmed = await window.KsqDialog.confirm({
+          title: "确认保存",
+          message:
+            "确认将 " +
+            count +
+            " 处修改写回原文件？\n写回前会按 原文件名.bak日期_时间 备份，并仅按商品编码增量更新改动项。",
+          confirmText: "确定写回",
+          cancelText: "取消",
+        });
+        if (!confirmed) {
+          setStatus("已取消保存");
+          return;
+        }
+        setStatus("保存中...");
+        const edits = Array.from(pendingEdits.values());
         for (let index = 0; index < edits.length; index += 1) {
           const edit = edits[index];
           const payload = {
@@ -1573,6 +1605,9 @@
         await refreshExportFileOptions();
       } catch (error) {
         await reportError(error);
+      } finally {
+        saveBusy = false;
+        if (reloadButton) reloadButton.disabled = reloadWasDisabled;
         syncSaveButton();
       }
     }
@@ -1743,11 +1778,30 @@
       role("cfg-client-secret").placeholder = data.has_client_secret
         ? "已保存，留空不改"
         : "请输入 client_secret";
+      tokenReady = Boolean(data.token_ready);
+      const dot = role("token-status-dot");
+      if (dot) {
+        dot.classList.toggle("ok", tokenReady);
+        dot.classList.toggle("err", false);
+      }
       return data;
     }
 
-    async function ensureToken() {
-      if (role("cfg-server")) await saveOrderConfig();
+    async function ensureOrderCreationAllowed() {
+      const response = await fetch("/api/order/preflight", { method: "POST" });
+      const data = await response.json();
+      if (!response.ok) {
+        throw await reportOrderApiError(
+          response,
+          data,
+          "当前无法下单"
+        );
+      }
+    }
+
+    async function ensureToken(options) {
+      const opts = options && typeof options === "object" ? options : {};
+      if (!opts.skipSave && role("cfg-server")) await saveOrderConfig();
       const mode = dashboardMode();
       const response = await fetch(
         "/api/order/token?mode=" + encodeURIComponent(mode),
@@ -1783,6 +1837,7 @@
           lines.find((item) => item.location_code === entry.location_code) || lines[0];
         if (!line) return;
         items.push({
+          sku_id: line.sku_id || entry.record.sku_id || "",
           item_id: line.item_id,
           location_code: line.location_code,
           barcode: line.barcode || "",
@@ -1793,169 +1848,9 @@
       return items;
     }
 
-    const ORDER_STATUS_LABELS = {
-      pending: "等待中",
-      dispatched: "已拆单",
-      running: "运行中",
-      success: "完成",
-      error: "失败",
-      cancel: "已取消",
-      awaiting_pack: "等待打包",
-    };
-    const ORDER_STATUS_TERMINAL = new Set([
-      "success",
-      "error",
-      "cancel",
-    ]);
-    const ORDER_STATUS_POLL_MS = 3000;
-    const ORDER_STATUS_POLL_MAX = 120;
-    let orderStatusPollTimer = null;
-    let orderStatusPollTaskId = "";
-    let orderStatusPollCount = 0;
-    let orderStatusItemCount = 0;
-
-    function stopOrderStatusPoll() {
-      if (orderStatusPollTimer !== null) {
-        clearInterval(orderStatusPollTimer);
-        orderStatusPollTimer = null;
-      }
-      orderStatusPollTaskId = "";
-      orderStatusPollCount = 0;
-    }
-
-    function unwrapTaskDetail(payload) {
-      if (!payload || typeof payload !== "object") return null;
-      let node = payload.data !== undefined ? payload.data : payload;
-      if (node && typeof node === "object" && node.data && typeof node.data === "object") {
-        if (node.data.task_id || node.data.status || node.data.order_no) {
-          node = node.data;
-        }
-      }
-      if (!node || typeof node !== "object") return null;
-      return node;
-    }
-
-    function orderStatusLabel(status) {
-      const key = String(status || "").trim();
-      return ORDER_STATUS_LABELS[key] || key || "未知";
-    }
-
-    function renderOrderStatus(task, options) {
-      const opts = options || {};
-      const panel = role("order-result-panel");
-      const meta = role("order-result-meta");
-      const statusLine = role("order-status-line");
-      const body = role("order-result-body");
-      if (panel) panel.hidden = false;
-      if (!task) {
-        if (statusLine) {
-          statusLine.hidden = false;
-          statusLine.textContent = "暂无任务状态";
-        }
-        return;
-      }
-      const status = String(task.status || "").trim();
-      const label = orderStatusLabel(status);
-      const badgeClass =
-        "order-status-badge s-" + (ORDER_STATUS_LABELS[status] ? status : "other");
-      const taskId = String(task.task_id || opts.taskId || "").trim();
-      const orderNo = String(task.order_no || "").trim();
-      const createTime = String(task.create_time || task.order_time || "").trim();
-      const itemCount =
-        opts.itemCount !== undefined ? opts.itemCount : orderStatusItemCount;
-      if (meta) {
-        meta.textContent =
-          "task_id=" +
-          (taskId || "-") +
-          (orderNo ? " · order_no=" + orderNo : "") +
-          (itemCount ? " · " + itemCount + " 件" : "") +
-          (createTime ? " · " + createTime : "");
-      }
-      if (statusLine) {
-        statusLine.hidden = false;
-        statusLine.innerHTML =
-          "工单状态：<span class=\"" +
-          badgeClass +
-          '">' +
-          escapeHtml(label) +
-          "</span>" +
-          (status && status !== label
-            ? ' <span class="meta compact">(' + escapeHtml(status) + ")</span>"
-            : "") +
-          (opts.polling ? ' <span class="meta compact">· 自动刷新中</span>' : "");
-      }
-      if (body && opts.showRaw) {
-        body.hidden = false;
-        body.textContent = JSON.stringify(opts.raw || task, null, 2);
-      }
-      setStatus(
-        "工单 " +
-          (taskId || "") +
-          " · " +
-          label +
-          (opts.polling ? "（自动刷新中）" : "")
-      );
-    }
-
-    async function fetchOrderTaskDetail(taskId) {
-      const response = await fetch(
-        "/api/order/tasks/" + encodeURIComponent(taskId)
-      );
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "查询任务状态失败");
-      const task = unwrapTaskDetail(data);
-      if (!task) throw new Error("任务详情格式无效");
-      return { task: task, raw: data };
-    }
-
-    function startOrderStatusPoll(taskId, itemCount) {
-      stopOrderStatusPoll();
-      orderStatusPollTaskId = taskId;
-      orderStatusItemCount = itemCount || 0;
-      orderStatusPollCount = 0;
-
-      const tick = async () => {
-        if (!orderStatusPollTaskId || orderStatusPollTaskId !== taskId) return;
-        orderStatusPollCount += 1;
-        try {
-          const result = await fetchOrderTaskDetail(taskId);
-          const status = String(result.task.status || "").trim();
-          const terminal = ORDER_STATUS_TERMINAL.has(status);
-          const reachedMax = orderStatusPollCount >= ORDER_STATUS_POLL_MAX;
-          renderOrderStatus(result.task, {
-            taskId: taskId,
-            itemCount: itemCount,
-            polling: !terminal && !reachedMax,
-            showRaw: true,
-            raw: result.raw,
-          });
-          if (terminal || reachedMax) {
-            stopOrderStatusPoll();
-            if (reachedMax && !terminal) {
-              setStatus(
-                "工单 " + taskId + " · " + orderStatusLabel(status) + "（已停止自动刷新）"
-              );
-            }
-          }
-        } catch (error) {
-          const statusLine = role("order-status-line");
-          if (statusLine) {
-            statusLine.hidden = false;
-            statusLine.textContent = "状态查询失败：" + error.message;
-          }
-          if (orderStatusPollCount >= 3) {
-            stopOrderStatusPoll();
-            await reportError(error);
-          }
-        }
-      };
-
-      tick();
-      orderStatusPollTimer = setInterval(tick, ORDER_STATUS_POLL_MS);
-    }
-
     async function quickOrder() {
       if (!isOrder) return;
+      if (orderBusy) return;
       if (!canOrder) {
         await promptCapabilityBlocked("药品下单");
         return;
@@ -1975,11 +1870,15 @@
         }
       }
       const button = role("btn-quick-order");
+      orderBusy = true;
       if (button) button.disabled = true;
       setStatus(tokenReady ? "下单中..." : "获取 Token 并下单...");
       try {
-        if (!tokenReady) await ensureToken();
-        else await saveOrderConfig();
+        await ensureOrderCreationAllowed();
+        // PUT invalidates the server-side token cache. Save the current form
+        // first, then always obtain a token for exactly that configuration.
+        await saveOrderConfig();
+        await ensureToken({ skipSave: true });
         const mode = dashboardMode();
         const response = await fetch("/api/order/create", {
           method: "POST",
@@ -1988,39 +1887,23 @@
         });
         const data = await response.json();
         if (!response.ok) {
-          throw await reportOrderApiError(response, data, "下单失败");
+          throw await reportOrderApiError(response, data, "下单失败", items);
+        }
+        if (!data.task_id) {
+          throw await reportOrderApiError(
+            response,
+            Object.assign({}, data, {
+              error: "Broker 未返回 task_id，下单未生效",
+            }),
+            "下单失败",
+            items
+          );
         }
         selectedOrders.clear();
         closeSelectedList();
         updateSelectedOrderUI();
         render(false);
-        const panel = role("order-result-panel");
-        const body = role("order-result-body");
-        const meta = role("order-result-meta");
-        if (panel) panel.hidden = false;
-        if (body) {
-          body.hidden = false;
-          body.textContent = JSON.stringify(data, null, 2);
-        }
-        if (data.task_id) {
-          const queued = !!(
-            data.order_session && Number(data.order_session.queue_position) > 0
-          );
-          role("last-task-id").value = data.task_id;
-          if (meta) {
-            meta.textContent =
-              (queued ? "下一单已进入等待队列" : "下单成功") +
-              " · " +
-              items.length +
-              " 件 · task_id=" +
-              data.task_id;
-          }
-          setStatus(queued ? "下一单已排队，当前单结束后自动执行" : "下单成功，正在查询状态...");
-          startOrderStatusPoll(data.task_id, items.length);
-        } else {
-          if (meta) meta.textContent = "已返回响应，请检查 task_id";
-          setStatus("下单已返回，请查看结果");
-        }
+        setStatus("下单成功，正在打开仪表板...");
         if (window.KsqDashboard && window.KsqDashboard.openAfterOrder) {
           const requestBody = data.request_body || {};
           window.KsqDashboard.openAfterOrder(
@@ -2042,16 +1925,9 @@
           window.KsqShell.showView("dashboard");
         }
       } catch (error) {
-        stopOrderStatusPoll();
         if (!error.orderApiReported) await reportError(error);
-        const panel = role("order-result-panel");
-        const body = role("order-result-body");
-        if (panel) panel.hidden = false;
-        if (body) {
-          body.hidden = false;
-          body.textContent = error.message;
-        }
       } finally {
+        orderBusy = false;
         updateSelectedOrderUI();
       }
     }
@@ -2088,9 +1964,21 @@
     }
 
     async function reloadData() {
-      if (reloadButton) reloadButton.disabled = true;
-      setStatus("加载中...");
+      if (saveBusy || reloadBusy) return;
+      reloadBusy = true;
       try {
+        if (pendingCount() > 0) {
+          if (!global.KsqDialog || !global.KsqDialog.confirm) return;
+          const discard = await global.KsqDialog.confirm({
+            title: "放弃未保存修改？",
+            message: "重新加载会丢弃当前编辑内容。是否继续？",
+            confirmText: "继续加载",
+            cancelText: "返回",
+          });
+          if (!discard) return;
+        }
+        if (reloadButton) reloadButton.disabled = true;
+        setStatus("加载中...");
         const response = await fetch("/api/reload", { method: "POST" });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "重新加载失败");
@@ -2104,6 +1992,7 @@
         await reportError(error);
       } finally {
         if (reloadButton) reloadButton.disabled = false;
+        reloadBusy = false;
       }
     }
 
@@ -2476,29 +2365,6 @@
         });
       }
       updateSelectedOrderUI();
-      const detailBtn = role("btn-task-detail");
-      if (detailBtn) detailBtn.addEventListener("click", async () => {
-        const taskId = role("last-task-id").value.trim();
-        if (!taskId) return;
-        try {
-          const result = await fetchOrderTaskDetail(taskId);
-          renderOrderStatus(result.task, {
-            taskId: taskId,
-            itemCount: orderStatusItemCount,
-            polling: false,
-            showRaw: true,
-            raw: result.raw,
-          });
-          if (!ORDER_STATUS_TERMINAL.has(String(result.task.status || "").trim())) {
-            startOrderStatusPoll(taskId, orderStatusItemCount);
-          }
-        } catch (error) {
-          const body = role("order-result-body");
-          body.hidden = false;
-          body.textContent = error.message;
-          await reportError(error);
-        }
-      });
     }
 
     function focusScan() {

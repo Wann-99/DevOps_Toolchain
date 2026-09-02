@@ -76,7 +76,8 @@ printf '{}\n' > "${STAGE}/config/test_order_state.json"
 printf '%s\n' "${DEFAULT_ORDER_CONFIG_JSON}" > "${STAGE}/config/order_config.json"
 printf '%s\n' "${DEFAULT_ORDER_CONFIG_JSON}" > "${STAGE}/config/order_config.prod.json"
 printf '%s\n' "${DEFAULT_USERS_JSON}" > "${STAGE}/config/users.json"
-echo "  [config] 已写入干净初始值（6 个状态/配置文件）"
+cp "${APP_DIR}/ksq/feishu/rules.json" "${STAGE}/config/feishu_rules.json"
+echo "  [config] 已写入干净初始值，并携带飞书规则文件"
 
 # 5. 打包
 cd "${DIST_DIR}"
@@ -88,6 +89,6 @@ echo "增量包: ${APP_BIN_DIST}"
 du -h "${PKG_NAME}.tar.gz" | awk '{print "大小:   " $1}'
 echo ""
 echo "目标设备使用:"
-echo "  tar xzf ${PKG_NAME}.tar.gz && cd ${PKG_NAME} && bash start.sh"
+echo "  tar xzf ${PKG_NAME}.tar.gz && cd ${PKG_NAME} && ./start.sh"
 echo "后续仅更新源码:"
 echo "  bash start.sh update /path/to/knowledge_shelf_query_${TAG}.bin"

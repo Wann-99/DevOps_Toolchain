@@ -1,6 +1,12 @@
 (function (global) {
-  const POLL_MS = 500;
-  const ERROR_AUTO_DISMISS_MS = 3000;
+  // 自适应轮询：/api/dashboard/status 实测 0.25~0.33s，与原 300ms 间隔相当，
+  // 用 setInterval 会让请求首尾相接、服务端常态满载，且每轮重绘会把按钮
+  // 节点销毁重建。改为每轮结束后再排下一次，并按忙/闲切换间隔。
+  const ACTIVE_POLL_MS = 1000;
+  const IDLE_POLL_MS = 4000;
+  // 必须明显小于服务端 _TASK_LIST_CACHE_SECONDS（20s），否则每次轮询都撞上
+  // 刚过期的缓存，每次都要跨公网拉全量任务（4~7s）。
+  const ORDER_LIST_POLL_MS = 8000;
   const AUTO_CONFIRM_SHOW_MS = 450;
   const KIND_LABELS = {
     started: "开始处理",
@@ -19,48 +25,116 @@
     success: "完成",
     error: "失败",
     cancel: "已取消",
+    manual_cancel: "人工取消",
+    manual_canceled: "人工取消",
     awaiting_pack: "等待打包",
     manual_transferred: "人工转单",
     manual_transferred_completed: "人工转单完成",
     manual_claimed_in_progress: "人工处理中",
     manual_claimed_completed: "人工处理完成",
   };
+  // 状态徽章色系：对齐 devtools STATUS_CLASS，manual_* 归入相近语义色。
+  const BROKER_STATUS_TONES = {
+    pending: "pending",
+    dispatched: "dispatched",
+    running: "running",
+    success: "success",
+    error: "error",
+    cancel: "cancel",
+    manual_cancel: "cancel",
+    manual_canceled: "cancel",
+    awaiting_pack: "pack",
+    manual_transferred: "manual",
+    manual_claimed_in_progress: "manual",
+    manual_transferred_completed: "success",
+    manual_claimed_completed: "success",
+  };
+  // 订单来源中文名：合并 devtools 各客户 profile 的 orderSources。
+  const ORDER_SOURCE_LABELS = {
+    meituan: "美团外卖",
+    eleme: "淘宝闪购",
+    jd: "京东",
+    dy: "抖音",
+    dsl: "大参林健康",
+    elemzb: "淘宝闪购滋补店",
+    qjw: "企健网",
+    zheb: "智慧E保",
+    ss: "漱玉小程序",
+  };
+  // 仅用于任务行按钮显隐引导（后端无状态门槛，直发由 Broker 裁决）。
   const CANCELABLE_STATUSES = new Set([
     "pending",
     "dispatched",
     "running",
     "awaiting_pack",
   ]);
-  // 转人工之后 Broker 给的是 manual_claimed_in_progress，「标记完成」要认这个状态。
-  // 与后端 order_api._MANUAL_COMPLETABLE_STATUSES 保持一致。
+  // 转人工之后 Broker 给的是 manual_claimed_in_progress，「完成」要认这个状态。
   const COMPLETABLE_STATUSES = new Set([
     "manual_claimed_in_progress",
     "manual_transferred",
   ]);
+  // 轮询频率判定用。数值与 CANCELABLE_STATUSES 目前巧合相同，但语义无关
+  // （一个是「能不能取消」，一个是「要不要高频刷」），故故意不复用，
+  // 避免日后改按钮规则时连带改变轮询行为。
+  const ACTIVE_BROKER_STATUSES = new Set([
+    "pending",
+    "dispatched",
+    "running",
+    "awaiting_pack",
+  ]);
+  // 空闲/终态才降频；其余一律按活跃处理，宁可多轮也不损实时观感。
+  const IDLE_FOCUS_STATUSES = new Set([
+    "",
+    "idle",
+    "success",
+    "error",
+    "cancel",
+    "failed",
+  ]);
   const el = (id) => document.getElementById(id);
 
   let timerId = 0;
+  let orderListTimerId = 0;
   let busy = false;
   let confirmBusy = false;
+  // active = 全页面常驻确认监听；dashboardVisible = 是否渲染仪表板明细。
   let active = false;
+  let dashboardVisible = false;
   let lastFingerprint = "";
+  // 最后一次快照，用于决定下一次轮询间隔
+  let lastStatusData = null;
+  // 各重绘块的内容指纹：未变则不碰 DOM
+  let lastEventsRenderKey = "";
+  let lastTasksRenderKey = "";
+  let lastOrderListRenderKey = "";
   let handledFingerprint = "";
   let modalOpen = false;
-  let modalDismissTimer = 0;
   let focusTaskId = "";
   let lastStatus = "idle";
   let currentOrderTaskId = "";
   let currentOrderNo = "";
   let currentBrokerStatus = "";
   let currentDashboardMode = "test";
-  let taskActionBusy = false;
+  // 正在执行的任务操作集（"taskId|action"）：只禁用被点的那一个按钮，
+  // 不连坐其他任务。按项目旧教训：被闭包持有的集合用 const + 原地修改。
+  const activeTaskActions = new Set();
+
+  function taskActionKey(taskId, action) {
+    return String(taskId) + "|" + String(action);
+  }
   let orderListBusy = false;
+  let orderListRefreshPending = false;
+  let orderListRefreshPendingForce = false;
   let orderListPage = 1;
   let orderListTotalPages = 1;
   let orderListHasMore = false;
   let lastOrderListData = null;
   let brokerConfigured = true;
   let orderListLoaded = false;
+  let refreshPending = false;
+  let refreshPendingForce = false;
+  let statusAbortController = null;
+  let orderListAbortController = null;
 
   function escapeHtml(value) {
     return String(value == null ? "" : value)
@@ -186,17 +260,22 @@
     }
   }
 
-  function setDetail(text, isError) {
+  function setDetail(text, isError, showDialog) {
     const node = el("dash-status-text");
     if (!node) return;
     // Hero no longer shows log/播报 prompts; keep node for rare inject errors only.
+    // 轮询路径的持续性错误（如服务未启动）传 showDialog=false，避免模态框反复轰炸。
     const show = Boolean(isError && text);
     node.hidden = !show;
     node.textContent = show ? String(text) : "";
     node.style.opacity = show ? "1" : "";
+    if (show && showDialog !== false && global.KsqStatus && global.KsqStatus.error) {
+      global.KsqStatus.error(text);
+    }
   }
 
   function fingerprint(data) {
+    if (data.confirm_fingerprint) return String(data.confirm_fingerprint);
     const current = data.current_item || {};
     const order = data.order || {};
     return [
@@ -277,9 +356,14 @@
   }
 
   function updateConfirmUi(data) {
-    const button = el("dash-confirm-now");
     const needs = !!data.needs_confirm;
-    if (button) button.disabled = !needs || confirmBusy;
+    const disabled = !needs || confirmBusy;
+    ["dash-confirm-now", "dash-modal-confirm", "dash-modal-dismiss"].forEach(
+      (id) => {
+        const button = el(id);
+        if (button) button.disabled = disabled;
+      }
+    );
   }
 
   function renderEvents(events) {
@@ -287,6 +371,11 @@
     const count = el("dash-feed-count");
     if (!list) return;
     const rows = Array.isArray(events) ? events.slice().reverse() : [];
+    // 内容未变就不碰 DOM：否则每轮 innerHTML 重建会把子树里的按钮销毁，
+    // 用户 mousedown/mouseup 跨越重建时 click 会派到祖先节点而被丢弃。
+    const renderKey = JSON.stringify(rows);
+    if (renderKey === lastEventsRenderKey) return;
+    lastEventsRenderKey = renderKey;
     if (count) count.textContent = rows.length + " 条";
     if (!rows.length) {
       list.innerHTML =
@@ -414,7 +503,6 @@
     const orderTask = el("dash-order-task");
     const lifeTag = el("dash-order-life");
     const brokerTag = el("dash-order-broker");
-    const queueTag = el("dash-order-queue");
     const progressLabel = el("dash-order-progress-label");
     const progressMeta = el("dash-order-progress-meta");
     const bar = el("dash-order-bar");
@@ -425,8 +513,11 @@
     const active = Number(progress.active || 0);
     const previousTaskId = currentOrderTaskId;
     const previousMode = currentDashboardMode;
+    const brokerTaskId = String(
+      (broker && broker.ok && broker.task_id) || ""
+    ).trim();
     currentOrderTaskId = String(
-      (order && order.task_id) || data.task_id || focusTaskId || ""
+      brokerTaskId || (order && order.task_id) || data.task_id || focusTaskId || ""
     );
     currentOrderNo = String(
       (order && (order.order_no || order.platform_order_no)) ||
@@ -436,9 +527,10 @@
     currentBrokerStatus = String(broker.status || "");
     currentDashboardMode = String(data.dashboard_mode || "test");
     renderOrderSource(order, broker);
+    syncCurrentOrderListStatus(broker);
     if (orderNo) {
       const taskId =
-        (order && order.task_id) || data.task_id || focusTaskId || "";
+        brokerTaskId || (order && order.task_id) || data.task_id || focusTaskId || "";
       const shortId = taskId
         ? String(taskId).slice(0, 8)
         : "";
@@ -450,7 +542,7 @@
     if (orderTask) {
       orderTask.textContent =
         "task_id " +
-        ((order && order.task_id) || data.task_id || focusTaskId || "—");
+        (brokerTaskId || (order && order.task_id) || data.task_id || focusTaskId || "—");
     }
     if (lifeTag) {
       lifeTag.textContent = life.label || data.status_label || "进行中";
@@ -471,18 +563,6 @@
           ? "工单状态不可用"
           : "工单状态 —";
       }
-    }
-    if (queueTag) {
-      const queue = data.order_queue || {};
-      const waiting = Array.isArray(queue.queued) ? queue.queued[0] : null;
-      queueTag.hidden = !waiting;
-      queueTag.textContent = waiting
-        ? "下一单等待 · " +
-          (waiting.order_no || String(waiting.task_id || "").slice(0, 8) || "未命名") +
-          " · " +
-          Number(waiting.item_count || 0) +
-          " SKU"
-        : "";
     }
     if (progressLabel) progressLabel.textContent = done + " / " + total;
     if (progressMeta) {
@@ -513,6 +593,21 @@
     }
   }
 
+  function syncCurrentOrderListStatus(broker) {
+    if (!broker || !broker.ok || !currentOrderTaskId || !lastOrderListData) return;
+    const status = String(broker.status || "").trim();
+    if (!status || !Array.isArray(lastOrderListData.tasks)) return;
+    const index = lastOrderListData.tasks.findIndex(
+      (task) => task && String(task.task_id || "") === currentOrderTaskId
+    );
+    if (index < 0 || String(lastOrderListData.tasks[index].status || "") === status) {
+      return;
+    }
+    const tasks = lastOrderListData.tasks.slice();
+    tasks[index] = Object.assign({}, tasks[index], { status: status });
+    renderOrderList(Object.assign({}, lastOrderListData, { tasks: tasks }));
+  }
+
   function taskDetailNode(task) {
     if (!task || typeof task !== "object") return {};
     return task.task_detail && typeof task.task_detail === "object"
@@ -525,7 +620,9 @@
   function taskActionButtons(taskId, orderNo, status) {
     // Broker task writes are test-mode only; prod returns 403 upstream.
     if (currentDashboardMode !== "test" || !taskId) return "";
-    const disabled = taskActionBusy ? " disabled" : "";
+    // 只禁用正在提交的那一个按钮；其余任务的按钮保持可用。
+    const disabledFor = (actionName) =>
+      activeTaskActions.has(taskActionKey(taskId, actionName)) ? " disabled" : "";
     const attrs =
       ' data-task-id="' +
       escapeHtml(taskId) +
@@ -539,27 +636,58 @@
       buttons.push(
         '<button class="secondary dash-order-task-action" type="button" data-action="cancel"' +
           attrs +
-          disabled +
+          disabledFor("cancel") +
           ">取消任务</button>"
       );
     }
-    if (status === "running") {
+    // 人工流是单槽位：running 显示「转人工处理」，点击后 Broker 回
+    // manual_claimed_in_progress/manual_transferred，才换成「完成」。
+    const manualAction =
+      status === "running"
+        ? { name: "manual_claim", className: "danger", label: "转人工处理" }
+        : COMPLETABLE_STATUSES.has(status)
+          ? { name: "manual_complete", className: "primary", label: "完成" }
+          : null;
+    if (manualAction) {
       buttons.push(
-        '<button class="danger dash-order-task-action" type="button" data-action="manual_claim"' +
+        '<button class="' + manualAction.className + ' dash-order-task-action" type="button" data-action="' +
+          manualAction.name +
+          '"' +
           attrs +
-          disabled +
-          ">转人工处理</button>"
-      );
-    }
-    if (COMPLETABLE_STATUSES.has(status)) {
-      buttons.push(
-        '<button class="primary dash-order-task-action" type="button" data-action="manual_complete"' +
-          attrs +
-          disabled +
-          ">标记完成</button>"
+          disabledFor(manualAction.name) +
+          ">" + manualAction.label + "</button>"
       );
     }
     return buttons.join("");
+  }
+
+  function statusBadge(status) {
+    const raw = String(status || "");
+    if (!raw) return "—";
+    const tone = BROKER_STATUS_TONES[raw] || "other";
+    const label = BROKER_STATUS_LABELS[raw] || "";
+    return (
+      '<span class="dash-task-badge dash-task-badge-' + tone + '">' +
+      escapeHtml(raw) +
+      (label
+        ? '<br><span class="dash-task-badge-sub">' + escapeHtml(label) + "</span>"
+        : "") +
+      "</span>"
+    );
+  }
+
+  function sourceBadge(source) {
+    const raw = String(source || "");
+    if (!raw) return "—";
+    const label = ORDER_SOURCE_LABELS[raw] || "";
+    return (
+      '<span class="dash-task-badge dash-task-badge-source">' +
+      escapeHtml(raw) +
+      (label
+        ? '<br><span class="dash-task-badge-sub">' + escapeHtml(label) + "</span>"
+        : "") +
+      "</span>"
+    );
   }
 
   function renderOrderList(data) {
@@ -576,8 +704,9 @@
     if (pagesNode) pagesNode.textContent = String(orderListTotalPages);
     const prev = el("dash-order-list-prev");
     const next = el("dash-order-list-next");
-    if (prev) prev.disabled = orderListBusy || orderListPage <= 1;
-    if (next) next.disabled = orderListBusy || !orderListHasMore;
+    // 不看 orderListBusy：自动轮询不得影响分页按钮的可点击性。
+    if (prev) prev.disabled = orderListPage <= 1;
+    if (next) next.disabled = !orderListHasMore;
     if (meta) {
       const total = Math.max(0, Number(data.total || 0));
       meta.textContent =
@@ -587,9 +716,21 @@
         total.toLocaleString("zh-CN") +
         " 条 · 本页 " +
         tasks.length +
-        " 条";
+        " 条" +
+        (data.stale ? " · 数据更新中" : "");
     }
     if (!body) return;
+    // 这是唯一含按钮（查看详情/取消/转人工/完成）的重绘子树：内容未变就不重建，
+    // 否则 mousedown/mouseup 跨越重建时 click 会派到 tbody，closest() 拿不到按钮。
+    // 指纹必须包含 activeTaskActions，否则操作中的禁用态刷新会被跳过。
+    const renderKey = JSON.stringify([
+      tasks,
+      currentOrderTaskId,
+      currentDashboardMode,
+      Array.from(activeTaskActions).sort(),
+    ]);
+    if (renderKey === lastOrderListRenderKey) return;
+    lastOrderListRenderKey = renderKey;
     if (!tasks.length) {
       body.innerHTML = '<tr><td colspan="7" class="dash-order-list-empty">暂无任务</td></tr>';
       return;
@@ -600,6 +741,7 @@
         const taskId = String(task.task_id || "");
         const orderNo = String(task.order_no || detail.order_no || "");
         const source = String(task.order_source || detail.order_source || "");
+        // 订单状态直出 Broker 原值，不做本地覆盖。
         const status = String(task.status || "");
         const businessMode = String(
           task.business_mode_code || detail.business_mode_code || ""
@@ -611,8 +753,8 @@
           "<td>" + escapeHtml(orderNo || "—") +
           (isCurrent ? '<span class="dash-order-list-current">当前</span>' : "") +
           "</td>" +
-          "<td>" + escapeHtml(source || "—") + "</td>" +
-          "<td>" + escapeHtml(BROKER_STATUS_LABELS[status] || status || "—") + "</td>" +
+          "<td>" + sourceBadge(source) + "</td>" +
+          "<td>" + statusBadge(status) + "</td>" +
           "<td class=\"mono\">" + escapeHtml(businessMode || "—") + "</td>" +
           "<td class=\"mono\">" + escapeHtml(taskId || "—") + "</td>" +
           '<td><div class="dash-order-list-ops">' +
@@ -625,15 +767,38 @@
       .join("");
   }
 
-  async function refreshOrderList(forceRefresh) {
-    if (orderListBusy) return;
+  // manual=true 表示用户亲自触发（刷新/翻页/筛选）：必须立即执行，不能被
+  // 进行中的自动轮询吞掉，否则接口慢时按钮看上去彻底失灵。
+  async function refreshOrderList(forceRefresh, manual) {
+    if (orderListBusy) {
+      if (!manual) {
+        orderListRefreshPending = true;
+        orderListRefreshPendingForce =
+          orderListRefreshPendingForce || Boolean(forceRefresh);
+        return;
+      }
+      // 手动操作抢占：中止进行中的自动请求再继续。被中止的那一轮会在
+      // finally 里发现自己已不是当前请求，不再回写任何状态。
+      if (orderListAbortController) orderListAbortController.abort();
+      orderListRefreshPending = false;
+      orderListRefreshPendingForce = false;
+    }
     orderListBusy = true;
+    const controller = new AbortController();
+    orderListAbortController = controller;
     const meta = el("dash-order-list-meta");
-    if (meta) meta.textContent = "读取 Broker 任务并统计总数…";
+    // Automatic polling is silent; keep the last list visible while Broker is
+    // queried. Manual refresh/initial load may show progress to the user.
+    if (meta && (manual || forceRefresh || !lastOrderListData)) {
+      meta.textContent = "读取 Broker 任务并统计总数…";
+    }
     const prev = el("dash-order-list-prev");
     const next = el("dash-order-list-next");
-    if (prev) prev.disabled = true;
-    if (next) next.disabled = true;
+    // 只有手动操作才瞬时禁用分页按钮（给用户反馈）；自动轮询不动。
+    if (manual) {
+      if (prev) prev.disabled = true;
+      if (next) next.disabled = true;
+    }
     try {
       const status = el("dash-order-list-status");
       const size = el("dash-order-list-size");
@@ -645,19 +810,96 @@
         tz: "Asia/Shanghai",
       });
       if (forceRefresh) query.set("refresh", "1");
-      const response = await fetch("/api/order/tasks?" + query.toString());
+      const response = await fetch("/api/order/tasks?" + query.toString(), {
+        cache: "no-store",
+        signal: controller.signal,
+      });
       const data = await readJson(response);
       if (!response.ok) {
         throw new Error(data.error || "任务列表获取失败");
       }
       renderOrderList(data);
     } catch (error) {
-      if (meta) meta.textContent = error.message || String(error);
+      if (!error || error.name !== "AbortError") {
+        if (meta) meta.textContent = error.message || String(error);
+      }
     } finally {
-      orderListBusy = false;
-      if (prev) prev.disabled = orderListPage <= 1;
-      if (next) next.disabled = !orderListHasMore;
+      // 已被手动请求抢占时，本轮不得回写 busy/按钮/pending 任何状态，
+      // 否则会把正在飞的手动请求的 busy 提前清掉。
+      if (orderListAbortController === controller) {
+        orderListAbortController = null;
+        orderListBusy = false;
+        if (prev) prev.disabled = orderListPage <= 1;
+        if (next) next.disabled = !orderListHasMore;
+        if (orderListRefreshPending) {
+          const pendingForce = orderListRefreshPendingForce;
+          orderListRefreshPending = false;
+          orderListRefreshPendingForce = false;
+          if (dashboardVisible) {
+            global.setTimeout(() => refreshOrderList(pendingForce), 0);
+          }
+        }
+      }
     }
+  }
+
+  function detailSummary(data) {
+    // 解析 Broker 任务详情为可读摘要；原始 JSON 仍放在 details 折叠区。
+    const detail =
+      data && typeof data === "object"
+        ? (data.data && typeof data.data === "object" ? data.data : data)
+        : {};
+    const params =
+      detail.params && typeof detail.params === "object" ? detail.params : {};
+    const pick = (...vals) => {
+      for (const value of vals) {
+        const text = String(value == null ? "" : value).trim();
+        if (text) return text;
+      }
+      return "";
+    };
+    const status = pick(detail.status);
+    const statusText = status
+      ? status + (BROKER_STATUS_LABELS[status] ? "（" + BROKER_STATUS_LABELS[status] + "）" : "")
+      : "—";
+    const source = pick(params.order_source, detail.order_source);
+    const sourceText = source
+      ? source + (ORDER_SOURCE_LABELS[source] ? "（" + ORDER_SOURCE_LABELS[source] + "）" : "")
+      : "—";
+    const storeParts = [
+      pick(detail.store_id, params.store_id),
+      pick(detail.store_name, params.store_name),
+    ].filter(Boolean);
+    const lines = [
+      "任务 task_id：" + (pick(detail.task_id) || "—"),
+      "订单号：" + (pick(params.order_no, detail.order_no) || "—"),
+      "状态：" + statusText,
+      "业务模式：" + (pick(detail.business_mode_code, params.business_mode_code) || "—"),
+      "来源：" + sourceText,
+      "创建时间：" + (pick(detail.create_time, params.create_time, detail.order_time, params.order_time) || "—"),
+      "门店：" + (storeParts.length ? storeParts.join(" ") : "—"),
+    ];
+    const items = Array.isArray(params.items) ? params.items : [];
+    if (items.length) {
+      lines.push("商品明细（" + items.length + " 项）：");
+      items.forEach((item, index) => {
+        if (!item || typeof item !== "object") return;
+        const name = pick(item.common_name, item.item_name, item.name);
+        const parts = [
+          pick(item.item_id),
+          name,
+          "×" + (item.quantity || 1),
+        ];
+        const location = pick(item.location_code);
+        if (location) parts.push("@" + location);
+        const extra = [pick(item.batch_number), pick(item.expiry_date)].filter(Boolean);
+        lines.push(
+          "  " + (index + 1) + ". " + parts.filter(Boolean).join(" ") +
+          (extra.length ? "（" + extra.join(" / ") + "）" : "")
+        );
+      });
+    }
+    return lines.join("\n");
   }
 
   async function showOrderDetail(taskId) {
@@ -674,7 +916,7 @@
       }
       await global.KsqDialog.notice({
         title: "任务详情",
-        message: "task_id " + taskId,
+        message: detailSummary(data),
         details: data,
         confirmText: "关闭",
       });
@@ -684,11 +926,13 @@
   }
 
   async function runTaskAction(action, taskId, orderNo) {
-    if (taskActionBusy || !taskId) return;
+    if (!taskId) return;
+    // 只挡同一任务同一动作的重复提交；其他任务的操作不受影响。
+    if (activeTaskActions.has(taskActionKey(taskId, action))) return;
     const labels = {
       cancel: "取消任务",
       manual_claim: "人工转单",
-      manual_complete: "标记完成",
+      manual_complete: "完成",
     };
     const target = orderNo || taskId.slice(0, 8) || "—";
     let body = {};
@@ -723,13 +967,13 @@
           target +
           (action === "manual_claim"
             ? " 执行人工转单？机器人将停止处理该订单。"
-            : " 标记人工处理完成？"),
+            : " 的人工处理并完成上一单？"),
         confirmText: "确认" + labels[action],
         cancelText: "返回",
       });
       if (!confirmed) return;
     }
-    taskActionBusy = true;
+    activeTaskActions.add(taskActionKey(taskId, action));
     if (lastOrderListData) renderOrderList(lastOrderListData);
     const path = action === "cancel" ? "cancel" : action.replace("_", "-");
     try {
@@ -750,7 +994,6 @@
         });
         return;
       }
-      taskActionBusy = false;
       await refresh();
       await refreshOrderList(true);
       await global.KsqDialog.notice({
@@ -762,7 +1005,7 @@
     } catch (error) {
       setDetail(error.message || String(error), true);
     } finally {
-      taskActionBusy = false;
+      activeTaskActions.delete(taskActionKey(taskId, action));
       if (lastOrderListData) renderOrderList(lastOrderListData);
     }
   }
@@ -772,6 +1015,10 @@
     const count = el("dash-task-count");
     if (!list) return;
     const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+    // 同上：内容未变则跳过重绘，避免无意义地销毁重建子树。
+    const renderKey = JSON.stringify([tasks, String(data.active_code || "")]);
+    if (renderKey === lastTasksRenderKey) return;
+    lastTasksRenderKey = renderKey;
     if (count) count.textContent = tasks.length + " 个";
     if (!tasks.length) {
       list.innerHTML =
@@ -779,10 +1026,34 @@
       return;
     }
     const activeCode = String(data.active_code || "");
+    const groupCounts = new Map();
+    tasks.forEach((task) => {
+      const groupId = String(task.group_id || "");
+      const groupField = String(task.group_field || "组合");
+      const groupKey = groupId ? groupField + "\u0000" + groupId : "";
+      if (groupKey) {
+        groupCounts.set(groupKey, (groupCounts.get(groupKey) || 0) + 1);
+      }
+    });
+    let previousGroup = "";
     list.innerHTML = tasks
       .map((task, index) => {
         const code = String(task.code || task.barcode || "");
         const barcode = String(task.barcode || task.code || task.sku_code || "—");
+        const groupId = String(task.group_id || "");
+        const groupField = String(task.group_field || "组合");
+        const groupKey = groupId ? groupField + "\u0000" + groupId : "";
+        const groupHeader =
+          groupKey && groupKey !== previousGroup
+            ? '<div class="dash-task-group-heading"><strong>' +
+              escapeHtml(groupField) +
+              " · " +
+              escapeHtml(groupId) +
+              "</strong><span>" +
+              escapeHtml(String(groupCounts.get(groupKey) || 0)) +
+              " 个 SKU</span></div>"
+            : "";
+        previousGroup = groupKey;
         const status = String(task.status || "pending");
         const name = String(task.name || barcode || code || "未命名商品");
         const location = String(task.location_code || "—");
@@ -799,6 +1070,7 @@
         if (status === "success") classes.push("is-success");
         if (status === "skipped") classes.push("is-skipped");
         return (
+          groupHeader +
           '<article class="' +
           classes.join(" ") +
           '" data-code="' +
@@ -833,15 +1105,9 @@
       .join("");
   }
 
-  function clearModalDismissTimer() {
-    if (!modalDismissTimer) return;
-    global.clearTimeout(modalDismissTimer);
-    modalDismissTimer = 0;
-  }
 
   async function dismissModal() {
     // Close only: never inject confirm / continue robot.
-    clearModalDismissTimer();
     handledFingerprint = lastFingerprint;
     hideModal();
     // Sync dismiss so other devices also hide this await modal.
@@ -857,14 +1123,12 @@
   }
 
   function showModal(data, options) {
-    const opts = options && typeof options === "object" ? options : {};
     const modal = el("dash-confirm-modal");
     const title = el("dash-modal-title");
     const body = el("dash-modal-body");
     const line = el("dash-modal-line");
     const badge = el("dash-modal-badge");
     if (!modal) return;
-    clearModalDismissTimer();
     modalOpen = true;
     modal.hidden = false;
     const current = data.current_item || {};
@@ -896,19 +1160,11 @@
             "日志检测到人工确认播报。确认后将继续流程。";
     }
     if (line) line.textContent = data.await_line || current.await_line || "";
-    // Error only: after 3s just close the modal (稍后处理), do not confirm.
-    const allowErrorAutoDismiss = opts.autoDismissError !== false;
-    if (isError && allowErrorAutoDismiss) {
-      modalDismissTimer = global.setTimeout(() => {
-        modalDismissTimer = 0;
-        if (!modalOpen) return;
-        dismissModal();
-      }, ERROR_AUTO_DISMISS_MS);
-    }
+    // 报错弹窗一直保留到人工处理（确认/稍后处理），不自动关闭——
+    // 自动关闭会把该提示的指纹同步为已忽略，之后同一报错永不再弹。
   }
 
   function hideModal() {
-    clearModalDismissTimer();
     const modal = el("dash-confirm-modal");
     if (modal) modal.hidden = true;
     modalOpen = false;
@@ -941,16 +1197,29 @@
         ? "更新 " + formatClock(data.polled_at)
         : "等待更新";
     }
+    // 日志不可用时，处理进度无从得知；不能假装成“空闲/尚未开始”，
+    // 也不应遮住 Broker 侧已知的工单状态。
+    const logsDown = data.log_available === false && !!data.service_running;
     if (statusLabel) {
-      statusLabel.textContent =
-        current.status_label || data.status_label || status || "—";
+      const brokerLabel =
+        (data.broker_order && data.broker_order.status_label) || "";
+      statusLabel.textContent = logsDown
+        ? brokerLabel || "日志不可用"
+        : current.status_label || data.status_label || status || "—";
     }
     if (currentItem) {
       const name = current.name || current.code || data.object_hint || "";
       const location = current.location_code || "";
-      currentItem.textContent = name
-        ? name + (location ? " · 库位 " + location : "")
-        : "尚未开始处理商品";
+      if (name) {
+        currentItem.textContent =
+          name + (location ? " · 库位 " + location : "");
+      } else if (logsDown) {
+        currentItem.textContent =
+          "无法读取机器人日志，当前子任务未知" +
+          (data.log_error ? "：" + data.log_error : "");
+      } else {
+        currentItem.textContent = "尚未开始处理商品";
+      }
     }
     if (orderElapsed) {
       orderElapsed.textContent = formatSeconds(orderElapsedSeconds(data));
@@ -974,7 +1243,7 @@
     renderTasks(data);
     renderEvents(data.events);
 
-    if (data.error) setDetail(data.error, true);
+    if (data.error) setDetail(data.error, true, false);
     else setDetail("", false);
   }
 
@@ -1008,17 +1277,32 @@
         status: lastStatus,
         service_running: true,
       });
-      buttons.forEach((button) => {
-        if (button && button.id === "dash-modal-confirm") button.disabled = false;
-      });
     }
   }
 
-  async function refresh() {
-    if (busy) return;
+  async function refresh(forceOrderList, manual) {
+    if (busy) {
+      if (!manual) {
+        refreshPending = true;
+        refreshPendingForce = refreshPendingForce || Boolean(forceOrderList);
+        return;
+      }
+      // 手动刷新抢占：中止进行中的自动快照，否则按钮看上去没反应。
+      if (statusAbortController) statusAbortController.abort();
+      refreshPending = false;
+      refreshPendingForce = false;
+    }
     busy = true;
+    const controller = new AbortController();
+    statusAbortController = controller;
     try {
-      const response = await fetch("/api/dashboard/status?tail=2500");
+      const response = await fetch(
+        "/api/dashboard/status?tail=2500" + (manual ? "&refresh=1" : ""),
+        {
+          cache: "no-store",
+          signal: controller.signal,
+        }
+      );
       const data = await readJson(response);
       if (!response.ok) throw new Error(data.error || "读取仪表板失败");
       if (Object.prototype.hasOwnProperty.call(data, "auto_confirm")) {
@@ -1026,13 +1310,16 @@
       }
       const wasBrokerConfigured = brokerConfigured;
       brokerConfigured = data.broker_configured !== false;
-      render(data);
-      if (brokerConfigured && (!orderListLoaded || !wasBrokerConfigured)) {
-        orderListLoaded = true;
-        refreshOrderList();
-      } else if (!brokerConfigured) {
-        orderListLoaded = false;
-        showBrokerNotConfigured();
+      lastStatusData = data;
+      if (dashboardVisible) {
+        render(data);
+        if (brokerConfigured && (!orderListLoaded || !wasBrokerConfigured)) {
+          orderListLoaded = true;
+          refreshOrderList(forceOrderList);
+        } else if (!brokerConfigured) {
+          orderListLoaded = false;
+          showBrokerNotConfigured();
+        }
       }
       const fp = fingerprint(data);
       lastFingerprint = fp;
@@ -1044,11 +1331,9 @@
         const autoOn = autoConfirmEnabled();
         // Always show the popup first; auto-confirm clicks through after a short show.
         if (!modalOpen) {
-          showModal(data, { autoDismissError: !autoOn });
+          showModal(data);
         }
         if (autoOn) {
-          clearModalDismissTimer();
-          handledFingerprint = fp;
           await new Promise((resolve) => {
             global.setTimeout(resolve, AUTO_CONFIRM_SHOW_MS);
           });
@@ -1057,8 +1342,10 @@
           }
         }
       } else if (!data.needs_confirm) {
-        // Physical key or software confirm already cleared await_*.
-        if (modalOpen || handledFingerprint !== fp) {
+        // 提示消失分两种：被确认/关闭（confirm_closed，日志出现「继续」类行）
+        // —— 记录指纹防复弹；以及提示行短暂滚出解析窗口（闪烁）——不记录，
+        // 否则同一提示恢复时会被误判为已处理而永不再弹。
+        if (data.confirm_closed) {
           handledFingerprint = fp;
         }
         hideModal();
@@ -1067,56 +1354,110 @@
         hideModal();
       }
     } catch (error) {
-      setDetail(error.message || String(error), true);
-      updateLiveDot("failed", false);
-      const badge = el("dash-service-badge");
-      if (badge) badge.textContent = "接口异常";
+      if (dashboardVisible && (!error || error.name !== "AbortError")) {
+        setDetail(error.message || String(error), true, false);
+        updateLiveDot("failed", false);
+        const badge = el("dash-service-badge");
+        if (badge) badge.textContent = "接口异常";
+      }
     } finally {
-      busy = false;
+      // 被手动刷新抢占时，本轮不得回写 busy，也不得接管轮询排程。
+      if (statusAbortController === controller) {
+        statusAbortController = null;
+        busy = false;
+        const hadPending = refreshPending;
+        const pendingForce = refreshPendingForce;
+        refreshPending = false;
+        refreshPendingForce = false;
+        // 不再 0ms 立即重发：统一走调度，保证两次请求之间必有间隙。
+        if (active) scheduleNextPoll(hadPending ? pendingForce : undefined);
+      }
     }
   }
 
-  function stopPoll() {
+  // 轮询间隔：活跃时 1s，空闲/终态时 4s。
+  function pollDelayFor(data) {
+    if (!data || data.needs_confirm) return ACTIVE_POLL_MS;
+    const order = data.order || {};
+    if (ACTIVE_BROKER_STATUSES.has(String(order.status || ""))) {
+      return ACTIVE_POLL_MS;
+    }
+    return IDLE_FOCUS_STATUSES.has(focusStatus(data))
+      ? IDLE_POLL_MS
+      : ACTIVE_POLL_MS;
+  }
+
+  function scheduleNextPoll(forceOrderList) {
+    if (!active) return;
     if (timerId) {
-      global.clearInterval(timerId);
+      global.clearTimeout(timerId);
       timerId = 0;
     }
+    timerId = global.setTimeout(() => {
+      timerId = 0;
+      if (active) refresh(forceOrderList);
+    }, pollDelayFor(lastStatusData));
   }
 
-  function startPoll() {
-    stopPoll();
-    timerId = global.setInterval(() => {
-      if (active) refresh();
-    }, POLL_MS);
+  function stopOrderListPoll() {
+    if (orderListTimerId) {
+      global.clearInterval(orderListTimerId);
+      orderListTimerId = 0;
+    }
+  }
+
+  function startOrderListPoll() {
+    stopOrderListPoll();
+    orderListTimerId = global.setInterval(() => {
+      if (dashboardVisible && brokerConfigured) refreshOrderList(false);
+    }, ORDER_LIST_POLL_MS);
+  }
+
+  function start() {
+    if (active) return;
+    active = true;
+    refresh();
   }
 
   function activate(options) {
-    active = true;
+    dashboardVisible = true;
+    start();
     if (options && options.taskId) focusTaskId = String(options.taskId);
     orderListPage = 1;
     orderListLoaded = false;
-    refresh();
-    startPoll();
+    if (lastStatusData) render(lastStatusData);
+    // Refresh the task list in parallel with the status snapshot on return;
+    // the list endpoint is the slower Broker request and should not block the
+    // first dashboard render.
+    if (brokerConfigured) {
+      orderListLoaded = true;
+      refreshOrderList(true);
+    }
+    refresh(true);
+    startOrderListPoll();
   }
 
   function deactivate() {
-    active = false;
-    stopPoll();
+    dashboardVisible = false;
+    stopOrderListPoll();
+    if (orderListAbortController) orderListAbortController.abort();
   }
 
   function bind() {
     const refreshBtn = el("dash-refresh");
-    if (refreshBtn) refreshBtn.addEventListener("click", () => refresh());
+    if (refreshBtn) refreshBtn.addEventListener("click", () => refresh(false, true));
     const confirmBtn = el("dash-confirm-now");
     if (confirmBtn) confirmBtn.addEventListener("click", () => injectConfirm());
-    const modalConfirm = el("dash-modal-confirm");
-    if (modalConfirm) {
-      modalConfirm.addEventListener("click", () => injectConfirm());
-    }
     const modalDismiss = el("dash-modal-dismiss");
-    if (modalDismiss) {
-      modalDismiss.addEventListener("click", () => dismissModal());
-    }
+    if (modalDismiss) modalDismiss.addEventListener("click", () => dismissModal());
+    const modalConfirm = el("dash-modal-confirm");
+    if (modalConfirm) modalConfirm.addEventListener("click", () => injectConfirm());
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && modalOpen) {
+        event.preventDefault();
+        dismissModal();
+      }
+    });
     const autoConfirm = el("dash-auto-confirm");
     if (autoConfirm) {
       autoConfirm.addEventListener("change", () => {
@@ -1131,15 +1472,15 @@
       });
     }
     const listRefresh = el("dash-order-list-refresh");
-    if (listRefresh) listRefresh.addEventListener("click", () => refreshOrderList(true));
+    if (listRefresh) listRefresh.addEventListener("click", () => refreshOrderList(true, true));
     const listStatus = el("dash-order-list-status");
-    if (listStatus) listStatus.addEventListener("change", () => { orderListPage = 1; refreshOrderList(); });
+    if (listStatus) listStatus.addEventListener("change", () => { orderListPage = 1; refreshOrderList(false, true); });
     const listSize = el("dash-order-list-size");
-    if (listSize) listSize.addEventListener("change", () => { orderListPage = 1; refreshOrderList(); });
+    if (listSize) listSize.addEventListener("change", () => { orderListPage = 1; refreshOrderList(false, true); });
     const listPrev = el("dash-order-list-prev");
-    if (listPrev) listPrev.addEventListener("click", () => { if (orderListPage > 1) { orderListPage -= 1; refreshOrderList(); } });
+    if (listPrev) listPrev.addEventListener("click", () => { if (orderListPage > 1) { orderListPage -= 1; refreshOrderList(false, true); } });
     const listNext = el("dash-order-list-next");
-    if (listNext) listNext.addEventListener("click", () => { if (orderListHasMore) { orderListPage += 1; refreshOrderList(); } });
+    if (listNext) listNext.addEventListener("click", () => { if (orderListHasMore) { orderListPage += 1; refreshOrderList(false, true); } });
     const listBody = el("dash-order-list-body");
     if (listBody) listBody.addEventListener("click", (event) => {
       if (!(event.target instanceof Element)) return;
@@ -1161,8 +1502,7 @@
 
   async function registerOrder(session) {
     if (!session || typeof session !== "object") return;
-    // /api/order/create has already registered the current/waiting order.
-    // Posting a queued session here would overwrite the order being executed.
+    // /api/order/create already registered the active order. Avoid overwriting it.
     if (session.queue_position != null) return;
     focusTaskId = String(session.task_id || focusTaskId || "");
     try {
@@ -1177,6 +1517,7 @@
   }
 
   global.KsqDashboard = {
+    start: start,
     activate: activate,
     deactivate: deactivate,
     refresh: refresh,
@@ -1185,10 +1526,7 @@
       if (typeof payload === "string" || payload == null) {
         session = { task_id: payload || "" };
       }
-      const queued = !!(session && Number(session.queue_position) > 0);
-      if (!queued) {
-        focusTaskId = String((session && session.task_id) || "");
-      }
+      focusTaskId = String((session && session.task_id) || "");
       await registerOrder(session || {});
       if (global.KsqShell && global.KsqShell.showView) {
         global.KsqShell.showView("dashboard");

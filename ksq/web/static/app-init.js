@@ -250,6 +250,10 @@
       if (view === "logs") global.KsqLogs.activate();
       else if (global.KsqLogs.deactivate) global.KsqLogs.deactivate();
     }
+    if (global.KsqOrderOps) {
+      if (view === "order-ops") global.KsqOrderOps.activate();
+      else global.KsqOrderOps.deactivate();
+    }
     if (view === "test-order" && global.KsqTestOrder) {
       global.KsqTestOrder.activate();
     } else if (global.KsqTestOrder && global.KsqTestOrder.deactivate) {
@@ -285,6 +289,9 @@
 
   async function boot() {
     const initial = global.KsqShell.readInitialView();
+    if (global.KsqDashboard && global.KsqDashboard.start) {
+      global.KsqDashboard.start();
+    }
     try {
       try {
         const response = await fetch("/api/status");

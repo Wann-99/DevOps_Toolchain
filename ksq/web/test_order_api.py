@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import math
 import random
 import threading
 import time
@@ -99,7 +101,7 @@ def _parse_key(raw: object) -> Optional[Tuple[str, str, str]]:
     if not text or "|" not in text:
         return None
     parts = text.split("|")
-    if len(parts) < 2:
+    if len(parts) not in {2, 3}:
         return None
     sku = parts[0].strip()
     location = parts[1].strip().replace("-", "")
@@ -111,12 +113,37 @@ def _parse_key(raw: object) -> Optional[Tuple[str, str, str]]:
 
 def _parse_ratio(source: Dict[str, object], key: str, default: object) -> float:
     try:
-        ratio = float(source.get(key, default))
+        value = source.get(key, default)
+        if isinstance(value, bool):
+            raise ValueError
+        ratio = float(value)
     except (TypeError, ValueError) as error:
         raise ValueError(f"{key} 必须是数字。") from error
-    if ratio < 0 or ratio > 1:
+    if not math.isfinite(ratio) or ratio < 0 or ratio > 1:
         raise ValueError(f"{key} 必须在 0~1 之间。")
     return ratio
+
+
+def _parse_integer(value: object, key: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{key} 必须是整数。")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        digits = text.lstrip("+-")
+        if digits and digits.isdigit():
+            return int(text)
+    raise ValueError(f"{key} 必须是整数。")
+
+
+def _parse_bool(source: Dict[str, object], key: str, default: bool) -> bool:
+    value = source.get(key, default)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} 必须是布尔值。")
+    return value
 
 
 def _load_packaging_choices() -> List[str]:
@@ -140,28 +167,32 @@ _PACKAGING_CHOICES_CACHE_SECONDS = 60.0
 _packaging_choices_lock = threading.Lock()
 _packaging_choices_cache_at = 0.0
 _packaging_choices_cache: Optional[List[str]] = None
+_packaging_choices_cache_revision: Optional[int] = None
 
 
 def _candidate_packaging_choices() -> List[str]:
     global _packaging_choices_cache_at, _packaging_choices_cache
+    global _packaging_choices_cache_revision
     with _packaging_choices_lock:
         now = time.monotonic()
         if (
             _packaging_choices_cache is not None
+            and _packaging_choices_cache_revision == state.data_revision
             and now - _packaging_choices_cache_at < _PACKAGING_CHOICES_CACHE_SECONDS
         ):
             return list(_packaging_choices_cache)
         choices = _load_packaging_choices()
         _packaging_choices_cache = choices
         _packaging_choices_cache_at = now
+        _packaging_choices_cache_revision = state.data_revision
         return list(choices)
 
 
 def _normalize_config(raw: object) -> Dict[str, object]:
     source = raw if isinstance(raw, dict) else {}
     try:
-        count = int(source.get("count", DEFAULT_CONFIG["count"]))
-    except (TypeError, ValueError) as error:
+        count = _parse_integer(source.get("count", DEFAULT_CONFIG["count"]), "count")
+    except ValueError as error:
         raise ValueError("count 必须是整数。") from error
     if count < 1:
         raise ValueError("count 必须 >= 1。")
@@ -170,15 +201,15 @@ def _normalize_config(raw: object) -> Dict[str, object]:
         seed_value: Optional[int] = None
     else:
         try:
-            seed_value = int(source.get("seed"))
-        except (TypeError, ValueError) as error:
+            seed_value = _parse_integer(source.get("seed"), "seed")
+        except ValueError as error:
             raise ValueError("seed 必须是整数或留空。") from error
 
     # migrate old keys: small_enabled -> closed_loop_enabled
     if "closed_loop_enabled" in source:
-        closed_loop_enabled = bool(source.get("closed_loop_enabled"))
+        closed_loop_enabled = _parse_bool(source, "closed_loop_enabled", True)
     elif "small_enabled" in source:
-        closed_loop_enabled = bool(source.get("small_enabled"))
+        closed_loop_enabled = _parse_bool(source, "small_enabled", True)
     else:
         closed_loop_enabled = bool(DEFAULT_CONFIG["closed_loop_enabled"])
 
@@ -193,9 +224,11 @@ def _normalize_config(raw: object) -> Dict[str, object]:
     else:
         closed_loop_ratio = float(DEFAULT_CONFIG["closed_loop_ratio"])
 
-    tool_enabled = bool(source.get("tool_enabled", DEFAULT_CONFIG["tool_enabled"]))
-    packaging_enabled = bool(
-        source.get("packaging_enabled", DEFAULT_CONFIG["packaging_enabled"])
+    tool_enabled = _parse_bool(
+        source, "tool_enabled", bool(DEFAULT_CONFIG["tool_enabled"])
+    )
+    packaging_enabled = _parse_bool(
+        source, "packaging_enabled", bool(DEFAULT_CONFIG["packaging_enabled"])
     )
 
     tool_ratio = _parse_ratio(
@@ -271,7 +304,14 @@ def _load_state_file() -> Dict[str, object]:
         state_data["ordered"],  # type: ignore[arg-type]
     )
     state_data["summary"] = summarize(state_data["pending"])  # type: ignore[arg-type]
-    state_data["candidate_count"] = int(payload.get("candidate_count") or 0)
+    raw_candidate_count = payload.get("candidate_count", 0)
+    try:
+        candidate_count = _parse_integer(raw_candidate_count or 0, "candidate_count")
+        if candidate_count < 0:
+            raise ValueError
+    except ValueError:
+        candidate_count = 0
+    state_data["candidate_count"] = candidate_count
     state_data["columns"] = _normalize_columns(payload.get("columns"))
     state_data["group_mode"] = _normalize_group_mode(payload.get("group_mode"))
     state_data["group_field"] = str(payload.get("group_field") or "")
@@ -314,7 +354,25 @@ def _normalize_order_batches(
         ]
         if not keys:
             continue
-        batch_id = str(raw.get("batch_id") or "").strip() or uuid4().hex
+        batch_id = str(raw.get("batch_id") or "").strip()
+        if not batch_id:
+            # Keep polling fingerprints stable for legacy batches that were
+            # persisted without an ID; random UUIDs would force a redraw on
+            # every state request.
+            stable_payload = json.dumps(
+                {
+                    "ordered_at": str(raw.get("ordered_at") or ""),
+                    "order_no": str(raw.get("order_no") or ""),
+                    "task_id": str(raw.get("task_id") or ""),
+                    "item_keys": keys,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            batch_id = "batch-" + hashlib.sha256(
+                stable_payload.encode("utf-8")
+            ).hexdigest()[:16]
         batch = {
             "batch_id": batch_id,
             "ordered_at": str(raw.get("ordered_at") or ""),
@@ -431,6 +489,17 @@ def get_state() -> Dict[str, object]:
     return _public_state(_load_state_file())
 
 
+def update_config(payload: Dict[str, object]) -> Dict[str, object]:
+    """Persist generation switches without regenerating or changing lists."""
+    current = _load_state_file()
+    config_payload = payload.get("config") if isinstance(payload, dict) else payload
+    config = _normalize_config(config_payload)
+    next_state = dict(current)
+    next_state["config"] = config
+    _save_state(next_state)
+    return _public_state(next_state)
+
+
 def generate(payload: Dict[str, object]) -> Dict[str, object]:
     config = _normalize_config(payload.get("config") if "config" in payload else payload)
     seed = config["seed"]
@@ -526,9 +595,13 @@ def import_csv(payload: Dict[str, object]) -> Dict[str, object]:
     tools = load_tool_mapping(state.configured_tool_mapping)
     small_skus = load_small_skus(state.configured_pick_strategy)
     packaging = load_packaging(state.configured_knowledge)
-    candidates = load_candidates(
-        state.configured_shelves, unavailable, tools, small_skus, packaging
-    )
+    try:
+        candidates = load_candidates(
+            state.configured_shelves, unavailable, tools, small_skus, packaging
+        )
+    except OSError:
+        # 候选数据只用来补全属性，缺失时仍按原文件导入（商品是否存在由下单接口报错）
+        candidates = []
     imported, errors, columns = parse_import_csv_full(
         csv_text,
         candidates,
@@ -584,6 +657,54 @@ def _move_keys(
     return next_source, next_target, moved
 
 
+def _idempotent_order_state(
+    current: Dict[str, object],
+    wanted: Set[Tuple[str, str, str]],
+    payload: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    """Return the current state when a completed mark request is retried.
+
+    A Broker order can already exist when the HTTP response for the first
+    mark request is lost.  Only accept a retry when an identity supplied by
+    the caller matches a persisted, non-legacy batch containing every key.
+    """
+    task_id = str(payload.get("task_id") or "").strip()
+    order_no = str(payload.get("order_no") or "").strip()
+    if not task_id and not order_no:
+        return None
+    wanted_text = {
+        f"{sku}|{location}|{group}" if group else f"{sku}|{location}"
+        for sku, location, group in wanted
+    }
+    ordered = current.get("ordered")
+    if not isinstance(ordered, list):
+        return None
+    batches = _normalize_order_batches(
+        current.get("order_batches", []),  # type: ignore[arg-type]
+        ordered,  # type: ignore[arg-type]
+    )
+    for batch in batches:
+        if str(batch.get("batch_id") or "").strip() == "legacy":
+            continue
+        batch_keys = {str(key) for key in batch.get("item_keys", [])}
+        if batch_keys != wanted_text:
+            continue
+        batch_task_id = str(batch.get("task_id") or "").strip()
+        batch_order_no = str(batch.get("order_no") or "").strip()
+        if task_id and task_id != batch_task_id:
+            continue
+        if order_no and order_no != batch_order_no:
+            continue
+        # Legacy/unidentified batches must never make a new external order
+        # look already synchronized.
+        if task_id and not batch_task_id:
+            continue
+        if order_no and not batch_order_no:
+            continue
+        return _public_state(current)
+    return None
+
+
 def mark_ordered(payload: Dict[str, object]) -> Dict[str, object]:
     keys_raw = payload.get("keys")
     if not isinstance(keys_raw, list) or not keys_raw:
@@ -598,8 +719,20 @@ def mark_ordered(payload: Dict[str, object]) -> Dict[str, object]:
     current = _load_state_file()
     pending: List[Dict[str, str]] = current["pending"]  # type: ignore[assignment]
     ordered: List[Dict[str, str]] = current["ordered"]  # type: ignore[assignment]
+    pending_identities = {_item_identity(item) for item in pending}
+    ordered_identities = {_item_identity(item) for item in ordered}
+    missing = wanted - pending_identities - ordered_identities
+    if missing:
+        raise ValueError("所选 SKU 不存在或已被刷新，请重新选择后重试。")
     next_pending, _, moved = _move_keys(pending, ordered, wanted)
+    ordered_wanted = ordered_identities & wanted
+    if moved and ordered_wanted:
+        raise ValueError("所选 SKU 同时包含已下单和待下单项目，请刷新后重试。")
     if not moved:
+        idempotent = _idempotent_order_state(current, wanted, payload)
+        if idempotent is not None:
+            idempotent["idempotent"] = True
+            return idempotent
         raise ValueError("未在待下单 SKU 列表中找到要移动的药品。")
 
     moved_keys = {_item_key_text(item) for item in moved}
@@ -658,6 +791,76 @@ def mark_ordered(payload: Dict[str, object]) -> Dict[str, object]:
         **_view_scheme(current),
     }
     next_state["summary"] = summarize(next_state["pending"])  # type: ignore[arg-type]
+    _save_state(next_state)
+    return _public_state(next_state)
+
+
+def restore(payload: Dict[str, object]) -> Dict[str, object]:
+    """Move selected local rows back to pending without cancelling Broker orders."""
+    keys_raw = payload.get("keys")
+    if not isinstance(keys_raw, list) or not keys_raw:
+        raise ValueError("keys 不能为空。")
+    wanted: Set[Tuple[str, str, str]] = set()
+    for raw in keys_raw:
+        parsed = _parse_key(raw)
+        if parsed is None:
+            raise ValueError(f"无效 key：{raw}")
+        wanted.add(parsed)
+
+    current = _load_state_file()
+    pending: List[Dict[str, str]] = current["pending"]  # type: ignore[assignment]
+    ordered: List[Dict[str, str]] = current["ordered"]  # type: ignore[assignment]
+    pending_identities = {_item_identity(item) for item in pending}
+    ordered_identities = {_item_identity(item) for item in ordered}
+    missing = wanted - ordered_identities - pending_identities
+    if missing:
+        raise ValueError("所选 SKU 不存在，请刷新后重试。")
+    already_pending = wanted & pending_identities
+    if already_pending:
+        raise ValueError("所选 SKU 同时包含待下单和已下单项目，请刷新后重试。")
+
+    moved: List[Dict[str, str]] = []
+    next_ordered: List[Dict[str, str]] = []
+    for item in ordered:
+        if _item_identity(item) not in wanted:
+            next_ordered.append(item)
+            continue
+        restored = dict(item)
+        # These fields describe the historical external order and must not
+        # follow a row back into a new pending order.
+        for field in ("order_batch_id", "ordered_at", "order_no", "task_id"):
+            restored.pop(field, None)
+        moved.append(restored)
+    if not moved:
+        raise ValueError("未在已下单列表中找到要恢复的药品。")
+
+    moved_keys = {_item_key_text(item) for item in moved}
+    batches = _normalize_order_batches(
+        current.get("order_batches", []),  # type: ignore[arg-type]
+        ordered,
+    )
+    next_batches: List[Dict[str, object]] = []
+    for raw_batch in batches:
+        kept_keys = [
+            str(key)
+            for key in raw_batch.get("item_keys", [])  # type: ignore[union-attr]
+            if str(key) not in moved_keys
+        ]
+        if not kept_keys:
+            continue
+        batch = dict(raw_batch)
+        batch["item_keys"] = kept_keys
+        next_batches.append(batch)
+
+    next_state = {
+        "config": current["config"],
+        "pending": pending + moved,
+        "ordered": next_ordered,
+        "order_batches": next_batches,
+        "summary": summarize(pending + moved),
+        "candidate_count": current.get("candidate_count", 0),
+        **_view_scheme(current),
+    }
     _save_state(next_state)
     return _public_state(next_state)
 
