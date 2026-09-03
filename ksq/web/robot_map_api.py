@@ -26,6 +26,7 @@ RESTful API PDF manual in a few places):
 from __future__ import annotations
 
 import io
+import ipaddress
 import json
 import math
 import struct
@@ -37,6 +38,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from copy import deepcopy
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from ksq.constants import (
     DEFAULT_ROBOT_BASE_URL,
@@ -71,12 +73,18 @@ _TELEMETRY_GENERATION = 0
 _TELEMETRY_EXECUTOR = ThreadPoolExecutor(
     max_workers=3, thread_name_prefix="robot-map-telemetry"
 )
+_POI_CACHE_LOCK = threading.RLock()
+_ROBOT_CONNECTION_LOCK = threading.RLock()
 
 
 class RobotApiError(RuntimeError):
     def __init__(self, message: str, status_code: int = 502) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class RobotConnectionSwitchRequired(RuntimeError):
+    """The old chassis could not be stopped before changing endpoints."""
 
 
 def _invalidate_telemetry_cache() -> None:
@@ -110,22 +118,77 @@ def load_settings() -> Dict[str, object]:
 
 
 def save_settings(payload: Dict[str, object]) -> Dict[str, object]:
-    base_url = str(payload.get("robot_base_url") or "").strip().rstrip("/")
-    if not base_url:
+    raw_base_url = payload.get("robot_base_url")
+    if not isinstance(raw_base_url, str) or not raw_base_url.strip():
         raise ValueError("机器人地址不能为空。")
-    if not (base_url.startswith("http://") or base_url.startswith("https://")):
-        raise ValueError("机器人地址必须以 http:// 或 https:// 开头。")
+    base_url_input = raw_base_url.strip()
+    try:
+        parsed = urlsplit(base_url_input)
+        port = parsed.port
+        address = ipaddress.ip_address(parsed.hostname or "")
+    except ValueError as error:
+        raise ValueError("机器人地址格式必须为 http://<IPv4>:<端口>。") from error
+    if (
+        parsed.scheme.lower() != "http"
+        or address.version != 4
+        or port is None
+        or not 1 <= port <= 65535
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or "?" in base_url_input
+        or "#" in base_url_input
+    ):
+        raise ValueError("机器人地址格式必须为 http://<IPv4>:<端口>。")
+    base_url = f"http://{address.compressed}:{port}"
+    force_switch = payload.get("force_switch", False)
+    if not isinstance(force_switch, bool):
+        raise ValueError("force_switch 必须是布尔值。")
     settings = {"robot_base_url": base_url}
-    safe_write_text(
-        ROBOT_MAP_SETTINGS_FILE,
-        json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
-    )
-    _invalidate_telemetry_cache()
-    return settings
+    with _ROBOT_CONNECTION_LOCK:
+        current = _require_current_base_url_unlocked(
+            payload.get("expected_robot_base_url")
+        )
+        if current != base_url:
+            _request(
+                "GET",
+                "/api/core/system/v1/robot/info",
+                timeout=3,
+                base_url=base_url,
+            )
+            try:
+                _cancel_current_action_for(current)
+            except RobotApiError as error:
+                if not force_switch:
+                    raise RobotConnectionSwitchRequired(
+                        "无法确认旧底盘已停止，请现场确认后再强制切换。"
+                    ) from error
+        safe_write_text(
+            ROBOT_MAP_SETTINGS_FILE,
+            json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
+        )
+        _invalidate_telemetry_cache()
+        return settings
 
 
 def _base_url() -> str:
     return str(load_settings()["robot_base_url"])
+
+
+def _require_current_base_url_unlocked(expected_base_url: object) -> str:
+    expected = str(expected_base_url or "").strip().rstrip("/")
+    current = _base_url()
+    if expected and expected != current:
+        raise ValueError("底盘连接已变更，请刷新地图后重试。")
+    return current
+
+
+def require_current_base_url(expected_base_url: object) -> str:
+    """Resolve a chassis endpoint while rejecting stale browser writes."""
+    with _ROBOT_CONNECTION_LOCK:
+        return _require_current_base_url_unlocked(expected_base_url)
 
 
 # --------------------------------------------------------------------------
@@ -138,8 +201,10 @@ def _request(
     payload: Optional[Dict[str, object]] = None,
     *,
     timeout: float = _REQUEST_TIMEOUT_SECONDS,
+    base_url: Optional[str] = None,
 ) -> Tuple[int, object]:
-    url = f"{_base_url()}{path}"
+    request_base_url = base_url or _base_url()
+    url = f"{request_base_url}{path}"
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     headers = {"Accept": "application/json"}
     if data is not None:
@@ -163,7 +228,7 @@ def _request(
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         reason = getattr(error, "reason", None) or str(error)
         raise RobotApiError(
-            f"无法连接机器人 {_base_url()}：{reason}", status_code=504
+            f"无法连接机器人 {request_base_url}：{reason}", status_code=504
         ) from error
     if not raw:
         return status, {}
@@ -691,26 +756,10 @@ def get_home_pose() -> Optional[Dict[str, object]]:
 
 _EXPLORE_HEADER_SIZE = 36
 
-# /api/core/slam/v1/maps/explore 每个栅格字节的取值含义，根据实测数据反推：
-# 对一张 366x400 的地图抓取原始字节做统计，146400 个格子里：
-#   - 值 0 占 73%（107063 个）——地图边界外、从未探测到的区域（哨兵值，不
-#     是概率刻度的一部分），应显示成浅灰色的"未探索"。
-#   - 值 127 占 10%（15049 个）——激光扫过但未直接命中的空闲区域，概率量
-#     表的中点附近。
-#   - 10、20、30 ... 递增到 120+，数量依次递减——从"确认空闲"到"不确定"
-#     过渡的探索区域。
-#   - 最大值 249，出现次数很少——墙体/障碍物边缘（墙是细线，像素本来就
-#     少），对应"确认占用"。
-# 也就是说这是标准的占据栅格概率编码：数值越小＝越确定空闲，数值越大＝
-# 越确定被占用，0 是"从未观测"的哨兵值单独处理。之前的实现把字节值直接
-# 当亮度显示（0→黑、255→白），方向刚好和思岚 RoboStudio 的约定（白=空闲，
-# 黑=障碍，灰=未探索）相反，导致墙体边缘显示成亮线、背景显示成暗色。这里
-# 用一张 256 项查找表订正：0 单独映射成浅灰；其余数值做 255-value 的反转，
-# 让"确定空闲"趋近白色、"确定占用"趋近黑色。
-_EXPLORE_UNKNOWN_GRAY = 205
-_EXPLORE_GRAY_LUT = [_EXPLORE_UNKNOWN_GRAY] + [
-    max(0, min(255, 255 - value)) for value in range(1, 256)
-]
+# Slamware 的 Bitmap8Bit 栅格是 signed int8（-128..127），官方显示规则是
+# uint8(128 + cell)。Python bytes 会把同一位模式读成 0..255，因此查找表等价
+# 于将无符号字节循环平移 128：未知区域为中灰、空闲区域为白、占用区域为黑。
+_EXPLORE_GRAY_LUT = [(value + 128) & 0xFF for value in range(256)]
 
 
 def get_map_image() -> Tuple[bytes, Dict[str, object]]:
@@ -769,11 +818,17 @@ def _finite_motion_value(value: object, name: str) -> float:
         raise ValueError(f"{name} 必须是有限数字。")
     return number
 
-def _create_action(action_name: str, options: Dict[str, object]) -> Dict[str, object]:
+def _create_action(
+    action_name: str,
+    options: Dict[str, object],
+    *,
+    base_url: Optional[str] = None,
+) -> Dict[str, object]:
     _, body = _request(
         "POST",
         "/api/core/motion/v1/actions",
         {"action_name": f"slamtec.agent.actions.{action_name}", "options": options},
+        base_url=base_url,
     )
     if not isinstance(body, dict):
         raise RobotApiError("机器人返回了非预期的动作响应。")
@@ -787,6 +842,8 @@ def move_to(
     precise: bool = True,
     speed_ratio: float = 0.8,
     mode: int = 0,
+    *,
+    expected_base_url: object = None,
 ) -> Dict[str, object]:
     x_value = _finite_motion_value(x, "x")
     y_value = _finite_motion_value(y, "y")
@@ -808,54 +865,90 @@ def move_to(
     }
     if yaw_value is not None:
         move_options["yaw"] = yaw_value
-    return _create_action(
-        "MoveToAction",
-        {
-            "target": {"x": x_value, "y": y_value, "z": 0},
-            "move_options": move_options,
-        },
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+        result = _create_action(
+            "MoveToAction",
+            {
+                "target": {"x": x_value, "y": y_value, "z": 0},
+                "move_options": move_options,
+            },
+            base_url=base_url,
+        )
+        return result
+
+
+def go_home(
+    dock: bool = True, *, expected_base_url: object = None
+) -> Dict[str, object]:
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+        result = _create_action(
+            "GoHomeAction",
+            {
+                "gohome_options": {
+                    "flags": "dock" if dock else "no_dock",
+                    "back_to_landing": True,
+                    "charging_retry_count": 3,
+                    "move_options": {"mode": 0},
+                }
+            },
+            base_url=base_url,
+        )
+        return result
+
+
+def recover_localization(
+    max_recover_time_ms: int = 30000, *, expected_base_url: object = None
+) -> Dict[str, object]:
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+        result = _create_action(
+            "RecoverLocalizationAction",
+            {
+                "relocalization_options": {
+                    "max_recover_time": max_recover_time_ms,
+                    "recover_movement_type": "RotateOnly",
+                }
+            },
+            base_url=base_url,
+        )
+        return result
+
+
+def get_action_status(
+    action_id: str, *, expected_base_url: object = None
+) -> Dict[str, object]:
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+    _, body = _request(
+        "GET", f"/api/core/motion/v1/actions/{action_id}", base_url=base_url
     )
-
-
-def go_home(dock: bool = True) -> Dict[str, object]:
-    return _create_action(
-        "GoHomeAction",
-        {
-            "gohome_options": {
-                "flags": "dock" if dock else "no_dock",
-                "back_to_landing": True,
-                "charging_retry_count": 3,
-                "move_options": {"mode": 0},
-            }
-        },
-    )
-
-
-def recover_localization(max_recover_time_ms: int = 30000) -> Dict[str, object]:
-    return _create_action(
-        "RecoverLocalizationAction",
-        {
-            "relocalization_options": {
-                "max_recover_time": max_recover_time_ms,
-                "recover_movement_type": "RotateOnly",
-            }
-        },
-    )
-
-
-def get_action_status(action_id: str) -> Dict[str, object]:
-    _, body = _request("GET", f"/api/core/motion/v1/actions/{action_id}")
     return body if isinstance(body, dict) else {}
 
 
-def get_current_action() -> Dict[str, object]:
+def get_current_action(*, expected_base_url: object = None) -> Dict[str, object]:
     """Return the chassis' current action from the read-only motion endpoint."""
-    _, body = _request("GET", "/api/core/motion/v1/actions/:current")
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+    _, body = _request(
+        "GET", "/api/core/motion/v1/actions/:current", base_url=base_url
+    )
     return body if isinstance(body, dict) else {}
 
 
-def cancel_current_action() -> None:
-    _request("DELETE", "/api/core/motion/v1/actions/:current")
+def _cancel_current_action_for(base_url: str) -> None:
+    try:
+        _request("DELETE", "/api/core/motion/v1/actions/:current", base_url=base_url)
+    except RobotApiError as error:
+        if error.status_code != 404:
+            raise
+
+
+def cancel_current_action(*, expected_base_url: object = None) -> None:
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+        _cancel_current_action_for(base_url)
 
 
 # --------------------------------------------------------------------------
@@ -864,32 +957,56 @@ def cancel_current_action() -> None:
 # (/api/core/artifact/v1/pois) remains the source of truth.
 # --------------------------------------------------------------------------
 
-def _load_poi_cache() -> List[Dict[str, object]]:
+def _read_poi_caches() -> Dict[str, List[Dict[str, object]]]:
     if not ROBOT_MAP_POIS_FILE.is_file():
-        return []
+        return {}
     try:
         payload = json.loads(ROBOT_MAP_POIS_FILE.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return []
-    return payload if isinstance(payload, list) else []
+        return {}
+    # Legacy files were a bare list with no robot identity.  Reusing that list
+    # after an address switch could send a different chassis to stale points.
+    if not isinstance(payload, dict):
+        return {}
+    endpoints = payload.get("endpoints")
+    if not isinstance(endpoints, dict):
+        return {}
+    return {
+        endpoint: items
+        for endpoint, items in endpoints.items()
+        if isinstance(endpoint, str) and isinstance(items, list)
+    }
 
 
-def _save_poi_cache(pois: List[Dict[str, object]]) -> None:
-    safe_write_text(
-        ROBOT_MAP_POIS_FILE, json.dumps(pois, ensure_ascii=False, indent=2) + "\n"
-    )
+def _load_poi_cache(base_url: str) -> List[Dict[str, object]]:
+    with _POI_CACHE_LOCK:
+        return _read_poi_caches().get(base_url, [])
+
+
+def _save_poi_cache(base_url: str, pois: List[Dict[str, object]]) -> None:
+    with _POI_CACHE_LOCK:
+        caches = _read_poi_caches()
+        caches[base_url] = pois
+        safe_write_text(
+            ROBOT_MAP_POIS_FILE,
+            json.dumps({"version": 2, "endpoints": caches}, ensure_ascii=False, indent=2)
+            + "\n",
+        )
 
 
 def list_pois() -> List[Dict[str, object]]:
     """Prefer the robot's own POI list; fall back to the local cache if
     the robot is unreachable so the map view still shows something."""
+    base_url = _base_url()
     try:
-        _, body = _request("GET", "/api/core/artifact/v1/pois")
+        _, body = _request(
+            "GET", "/api/core/artifact/v1/pois", base_url=base_url
+        )
     except RobotApiError:
-        return _load_poi_cache()
+        return _load_poi_cache(base_url)
     items = body if isinstance(body, list) else []
     normalized = [_normalize_poi(item) for item in items if isinstance(item, dict)]
-    _save_poi_cache(normalized)
+    _save_poi_cache(base_url, normalized)
     return normalized
 
 
@@ -910,31 +1027,49 @@ def _normalize_poi(raw: Dict[str, object]) -> Dict[str, object]:
 
 
 def create_poi(
-    name: str, x: float, y: float, yaw: float = 0, poi_type: str = ""
+    name: str,
+    x: float,
+    y: float,
+    yaw: float = 0,
+    poi_type: str = "",
+    *,
+    expected_base_url: object = None,
 ) -> Dict[str, object]:
-    poi_id = str(uuid.uuid4())
-    metadata: Dict[str, object] = {"display_name": name}
-    if poi_type:
-        metadata["type"] = poi_type
-    payload: Dict[str, object] = {
-        "id": poi_id,
-        "pose": {"x": x, "y": y, "yaw": yaw},
-        "metadata": metadata,
-    }
-    # 添加 POI 成功仅返回 200，响应体未定义结构（多数情况下为空），因此以
-    # 请求体本身作为权威结果，而不是尝试解析一个可能不存在的响应体。
-    _request("POST", "/api/core/artifact/v1/pois", payload)
-    poi = _normalize_poi(payload)
-    cache = _load_poi_cache()
-    cache.append(poi)
-    _save_poi_cache(cache)
-    return poi
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+        poi_id = str(uuid.uuid4())
+        metadata: Dict[str, object] = {"display_name": name}
+        if poi_type:
+            metadata["type"] = poi_type
+        payload: Dict[str, object] = {
+            "id": poi_id,
+            "pose": {"x": x, "y": y, "yaw": yaw},
+            "metadata": metadata,
+        }
+        # 添加 POI 成功仅返回 200，响应体未定义结构（多数情况下为空），因此以
+        # 请求体本身作为权威结果，而不是尝试解析一个可能不存在的响应体。
+        _request("POST", "/api/core/artifact/v1/pois", payload, base_url=base_url)
+        poi = _normalize_poi(payload)
+        with _POI_CACHE_LOCK:
+            cache = _load_poi_cache(base_url)
+            cache.append(poi)
+            _save_poi_cache(base_url, cache)
+        return poi
 
 
-def delete_poi(poi_id: str) -> None:
-    _request("DELETE", f"/api/core/artifact/v1/pois/{poi_id}")
-    cache = [item for item in _load_poi_cache() if item.get("id") != poi_id]
-    _save_poi_cache(cache)
+def delete_poi(poi_id: str, *, expected_base_url: object = None) -> None:
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+        _request(
+            "DELETE", f"/api/core/artifact/v1/pois/{poi_id}", base_url=base_url
+        )
+        with _POI_CACHE_LOCK:
+            cache = [
+                item
+                for item in _load_poi_cache(base_url)
+                if item.get("id") != poi_id
+            ]
+            _save_poi_cache(base_url, cache)
 
 
 # --------------------------------------------------------------------------

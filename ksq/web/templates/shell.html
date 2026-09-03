@@ -962,7 +962,7 @@
                 <div class="status-item">🔋 <span id="map-battery-text">—</span></div>
                 <div class="status-item">📍 定位：<span id="map-loc-text">—</span></div>
                 <div class="status-item">🔌 <span id="map-dock-text">—</span></div>
-                <div class="status-item">当前动作：<span id="map-action-text">空闲</span></div>
+                <div class="status-item">动作：<span id="map-action-text">空闲</span></div>
               </div>
               <div class="map-hint" aria-hidden="true">滚轮缩放 · 拖拽平移 · 单击选点（导航 / 存为停留点）</div>
               <div class="click-popover" id="map-click-popover" hidden>
@@ -983,21 +983,21 @@
              aria-label="调整地图区域宽度" title="拖动调整地图与功能区宽度"></div>
 
         <aside class="map-control-rail">
-          <nav class="map-drawer-tabs" aria-label="地图功能分类" role="tablist">
-            <button type="button" class="map-drawer-tab" role="tab" data-drawer-target="map-connection-card"
-                    aria-controls="map-connection-card" aria-selected="true" aria-expanded="true" title="底盘连接">
+          <nav class="map-drawer-tabs" aria-label="地图功能分类">
+            <button type="button" class="map-drawer-tab" data-drawer-target="map-connection-card"
+                    aria-controls="map-connection-card" aria-expanded="true" title="底盘连接">
               <span>底盘连接</span>
             </button>
-            <button type="button" class="map-drawer-tab" role="tab" data-drawer-target="map-chassis-card"
-                    aria-controls="map-chassis-card" aria-selected="false" aria-expanded="false" title="底盘操作">
+            <button type="button" class="map-drawer-tab" data-drawer-target="map-chassis-card"
+                    aria-controls="map-chassis-card" aria-expanded="false" title="底盘操作">
               <span>底盘操作</span>
             </button>
-            <button type="button" class="map-drawer-tab" role="tab" data-drawer-target="map-poi-card"
-                    aria-controls="map-poi-card" aria-selected="false" aria-expanded="false" title="停留点">
+            <button type="button" class="map-drawer-tab" data-drawer-target="map-poi-card"
+                    aria-controls="map-poi-card" aria-expanded="false" title="停留点">
               <span>停留点</span>
             </button>
-            <button type="button" class="map-drawer-tab" role="tab" data-drawer-target="map-patrol-card"
-                    aria-controls="map-patrol-card" aria-selected="false" aria-expanded="false" title="巡逻任务">
+            <button type="button" class="map-drawer-tab" data-drawer-target="map-patrol-card"
+                    aria-controls="map-patrol-card" aria-expanded="false" title="巡逻任务">
               <span>巡逻任务</span>
             </button>
           </nav>
@@ -1006,14 +1006,18 @@
               <span class="section-title">底盘连接</span>
             </summary>
             <div class="map-side-body">
-              <div class="path-fields order-config-grid">
-                <label class="path-field"><span>底盘地址</span><input id="map-robot-url" type="text" placeholder="http://192.168.11.1:1448"></label>
-              </div>
-              <div class="actions">
-                <button class="secondary" id="map-btn-test-connection">测试连接</button>
-                <button class="primary" id="map-btn-save-connection">保存</button>
-              </div>
-              <p class="meta compact" id="map-connection-status"></p>
+              <form class="map-connection-form" id="map-connection-form">
+                <label class="map-connection-field map-connection-ip">
+                  <span>IP</span>
+                  <input id="map-robot-ip" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="192.168.11.1">
+                </label>
+                <label class="map-connection-field map-connection-port">
+                  <span>端口</span>
+                  <input id="map-robot-port" type="number" inputmode="numeric" min="1" max="65535" step="1" value="1448">
+                </label>
+                <button class="primary" id="map-btn-connect" type="submit">连接</button>
+              </form>
+              <p class="meta compact" id="map-connection-status" aria-live="polite"></p>
             </div>
           </details>
 

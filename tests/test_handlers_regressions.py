@@ -258,7 +258,7 @@ class HandlerRegressionTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(data, {"active": False, "action": None})
-        get_current_action.assert_called_once_with()
+        get_current_action.assert_called_once_with(expected_base_url=None)
 
     def test_map_current_action_returns_the_active_action(self) -> None:
         action = {
@@ -275,7 +275,27 @@ class HandlerRegressionTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(data, {"active": True, "action": action})
-        get_current_action.assert_called_once_with()
+        get_current_action.assert_called_once_with(expected_base_url=None)
+
+    def test_map_settings_exposes_force_switch_confirmation(self) -> None:
+        payload = {
+            "robot_base_url": "http://192.168.5.10:1448",
+            "expected_robot_base_url": "http://192.168.5.9:1448",
+        }
+        with patch.object(
+            handlers.robot_map_api,
+            "save_settings",
+            side_effect=handlers.robot_map_api.RobotConnectionSwitchRequired(
+                "无法确认旧底盘已停止"
+            ),
+        ):
+            _handler, status, data = self._request(
+                "PUT", "/api/map/settings", role=auth.ROLE_ADMIN, payload=payload
+            )
+
+        self.assertEqual(status, 409)
+        self.assertEqual(data["code"], "force_switch_required")
+        self.assertIn("无法确认旧底盘已停止", data["error"])
 
     def test_viewer_cannot_trigger_map_control_actions(self) -> None:
         control_routes = (
@@ -335,6 +355,50 @@ class HandlerRegressionTests(unittest.TestCase):
             self.assertTrue(data["error"])
             move_to.assert_not_called()
             self.assertEqual(handler.rfile.read(), b"")
+
+    def test_map_navigate_rejects_a_stale_robot_endpoint(self) -> None:
+        payload = {
+            "x": 1,
+            "y": 2,
+            "expected_robot_base_url": "http://192.168.5.10:1448",
+        }
+        with patch.object(
+            handlers.robot_map_api,
+            "move_to",
+            side_effect=ValueError("底盘连接已变更，请刷新地图后重试。"),
+        ) as move_to:
+            handler, status, data = self._request(
+                "POST",
+                "/api/map/navigate",
+                role=auth.ROLE_ADMIN,
+                payload=payload,
+            )
+
+        self.assertEqual(status, 400)
+        self.assertIn("底盘连接已变更", data["error"])
+        move_to.assert_called_once_with(
+            1.0,
+            2.0,
+            yaw=None,
+            precise=True,
+            speed_ratio=0.8,
+            expected_base_url="http://192.168.5.10:1448",
+        )
+        self.assertEqual(handler.rfile.read(), b"")
+
+    def test_map_navigate_requires_the_rendered_robot_endpoint(self) -> None:
+        with patch.object(handlers.robot_map_api, "move_to") as move_to:
+            handler, status, data = self._request(
+                "POST",
+                "/api/map/navigate",
+                role=auth.ROLE_ADMIN,
+                payload={"x": 1, "y": 2},
+            )
+
+        self.assertEqual(status, 400)
+        self.assertIn("底盘连接信息已过期", data["error"])
+        move_to.assert_not_called()
+        self.assertEqual(handler.rfile.read(), b"")
 
 
 @unittest.skipIf(QueryHandler is None, "HTTP handlers require Python 3.12 or older")

@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import io
+import json
+from pathlib import Path
+import struct
+import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
+
+from PIL import Image
 
 from ksq.web import robot_map_api as api
 
@@ -18,6 +25,291 @@ def _scan() -> dict[str, object]:
             {"distance": 0.0, "angle": 0.0, "valid": False},
         ],
     }
+
+
+class RobotMapImageTests(unittest.TestCase):
+    def test_signed_grid_cells_use_slamware_palette_and_flip_y(self) -> None:
+        cells = bytes([0, 128, 127, 255])
+        header = struct.pack("<ffIIf12xI", 1.5, -2.0, 2, 2, 0.05, len(cells))
+        with patch.object(api, "_request_bytes", return_value=header + cells):
+            payload, metadata = api.get_map_image()
+
+        with Image.open(io.BytesIO(payload)) as image:
+            self.assertEqual(image.mode, "L")
+            self.assertEqual(image.size, (2, 2))
+            self.assertEqual(list(image.tobytes()), [255, 127, 128, 0])
+        self.assertEqual(metadata["width"], 2)
+        self.assertEqual(metadata["height"], 2)
+        self.assertAlmostEqual(metadata["resolution"], 0.05)
+
+
+class RobotMapConnectionTests(unittest.TestCase):
+    def test_write_guard_rejects_a_stale_robot_endpoint(self) -> None:
+        current = "http://192.168.5.9:1448"
+        with patch.object(api, "_base_url", return_value=current):
+            self.assertEqual(api.require_current_base_url(None), current)
+            self.assertEqual(api.require_current_base_url(current), current)
+            with self.assertRaises(ValueError):
+                api.require_current_base_url("http://192.168.5.10:1448")
+
+    def test_switch_cancels_the_old_endpoint_before_saving(self) -> None:
+        robot_a = "http://192.168.5.9:1448"
+        robot_b = "http://192.168.5.10:1448"
+        with tempfile.TemporaryDirectory() as directory:
+            settings_file = Path(directory) / "robot_map_settings.json"
+            _write_json(settings_file, {"robot_base_url": robot_a})
+            with (
+                patch.object(api, "ROBOT_MAP_SETTINGS_FILE", settings_file),
+                patch.object(api, "_request", return_value=(200, {})) as request,
+                patch.object(api, "_invalidate_telemetry_cache") as invalidate,
+            ):
+                settings = api.save_settings(
+                    {
+                        "robot_base_url": robot_b,
+                        "expected_robot_base_url": robot_a,
+                    }
+                )
+
+        self.assertEqual(settings, {"robot_base_url": robot_b})
+        self.assertEqual(
+            request.call_args_list,
+            [
+                call(
+                    "GET",
+                    "/api/core/system/v1/robot/info",
+                    timeout=3,
+                    base_url=robot_b,
+                ),
+                call(
+                    "DELETE",
+                    "/api/core/motion/v1/actions/:current",
+                    base_url=robot_a,
+                ),
+            ],
+        )
+        invalidate.assert_called_once_with()
+
+    def test_switch_is_rejected_when_the_old_endpoint_cannot_be_stopped(self) -> None:
+        robot_a = "http://192.168.5.9:1448"
+        robot_b = "http://192.168.5.10:1448"
+        with tempfile.TemporaryDirectory() as directory:
+            settings_file = Path(directory) / "robot_map_settings.json"
+            _write_json(settings_file, {"robot_base_url": robot_a})
+            with (
+                patch.object(api, "ROBOT_MAP_SETTINGS_FILE", settings_file),
+                patch.object(
+                    api,
+                    "_request",
+                    side_effect=[
+                        (200, {}),
+                        api.RobotApiError("offline", status_code=504),
+                    ],
+                ),
+                patch.object(api, "_invalidate_telemetry_cache") as invalidate,
+            ):
+                with self.assertRaisesRegex(
+                    api.RobotConnectionSwitchRequired, "无法确认旧底盘已停止"
+                ):
+                    api.save_settings(
+                        {
+                            "robot_base_url": robot_b,
+                            "expected_robot_base_url": robot_a,
+                        }
+                    )
+
+            self.assertEqual(
+                json.loads(settings_file.read_text(encoding="utf-8")),
+                {"robot_base_url": robot_a},
+            )
+            invalidate.assert_not_called()
+
+    def test_force_switch_recovers_after_old_endpoint_is_unreachable(self) -> None:
+        robot_a = "http://192.168.5.9:1448"
+        robot_b = "http://192.168.5.10:1448"
+        with tempfile.TemporaryDirectory() as directory:
+            settings_file = Path(directory) / "robot_map_settings.json"
+            _write_json(settings_file, {"robot_base_url": robot_a})
+            with (
+                patch.object(api, "ROBOT_MAP_SETTINGS_FILE", settings_file),
+                patch.object(
+                    api,
+                    "_request",
+                    side_effect=[
+                        (200, {}),
+                        api.RobotApiError("offline", status_code=504),
+                    ],
+                ),
+                patch.object(api, "_invalidate_telemetry_cache") as invalidate,
+            ):
+                settings = api.save_settings(
+                    {
+                        "robot_base_url": robot_b,
+                        "expected_robot_base_url": robot_a,
+                        "force_switch": True,
+                    }
+                )
+
+            self.assertEqual(settings, {"robot_base_url": robot_b})
+            self.assertEqual(
+                json.loads(settings_file.read_text(encoding="utf-8")), settings
+            )
+            invalidate.assert_called_once_with()
+
+    def test_unreachable_new_endpoint_is_never_saved(self) -> None:
+        robot_a = "http://192.168.5.9:1448"
+        robot_b = "http://192.168.5.10:1448"
+        with tempfile.TemporaryDirectory() as directory:
+            settings_file = Path(directory) / "robot_map_settings.json"
+            _write_json(settings_file, {"robot_base_url": robot_a})
+            with (
+                patch.object(api, "ROBOT_MAP_SETTINGS_FILE", settings_file),
+                patch.object(
+                    api,
+                    "_request",
+                    side_effect=api.RobotApiError("offline", status_code=504),
+                ),
+                patch.object(api, "_invalidate_telemetry_cache") as invalidate,
+            ):
+                with self.assertRaises(api.RobotApiError):
+                    api.save_settings(
+                        {
+                            "robot_base_url": robot_b,
+                            "expected_robot_base_url": robot_a,
+                        }
+                    )
+
+            self.assertEqual(
+                json.loads(settings_file.read_text(encoding="utf-8")),
+                {"robot_base_url": robot_a},
+            )
+            invalidate.assert_not_called()
+
+    def test_save_settings_normalizes_http_ipv4_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings_file = Path(directory) / "robot_map_settings.json"
+            with (
+                patch.object(api, "ROBOT_MAP_SETTINGS_FILE", settings_file),
+                patch.object(
+                    api,
+                    "_request",
+                    side_effect=[
+                        (200, {}),
+                        api.RobotApiError("idle", status_code=404),
+                    ],
+                ),
+                patch.object(api, "_invalidate_telemetry_cache") as invalidate,
+            ):
+                settings = api.save_settings(
+                    {"robot_base_url": "  HTTP://192.168.5.9:01448  "}
+                )
+
+            self.assertEqual(
+                settings, {"robot_base_url": "http://192.168.5.9:1448"}
+            )
+            self.assertEqual(json.loads(settings_file.read_text(encoding="utf-8")), settings)
+            invalidate.assert_called_once_with()
+
+    def test_save_settings_rejects_non_ipv4_endpoint_shapes(self) -> None:
+        invalid_urls = (
+            "https://192.168.5.9:1448",
+            "http://robot.local:1448",
+            "http://[::1]:1448",
+            "http://192.168.5.9",
+            "http://192.168.5.9:0",
+            "http://192.168.5.9:65536",
+            "http://user:pass@192.168.5.9:1448",
+            "http://192.168.5.9:1448/",
+            "http://192.168.5.9:1448/api",
+            "http://192.168.5.9:1448?debug=1",
+            "http://192.168.5.9:1448?",
+            "http://192.168.5.9:1448#fragment",
+            "http://192.168.5.9:1448#",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            settings_file = Path(directory) / "robot_map_settings.json"
+            with (
+                patch.object(api, "ROBOT_MAP_SETTINGS_FILE", settings_file),
+                patch.object(api, "_invalidate_telemetry_cache") as invalidate,
+            ):
+                for base_url in invalid_urls:
+                    with self.subTest(base_url=base_url), self.assertRaises(ValueError):
+                        api.save_settings({"robot_base_url": base_url})
+
+            self.assertFalse(settings_file.exists())
+            invalidate.assert_not_called()
+
+
+class RobotMapPoiCacheTests(unittest.TestCase):
+    def test_cache_is_partitioned_and_legacy_list_is_not_reused(self) -> None:
+        robot_a = "http://192.168.5.9:1448"
+        robot_b = "http://192.168.5.10:1448"
+        poi_a = {"id": "a", "name": "A", "x": 1, "y": 2}
+        poi_b = {"id": "b", "name": "B", "x": 3, "y": 4}
+        with tempfile.TemporaryDirectory() as directory:
+            cache_file = Path(directory) / "robot_map_pois_cache.json"
+            with patch.object(api, "ROBOT_MAP_POIS_FILE", cache_file):
+                _write_json(cache_file, [poi_a])
+                with (
+                    patch.object(api, "_base_url", return_value=robot_b),
+                    patch.object(
+                        api, "_request", side_effect=api.RobotApiError("offline")
+                    ) as request,
+                ):
+                    self.assertEqual(api.list_pois(), [])
+                request.assert_called_once_with(
+                    "GET", "/api/core/artifact/v1/pois", base_url=robot_b
+                )
+
+                api._save_poi_cache(robot_a, [poi_a])
+                api._save_poi_cache(robot_b, [poi_b])
+                for base_url, expected in ((robot_a, [poi_a]), (robot_b, [poi_b])):
+                    with (
+                        self.subTest(base_url=base_url),
+                        patch.object(api, "_base_url", return_value=base_url),
+                        patch.object(
+                            api, "_request", side_effect=api.RobotApiError("offline")
+                        ),
+                    ):
+                        self.assertEqual(api.list_pois(), expected)
+
+    def test_create_and_delete_only_update_current_endpoint(self) -> None:
+        robot_a = "http://192.168.5.9:1448"
+        robot_b = "http://192.168.5.10:1448"
+        poi_a = {"id": "a", "name": "A", "x": 1, "y": 2}
+        poi_b = {"id": "b", "name": "B", "x": 3, "y": 4}
+        current = {"base_url": robot_b}
+        calls: list[tuple[str, str]] = []
+
+        def request(method, path, payload=None, *, timeout=8, base_url=None):
+            calls.append((method, base_url))
+            return 200, {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_file = Path(directory) / "robot_map_pois_cache.json"
+            with (
+                patch.object(api, "ROBOT_MAP_POIS_FILE", cache_file),
+                patch.object(api, "_base_url", side_effect=lambda: current["base_url"]),
+                patch.object(api, "_request", side_effect=request),
+                patch.object(api.uuid, "uuid4", return_value="new"),
+            ):
+                api._save_poi_cache(robot_a, [poi_a])
+                api._save_poi_cache(robot_b, [poi_b])
+                created = api.create_poi("New", 5, 6)
+                current["base_url"] = robot_a
+                api.delete_poi("a")
+
+                self.assertEqual(api._load_poi_cache(robot_a), [])
+                self.assertEqual(
+                    [item["id"] for item in api._load_poi_cache(robot_b)],
+                    ["b", "new"],
+                )
+
+        self.assertEqual(created["id"], "new")
+        self.assertEqual(calls, [("POST", robot_b), ("DELETE", robot_a)])
+
+
+def _write_json(path: Path, payload: object) -> None:
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 class RobotMapTelemetryTests(unittest.TestCase):
@@ -77,10 +369,14 @@ class RobotMapTelemetryTests(unittest.TestCase):
             "stage": "GOING_TO_TARGET",
             "state": {"status": 1, "result": 0},
         }
-        with patch.object(api, "_request", return_value=(200, payload)) as request:
+        base_url = "http://192.168.5.9:1448"
+        with (
+            patch.object(api, "_base_url", return_value=base_url),
+            patch.object(api, "_request", return_value=(200, payload)) as request,
+        ):
             self.assertEqual(api.get_current_action(), payload)
         request.assert_called_once_with(
-            "GET", "/api/core/motion/v1/actions/:current"
+            "GET", "/api/core/motion/v1/actions/:current", base_url=base_url
         )
 
     def test_move_to_rejects_non_finite_and_out_of_range_motion_values(self) -> None:
@@ -104,7 +400,11 @@ class RobotMapTelemetryTests(unittest.TestCase):
         create_action.assert_not_called()
 
     def test_move_to_normalizes_valid_motion_values(self) -> None:
-        with patch.object(api, "_create_action", return_value={}) as create_action:
+        base_url = "http://192.168.5.9:1448"
+        with (
+            patch.object(api, "_base_url", return_value=base_url),
+            patch.object(api, "_create_action", return_value={}) as create_action,
+        ):
             result = api.move_to("1.5", "-2", yaw="0.25", speed_ratio="0.4")
         self.assertEqual(result, {})
         create_action.assert_called_once_with(
@@ -118,6 +418,7 @@ class RobotMapTelemetryTests(unittest.TestCase):
                     "yaw": 0.25,
                 },
             },
+            base_url=base_url,
         )
 
     def test_snapshot_is_shared_and_marks_partial_refresh_stale(self) -> None:

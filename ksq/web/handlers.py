@@ -78,6 +78,13 @@ def _parse_finite_float(value: object, field: str) -> float:
     return number
 
 
+def _expected_robot_base_url(payload: Dict[str, object]) -> str:
+    expected = payload.get("expected_robot_base_url")
+    if not isinstance(expected, str) or not expected.strip():
+        raise ValueError("底盘连接信息已过期，请刷新地图后重试。")
+    return expected
+
+
 def _mark_request_body_consumed(
     handler: BaseHTTPRequestHandler, amount: int
 ) -> None:
@@ -717,11 +724,20 @@ class QueryHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
             return
         if path == "/api/map/current-action":
+            query = parse_qs(parsed.query)
+            expected_base_url = (query.get("expected_robot_base_url") or [None])[0]
             try:
                 self._send_json(
                     HTTPStatus.OK,
-                    {"active": True, "action": robot_map_api.get_current_action()},
+                    {
+                        "active": True,
+                        "action": robot_map_api.get_current_action(
+                            expected_base_url=expected_base_url
+                        ),
+                    },
                 )
+            except ValueError as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             except RobotApiError as error:
                 # Slamware returns 404 when no action is running; expose that
                 # normal idle state as data instead of a failed status request.
@@ -737,10 +753,17 @@ class QueryHandler(BaseHTTPRequestHandler):
             if not action_id or "/" in action_id:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "action_id 无效。"})
                 return
+            query = parse_qs(parsed.query)
+            expected_base_url = (query.get("expected_robot_base_url") or [None])[0]
             try:
                 self._send_json(
-                    HTTPStatus.OK, robot_map_api.get_action_status(action_id)
+                    HTTPStatus.OK,
+                    robot_map_api.get_action_status(
+                        action_id, expected_base_url=expected_base_url
+                    ),
                 )
+            except ValueError as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             except RobotApiError as error:
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
             return
@@ -823,7 +846,19 @@ class QueryHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/map/settings":
                 payload = read_json_body(self)
-                self._send_json(HTTPStatus.OK, robot_map_api.save_settings(payload))
+                _expected_robot_base_url(payload)
+                try:
+                    settings = robot_map_api.save_settings(payload)
+                except robot_map_api.RobotConnectionSwitchRequired as error:
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {"error": str(error), "code": "force_switch_required"},
+                    )
+                    return
+                except RobotApiError as error:
+                    self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+                    return
+                self._send_json(HTTPStatus.OK, settings)
                 return
             _drain_request_body(self)
             self._send_not_found(path, "Endpoint not found")
@@ -1525,6 +1560,7 @@ class QueryHandler(BaseHTTPRequestHandler):
                         yaw=yaw,
                         precise=bool(payload.get("precise", True)),
                         speed_ratio=speed_ratio,
+                        expected_base_url=_expected_robot_base_url(payload),
                     )
                 except RobotApiError as error:
                     self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
@@ -1532,27 +1568,33 @@ class QueryHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, result)
                 return
             if path == "/api/map/actions/cancel":
-                _drain_request_body(self)
+                payload = read_json_body(self)
                 try:
-                    robot_map_api.cancel_current_action()
+                    robot_map_api.cancel_current_action(
+                        expected_base_url=_expected_robot_base_url(payload)
+                    )
                 except RobotApiError as error:
                     self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
                     return
                 self._send_json(HTTPStatus.OK, {"ok": True})
                 return
             if path == "/api/map/gohome":
-                _drain_request_body(self)
+                payload = read_json_body(self)
                 try:
-                    result = robot_map_api.go_home()
+                    result = robot_map_api.go_home(
+                        expected_base_url=_expected_robot_base_url(payload)
+                    )
                 except RobotApiError as error:
                     self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
                     return
                 self._send_json(HTTPStatus.OK, result)
                 return
             if path == "/api/map/relocate":
-                _drain_request_body(self)
+                payload = read_json_body(self)
                 try:
-                    result = robot_map_api.recover_localization()
+                    result = robot_map_api.recover_localization(
+                        expected_base_url=_expected_robot_base_url(payload)
+                    )
                 except RobotApiError as error:
                     self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
                     return
@@ -1571,7 +1613,12 @@ class QueryHandler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "x/y 必须是数字。"})
                     return
                 try:
-                    result = robot_map_api.create_poi(name, x, y)
+                    result = robot_map_api.create_poi(
+                        name,
+                        x,
+                        y,
+                        expected_base_url=_expected_robot_base_url(payload),
+                    )
                 except RobotApiError as error:
                     self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
                     return
@@ -1584,7 +1631,10 @@ class QueryHandler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "id 不能为空。"})
                     return
                 try:
-                    robot_map_api.delete_poi(poi_id)
+                    robot_map_api.delete_poi(
+                        poi_id,
+                        expected_base_url=_expected_robot_base_url(payload),
+                    )
                 except RobotApiError as error:
                     self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
                     return
