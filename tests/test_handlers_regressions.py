@@ -277,6 +277,28 @@ class HandlerRegressionTests(unittest.TestCase):
         self.assertEqual(data, {"active": True, "action": action})
         get_current_action.assert_called_once_with(expected_base_url=None)
 
+    def test_map_speed_limit_uses_the_current_robot_maximum(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        with patch.object(
+            handlers.robot_map_api, "get_max_moving_speed", return_value=0.8
+        ) as get_max_speed:
+            _handler, status, data = self._request(
+                "GET",
+                "/api/map/speed-limit?expected_robot_base_url=" + base_url,
+                role=auth.ROLE_VIEWER,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            data,
+            {
+                "min_speed_mps": 0.08,
+                "max_speed_mps": 0.8,
+                "default_speed_mps": 0.64,
+            },
+        )
+        get_max_speed.assert_called_once_with(expected_base_url=base_url)
+
     def test_map_settings_exposes_force_switch_confirmation(self) -> None:
         payload = {
             "robot_base_url": "http://192.168.5.10:1448",
@@ -340,6 +362,10 @@ class HandlerRegressionTests(unittest.TestCase):
             b'{"x": 0, "y": 1, "speed_ratio": 1.1}',
             b'{"x": 0, "y": 1, "speed_ratio": -0.1}',
             b'{"x": 0, "y": 1, "speed_ratio": 0.05}',
+            b'{"x": 0, "y": 1, "speed_mps": NaN}',
+            b'{"x": 0, "y": 1, "speed_mps": 0}',
+            b'{"x": 0, "y": 1, "speed_mps": -0.1}',
+            b'{"x": 0, "y": 1, "speed_mps": 0.4, "speed_ratio": 0.5}',
         )
         for raw_body in invalid_bodies:
             with self.subTest(raw_body=raw_body), patch.object(
@@ -355,6 +381,37 @@ class HandlerRegressionTests(unittest.TestCase):
             self.assertTrue(data["error"])
             move_to.assert_not_called()
             self.assertEqual(handler.rfile.read(), b"")
+
+    def test_map_navigate_forwards_real_speed_when_requested(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        with patch.object(
+            handlers.robot_map_api,
+            "move_to",
+            return_value={"action_id": 7},
+        ) as move_to:
+            _handler, status, data = self._request(
+                "POST",
+                "/api/map/navigate",
+                role=auth.ROLE_ADMIN,
+                payload={
+                    "x": 1,
+                    "y": 2,
+                    "speed_mps": 0.4,
+                    "expected_robot_base_url": base_url,
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data, {"action_id": 7})
+        move_to.assert_called_once_with(
+            1.0,
+            2.0,
+            yaw=None,
+            precise=True,
+            speed_ratio=0.8,
+            expected_base_url=base_url,
+            speed_mps=0.4,
+        )
 
     def test_map_navigate_rejects_a_stale_robot_endpoint(self) -> None:
         payload = {

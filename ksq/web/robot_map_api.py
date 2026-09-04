@@ -202,11 +202,12 @@ def _request(
     *,
     timeout: float = _REQUEST_TIMEOUT_SECONDS,
     base_url: Optional[str] = None,
+    accept: str = "application/json",
 ) -> Tuple[int, object]:
     request_base_url = base_url or _base_url()
     url = f"{request_base_url}{path}"
     data = None if payload is None else json.dumps(payload).encode("utf-8")
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": accept}
     if data is not None:
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -300,6 +301,30 @@ def _finite_float(value: object) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _get_max_moving_speed_for(base_url: str) -> float:
+    _, body = _request(
+        "GET",
+        "/api/core/system/v1/parameter?param=base.max_moving_speed",
+        base_url=base_url,
+        accept="text/plain",
+    )
+    if isinstance(body, dict):
+        body = next(
+            (body[key] for key in ("value", "data", "result") if key in body),
+            None,
+        )
+    value = _finite_float(body)
+    if value is None or value <= 0:
+        raise RobotApiError("机器人返回的最大线速度无效。", status_code=502)
+    return value
+
+
+def get_max_moving_speed(*, expected_base_url: object = None) -> float:
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+        return _get_max_moving_speed_for(base_url)
 
 
 def _normalize_pose_payload(
@@ -758,7 +783,7 @@ _EXPLORE_HEADER_SIZE = 36
 
 # Slamware 的 Bitmap8Bit 栅格是 signed int8（-128..127），官方显示规则是
 # uint8(128 + cell)。Python bytes 会把同一位模式读成 0..255，因此查找表等价
-# 于将无符号字节循环平移 128：未知区域为中灰、空闲区域为白、占用区域为黑。
+# 于将无符号字节循环平移 128：占用趋近黑、未知为中灰、空闲趋近白。
 _EXPLORE_GRAY_LUT = [(value + 128) & 0xFF for value in range(256)]
 
 
@@ -843,6 +868,7 @@ def move_to(
     speed_ratio: float = 0.8,
     mode: int = 0,
     *,
+    speed_mps: Optional[float] = None,
     expected_base_url: object = None,
 ) -> Dict[str, object]:
     x_value = _finite_motion_value(x, "x")
@@ -852,21 +878,41 @@ def move_to(
     # raise this ceiling only after an explicit field safety review.
     if speed_value < 0.1 or speed_value > 1:
         raise ValueError("speed_ratio 必须在 0.1~1 之间。")
+    speed_mps_value = (
+        None
+        if speed_mps is None
+        else _finite_motion_value(speed_mps, "speed_mps")
+    )
+    if speed_mps_value is not None and speed_mps_value <= 0:
+        raise ValueError("巡逻速度必须大于 0 m/s。")
     yaw_value = None if yaw is None else _finite_motion_value(yaw, "yaw")
     flags: List[str] = []
     if precise:
         flags.append("precise")
     if yaw_value is not None:
         flags.append("with_yaw")
-    move_options: Dict[str, object] = {
-        "mode": mode,
-        "flags": flags,
-        "speed_ratio": speed_value,
-    }
-    if yaw_value is not None:
-        move_options["yaw"] = yaw_value
     with _ROBOT_CONNECTION_LOCK:
         base_url = _require_current_base_url_unlocked(expected_base_url)
+        if speed_mps_value is not None:
+            max_speed = _get_max_moving_speed_for(base_url)
+            min_speed = max_speed * 0.1
+            tolerance = 1e-9
+            if (
+                speed_mps_value < min_speed - tolerance
+                or speed_mps_value > max_speed + tolerance
+            ):
+                raise ValueError(
+                    "巡逻速度必须在 "
+                    f"{min_speed:.3g}~{max_speed:.3g} m/s 之间。"
+                )
+            speed_value = min(1.0, max(0.1, speed_mps_value / max_speed))
+        move_options: Dict[str, object] = {
+            "mode": mode,
+            "flags": flags,
+            "speed_ratio": speed_value,
+        }
+        if yaw_value is not None:
+            move_options["yaw"] = yaw_value
         result = _create_action(
             "MoveToAction",
             {
@@ -971,11 +1017,67 @@ def _read_poi_caches() -> Dict[str, List[Dict[str, object]]]:
     endpoints = payload.get("endpoints")
     if not isinstance(endpoints, dict):
         return {}
-    return {
+    caches = {
         endpoint: items
         for endpoint, items in endpoints.items()
         if isinstance(endpoint, str) and isinstance(items, list)
     }
+    if payload.get("version") == 2:
+        caches = {
+            endpoint: _migrate_default_poi_order(items)
+            for endpoint, items in caches.items()
+        }
+    return caches
+
+
+def _migrate_default_poi_order(
+    items: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """Recover creation order encoded by this UI's legacy default names."""
+    numbered: List[Tuple[int, Dict[str, object]]] = []
+    seen: set[int] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            return items
+        name = str(item.get("name") or "")
+        suffix = name[len("停留点") :] if name.startswith("停留点") else ""
+        if not suffix.isdigit():
+            return items
+        sequence = int(suffix)
+        if sequence in seen:
+            return items
+        seen.add(sequence)
+        numbered.append((sequence, item))
+    return [item for _, item in sorted(numbered, key=lambda entry: entry[0])]
+
+
+def _merge_pois_in_cached_order(
+    cached: List[Dict[str, object]], live: List[Dict[str, object]]
+) -> List[Dict[str, object]]:
+    if not cached:
+        # A fresh install has no local creation history.  The UI's default
+        # names are the only stable order signal available from the chassis.
+        return _migrate_default_poi_order(live)
+    live_by_id = {
+        str(item.get("id")): item
+        for item in live
+        if item.get("id") not in (None, "")
+    }
+    ordered: List[Dict[str, object]] = []
+    seen: set[str] = set()
+    for item in cached:
+        poi_id = str(item.get("id") or "")
+        if poi_id and poi_id in live_by_id and poi_id not in seen:
+            ordered.append(live_by_id[poi_id])
+            seen.add(poi_id)
+    for item in live:
+        poi_id = str(item.get("id") or "")
+        if poi_id and poi_id in seen:
+            continue
+        ordered.append(item)
+        if poi_id:
+            seen.add(poi_id)
+    return ordered
 
 
 def _load_poi_cache(base_url: str) -> List[Dict[str, object]]:
@@ -989,7 +1091,7 @@ def _save_poi_cache(base_url: str, pois: List[Dict[str, object]]) -> None:
         caches[base_url] = pois
         safe_write_text(
             ROBOT_MAP_POIS_FILE,
-            json.dumps({"version": 2, "endpoints": caches}, ensure_ascii=False, indent=2)
+            json.dumps({"version": 3, "endpoints": caches}, ensure_ascii=False, indent=2)
             + "\n",
         )
 
@@ -998,16 +1100,18 @@ def list_pois() -> List[Dict[str, object]]:
     """Prefer the robot's own POI list; fall back to the local cache if
     the robot is unreachable so the map view still shows something."""
     base_url = _base_url()
+    cached = _load_poi_cache(base_url)
     try:
         _, body = _request(
             "GET", "/api/core/artifact/v1/pois", base_url=base_url
         )
     except RobotApiError:
-        return _load_poi_cache(base_url)
+        return cached
     items = body if isinstance(body, list) else []
     normalized = [_normalize_poi(item) for item in items if isinstance(item, dict)]
-    _save_poi_cache(base_url, normalized)
-    return normalized
+    ordered = _merge_pois_in_cached_order(cached, normalized)
+    _save_poi_cache(base_url, ordered)
+    return ordered
 
 
 def _normalize_poi(raw: Dict[str, object]) -> Dict[str, object]:

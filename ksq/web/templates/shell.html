@@ -1026,6 +1026,13 @@
               <span class="section-title">底盘操作</span>
             </summary>
             <div class="map-side-body">
+              <label class="map-patrol-speed-control" for="map-patrol-speed">
+                <span>巡逻最高速度</span>
+                <span class="map-patrol-speed-field">
+                  <input id="map-patrol-speed" type="number" inputmode="decimal" min="0.01" step="any" placeholder="--" required disabled>
+                  <span>m/s</span>
+                </span>
+              </label>
               <div class="map-status-actions">
                 <button class="secondary" id="map-btn-gohome">回桩充电</button>
                 <button class="secondary" id="map-btn-relocate" title="定位丢失或漂移时，让机器人原地旋转重新确认自己在地图上的位置">重定位</button>

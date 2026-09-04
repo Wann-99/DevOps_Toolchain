@@ -658,6 +658,33 @@ class QueryHandler(BaseHTTPRequestHandler):
                     {"error": str(error)},
                 )
             return
+        if path == "/api/map/speed-limit":
+            query = parse_qs(parsed.query)
+            expected_base_url = (
+                query.get("expected_robot_base_url") or [None]
+            )[0]
+            try:
+                max_speed = robot_map_api.get_max_moving_speed(
+                    expected_base_url=expected_base_url
+                )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "min_speed_mps": round(max_speed * 0.1, 6),
+                        "max_speed_mps": max_speed,
+                        "default_speed_mps": round(max_speed * 0.8, 6),
+                    },
+                )
+            except ValueError as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except RobotApiError as error:
+                self._send_json(
+                    HTTPStatus(error.status_code)
+                    if 400 <= error.status_code < 600
+                    else HTTPStatus.BAD_GATEWAY,
+                    {"error": str(error)},
+                )
+            return
         if path == "/api/map/power":
             try:
                 self._send_json(HTTPStatus.OK, robot_map_api.get_power_status())
@@ -1548,20 +1575,30 @@ class QueryHandler(BaseHTTPRequestHandler):
                 yaw = payload.get("yaw")
                 if yaw is not None:
                     yaw = _parse_finite_float(yaw, "yaw")
+                speed_mps = None
+                if "speed_mps" in payload:
+                    if "speed_ratio" in payload:
+                        raise ValueError("speed_mps 与 speed_ratio 不能同时设置。")
+                    speed_mps = _parse_finite_float(
+                        payload["speed_mps"], "speed_mps"
+                    )
+                    if speed_mps <= 0:
+                        raise ValueError("巡逻速度必须大于 0 m/s。")
                 speed_ratio = _parse_finite_float(
                     payload.get("speed_ratio", 0.8), "speed_ratio"
                 )
                 if speed_ratio < 0.1 or speed_ratio > 1:
                     raise ValueError("speed_ratio 必须在 0.1~1 之间。")
                 try:
-                    result = robot_map_api.move_to(
-                        x,
-                        y,
-                        yaw=yaw,
-                        precise=bool(payload.get("precise", True)),
-                        speed_ratio=speed_ratio,
-                        expected_base_url=_expected_robot_base_url(payload),
-                    )
+                    move_options = {
+                        "yaw": yaw,
+                        "precise": bool(payload.get("precise", True)),
+                        "speed_ratio": speed_ratio,
+                        "expected_base_url": _expected_robot_base_url(payload),
+                    }
+                    if speed_mps is not None:
+                        move_options["speed_mps"] = speed_mps
+                    result = robot_map_api.move_to(x, y, **move_options)
                 except RobotApiError as error:
                     self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
                     return

@@ -28,7 +28,7 @@ def _scan() -> dict[str, object]:
 
 
 class RobotMapImageTests(unittest.TestCase):
-    def test_signed_grid_cells_use_slamware_palette_and_flip_y(self) -> None:
+    def test_signed_grid_cells_use_official_slamware_palette_and_flip_y(self) -> None:
         cells = bytes([0, 128, 127, 255])
         header = struct.pack("<ffIIf12xI", 1.5, -2.0, 2, 2, 0.05, len(cells))
         with patch.object(api, "_request_bytes", return_value=header + cells):
@@ -37,6 +37,7 @@ class RobotMapImageTests(unittest.TestCase):
         with Image.open(io.BytesIO(payload)) as image:
             self.assertEqual(image.mode, "L")
             self.assertEqual(image.size, (2, 2))
+            # Official conversion is uint8(128 + signed cell), then Y is flipped.
             self.assertEqual(list(image.tobytes()), [255, 127, 128, 0])
         self.assertEqual(metadata["width"], 2)
         self.assertEqual(metadata["height"], 2)
@@ -307,6 +308,66 @@ class RobotMapPoiCacheTests(unittest.TestCase):
         self.assertEqual(created["id"], "new")
         self.assertEqual(calls, [("POST", robot_b), ("DELETE", robot_a)])
 
+    def test_list_preserves_cached_order_when_robot_reorders(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        cached = [
+            {"id": "b", "name": "B", "x": 2, "y": 2},
+            {"id": "a", "name": "A", "x": 1, "y": 1},
+        ]
+        live = [
+            {"id": "a", "pose": {"x": 1, "y": 1}, "metadata": {"display_name": "A"}},
+            {"id": "b", "pose": {"x": 2, "y": 2}, "metadata": {"display_name": "B"}},
+            {"id": "c", "pose": {"x": 3, "y": 3}, "metadata": {"display_name": "C"}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            cache_file = Path(directory) / "robot_map_pois_cache.json"
+            _write_json(cache_file, {"version": 3, "endpoints": {base_url: cached}})
+            with (
+                patch.object(api, "ROBOT_MAP_POIS_FILE", cache_file),
+                patch.object(api, "_base_url", return_value=base_url),
+                patch.object(api, "_request", return_value=(200, live)),
+            ):
+                result = api.list_pois()
+
+            self.assertEqual([item["id"] for item in result], ["b", "a", "c"])
+            saved = json.loads(cache_file.read_text(encoding="utf-8"))
+            self.assertEqual(saved["version"], 3)
+            self.assertEqual(
+                [item["id"] for item in saved["endpoints"][base_url]],
+                ["b", "a", "c"],
+            )
+
+    def test_version_two_default_names_recover_creation_order(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        cached = [
+            {"id": "two", "name": "停留点2", "x": 2, "y": 2},
+            {"id": "one", "name": "停留点1", "x": 1, "y": 1},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            cache_file = Path(directory) / "robot_map_pois_cache.json"
+            _write_json(cache_file, {"version": 2, "endpoints": {base_url: cached}})
+            with patch.object(api, "ROBOT_MAP_POIS_FILE", cache_file):
+                result = api._load_poi_cache(base_url)
+
+        self.assertEqual([item["id"] for item in result], ["one", "two"])
+
+    def test_fresh_cache_orders_default_named_live_pois_numerically(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        live = [
+            {"id": "two", "pose": {"x": 2, "y": 2}, "metadata": {"display_name": "停留点2"}},
+            {"id": "one", "pose": {"x": 1, "y": 1}, "metadata": {"display_name": "停留点1"}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            cache_file = Path(directory) / "robot_map_pois_cache.json"
+            with (
+                patch.object(api, "ROBOT_MAP_POIS_FILE", cache_file),
+                patch.object(api, "_base_url", return_value=base_url),
+                patch.object(api, "_request", return_value=(200, live)),
+            ):
+                result = api.list_pois()
+
+        self.assertEqual([item["id"] for item in result], ["one", "two"])
+
 
 def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -403,10 +464,12 @@ class RobotMapTelemetryTests(unittest.TestCase):
         base_url = "http://192.168.5.9:1448"
         with (
             patch.object(api, "_base_url", return_value=base_url),
+            patch.object(api, "_request") as request,
             patch.object(api, "_create_action", return_value={}) as create_action,
         ):
             result = api.move_to("1.5", "-2", yaw="0.25", speed_ratio="0.4")
         self.assertEqual(result, {})
+        request.assert_not_called()
         create_action.assert_called_once_with(
             "MoveToAction",
             {
@@ -420,6 +483,48 @@ class RobotMapTelemetryTests(unittest.TestCase):
             },
             base_url=base_url,
         )
+
+    def test_move_to_converts_mps_using_the_robot_speed_limit(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        with (
+            patch.object(api, "_base_url", return_value=base_url),
+            patch.object(api, "_request", return_value=(200, "0.8")) as request,
+            patch.object(api, "_create_action", return_value={}) as create_action,
+        ):
+            result = api.move_to(1, 2, speed_mps=0.4)
+        self.assertEqual(result, {})
+        request.assert_called_once_with(
+            "GET",
+            "/api/core/system/v1/parameter?param=base.max_moving_speed",
+            base_url=base_url,
+            accept="text/plain",
+        )
+        self.assertEqual(
+            create_action.call_args.args[1]["move_options"]["speed_ratio"], 0.5
+        )
+        self.assertEqual(create_action.call_args.kwargs["base_url"], base_url)
+
+    def test_move_to_rejects_unusable_or_out_of_range_mps(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        for maximum in ("high", 0, float("nan")):
+            with self.subTest(maximum=maximum), patch.object(
+                api, "_base_url", return_value=base_url
+            ), patch.object(
+                api, "_request", return_value=(200, maximum)
+            ), patch.object(api, "_create_action") as create_action:
+                with self.assertRaises(api.RobotApiError):
+                    api.move_to(1, 2, speed_mps=0.4)
+                create_action.assert_not_called()
+
+        for speed in (0.07, 0.81):
+            with self.subTest(speed=speed), patch.object(
+                api, "_base_url", return_value=base_url
+            ), patch.object(
+                api, "_request", return_value=(200, "0.8")
+            ), patch.object(api, "_create_action") as create_action:
+                with self.assertRaises(ValueError):
+                    api.move_to(1, 2, speed_mps=speed)
+                create_action.assert_not_called()
 
     def test_snapshot_is_shared_and_marks_partial_refresh_stale(self) -> None:
         parts = {
