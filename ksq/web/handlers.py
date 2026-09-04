@@ -703,6 +703,14 @@ class QueryHandler(BaseHTTPRequestHandler):
             except RobotApiError as error:
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
             return
+        if path == "/api/map/home-pose":
+            try:
+                self._send_json(
+                    HTTPStatus.OK, {"pose": robot_map_api.get_home_pose()}
+                )
+            except RobotApiError as error:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
         if path == "/api/map/telemetry":
             # The map collector returns one coherent scan/pose/quality snapshot.
             # Keep this endpoint read-only and expose stale snapshots as JSON so
@@ -772,6 +780,27 @@ class QueryHandler(BaseHTTPRequestHandler):
                     self._send_json(
                         HTTPStatus.OK, {"active": False, "action": None}
                     )
+                else:
+                    self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
+        if path in ("/api/map/path", "/api/map/milestones"):
+            query = parse_qs(parsed.query)
+            expected_base_url = (query.get("expected_robot_base_url") or [None])[0]
+            reader = (
+                robot_map_api.get_remaining_path
+                if path == "/api/map/path"
+                else robot_map_api.get_remaining_milestones
+            )
+            try:
+                self._send_json(
+                    HTTPStatus.OK,
+                    reader(expected_base_url=expected_base_url),
+                )
+            except ValueError as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except RobotApiError as error:
+                if error.status_code == 404:
+                    self._send_json(HTTPStatus.OK, {"path_points": []})
                 else:
                     self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
             return
@@ -1599,6 +1628,44 @@ class QueryHandler(BaseHTTPRequestHandler):
                     if speed_mps is not None:
                         move_options["speed_mps"] = speed_mps
                     result = robot_map_api.move_to(x, y, **move_options)
+                except RobotApiError as error:
+                    self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path == "/api/map/patrol":
+                payload = read_json_body(self)
+                try:
+                    raw_targets = payload.get("targets")
+                    if not isinstance(raw_targets, list) or not raw_targets:
+                        raise ValueError("巡逻路线至少需要一个停留点。")
+                    targets = []
+                    for index, target in enumerate(raw_targets, start=1):
+                        if not isinstance(target, dict):
+                            raise ValueError(f"第 {index} 个巡逻点格式无效。")
+                        targets.append(
+                            {
+                                "x": _parse_finite_float(
+                                    target.get("x"), f"第 {index} 个点 x"
+                                ),
+                                "y": _parse_finite_float(
+                                    target.get("y"), f"第 {index} 个点 y"
+                                ),
+                            }
+                        )
+                    speed_mps = _parse_finite_float(
+                        payload.get("speed_mps"), "speed_mps"
+                    )
+                    if speed_mps <= 0:
+                        raise ValueError("巡逻速度必须大于 0 m/s。")
+                    result = robot_map_api.series_move_to(
+                        targets,
+                        speed_mps=speed_mps,
+                        expected_base_url=_expected_robot_base_url(payload),
+                    )
+                except ValueError as error:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                    return
                 except RobotApiError as error:
                     self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
                     return

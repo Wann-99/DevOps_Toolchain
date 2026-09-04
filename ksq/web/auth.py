@@ -35,6 +35,7 @@ VIEWER_FORBIDDEN_POST_PATHS = frozenset(
         "/api/edit/persist",
         "/api/import",
         "/api/map/navigate",
+        "/api/map/patrol",
         "/api/map/actions/cancel",
         "/api/map/gohome",
         "/api/map/relocate",

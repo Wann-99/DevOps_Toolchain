@@ -208,6 +208,8 @@
   let pois = []; // { id, name, x, y }
   let zones = { areas: [], lines: [] }; // 禁行/危险/电梯等矩形区域 + 虚拟墙/轨道
   let robot = { x: 0, y: 0, yaw: 0, target: null, moving: false, hasFix: false };
+  let homePose = null;
+  let patrolPath = [];
 
   // 实时传感器数据只保留在浏览器内存中，作为地图底图上方的临时图层。
   // 后端负责从底盘采集并缓存快照，前端只消费一个快照接口，避免多浏览器把
@@ -265,9 +267,12 @@
   let resolveActionCommandReady = null;
   let cancelActionWhenCreated = false;
   let serverActionActive = false;
+  let actionStatusEpoch = 0;
   let patrolControlPending = false;
   let patrolSpeedLimitReady = false;
   let activePatrolSpeedMps = null;
+  let patrolPlanRequestInFlight = false;
+  let lastPatrolPlanRefreshAt = 0;
   let lastTrailFrameKey = null;
 
   function poiKey(poi) {
@@ -668,6 +673,76 @@
     );
   }
 
+  function drawPatrolPath() {
+    if (patrolPath.length < 2) return;
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    const trace = () => {
+      ctx.beginPath();
+      patrolPath.forEach((point, index) => {
+        const pixel = worldToPx(point.x, point.y);
+        if (index === 0) ctx.moveTo(pixel.x, pixel.y);
+        else ctx.lineTo(pixel.x, pixel.y);
+      });
+      ctx.stroke();
+    };
+    ctx.strokeStyle = "rgba(255,255,255,.9)";
+    ctx.lineWidth = screenPx(6);
+    trace();
+    ctx.strokeStyle = "#0891b2";
+    ctx.lineWidth = screenPx(3);
+    trace();
+    ctx.restore();
+  }
+
+  function drawHomePose() {
+    if (!homePose) return;
+    const point = worldToPx(homePose.x, homePose.y);
+    ctx.save();
+    ctx.translate(point.x, point.y);
+    ctx.scale(screenPx(1), screenPx(1));
+    ctx.rotate(-(homePose.yaw || 0));
+    ctx.strokeStyle = "rgba(255,255,255,.95)";
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(10, -15);
+    ctx.lineTo(-15, -15);
+    ctx.lineTo(-15, 15);
+    ctx.lineTo(10, 15);
+    ctx.stroke();
+    ctx.strokeStyle = "#15803d";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(10, -15);
+    ctx.lineTo(-15, -15);
+    ctx.lineTo(-15, 15);
+    ctx.lineTo(10, 15);
+    ctx.stroke();
+    ctx.fillStyle = "#15803d";
+    ctx.beginPath();
+    ctx.moveTo(-2, -9);
+    ctx.lineTo(5, -9);
+    ctx.lineTo(1, -1);
+    ctx.lineTo(7, -1);
+    ctx.lineTo(-4, 10);
+    ctx.lineTo(-1, 2);
+    ctx.lineTo(-7, 2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+    ctx.save();
+    ctx.fillStyle = "#166534";
+    ctx.font = `bold ${screenPx(11)}px sans-serif`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.lineWidth = screenPx(3);
+    ctx.strokeStyle = "rgba(255,255,255,.95)";
+    ctx.strokeText("充电桩", point.x + screenPx(18), point.y - screenPx(18));
+    ctx.fillText("充电桩", point.x + screenPx(18), point.y - screenPx(18));
+    ctx.restore();
+  }
+
   function drawMap() {
     const viewport = syncCanvasResolution();
     if (viewport && viewport.changed) {
@@ -724,7 +799,9 @@
     drawRadarOverlay();
     drawTelemetryTrail();
     drawZones();
+    drawPatrolPath();
     drawLiveScan();
+    drawHomePose();
 
     // 停留点
     pois.forEach((p, i) => {
@@ -978,6 +1055,80 @@
     return true;
   }
 
+  async function refreshHomePose(generation = connectionGeneration) {
+    try {
+      const payload = await apiGet("/api/map/home-pose");
+      if (generation !== connectionGeneration) return false;
+      homePose = extractPose(payload && payload.pose);
+      drawMap();
+      return true;
+    } catch (error) {
+      if (generation !== connectionGeneration) return false;
+      // Keep the last confirmed dock position through a transient timeout.
+      return false;
+    }
+  }
+
+  function normalizePathPoints(payload) {
+    const points = Array.isArray(payload)
+      ? payload
+      : payload && Array.isArray(payload.path_points)
+        ? payload.path_points
+        : payload && Array.isArray(payload.milestones)
+          ? payload.milestones
+          : [];
+    return points.map((point) => {
+      const x = finiteNumber(Array.isArray(point) ? point[0] : point && point.x);
+      const y = finiteNumber(Array.isArray(point) ? point[1] : point && point.y);
+      return x === null || y === null ? null : { x, y };
+    }).filter(Boolean);
+  }
+
+  async function refreshPatrolPlan(actionId, targetCount, startIndex) {
+    const now = Date.now();
+    if (
+      !patrolRunning || patrolPaused || patrolPlanRequestInFlight ||
+      currentActionId !== actionId || now - lastPatrolPlanRefreshAt < 750
+    ) return;
+    const generation = connectionGeneration;
+    patrolPlanRequestInFlight = true;
+    lastPatrolPlanRefreshAt = now;
+    const read = (path) => apiGet(pinnedRobotReadPath(path)).catch(() => null);
+    try {
+      const [pathPayload, milestonePayload] = await Promise.all([
+        read("/api/map/path"),
+        read("/api/map/milestones"),
+      ]);
+      if (
+        generation !== connectionGeneration || !patrolRunning || patrolPaused ||
+        currentActionId !== actionId
+      ) return;
+      if (pathPayload) patrolPath = normalizePathPoints(pathPayload);
+      if (milestonePayload) {
+        const remaining = normalizePathPoints(milestonePayload).length;
+        // The chassis returns an empty list while milestones are not ready and
+        // immediately after completion; neither state proves that points were skipped.
+        if (remaining === 0) {
+          drawMap();
+          return;
+        }
+        const completed = Math.max(0, targetCount - remaining);
+        patrolIndex = Math.min(
+          Math.max(0, patrolQueue.length - 1),
+          startIndex + completed
+        );
+        const poi = findPoiById(patrolQueue[patrolIndex]);
+        document.getElementById("map-patrol-status").textContent =
+          `巡逻中：第 ${patrolIndex + 1}/${patrolQueue.length} 个点` +
+          (poi ? ` · ${poi.name}` : "");
+        renderPatrolQueue();
+      }
+      drawMap();
+    } finally {
+      patrolPlanRequestInFlight = false;
+    }
+  }
+
   // ---------------------------------------------------------------------
   // 后端 API 封装
   // ---------------------------------------------------------------------
@@ -990,6 +1141,7 @@
   async function apiSend(method, path, payload) {
     const isRobotWrite = [
       "/api/map/navigate",
+      "/api/map/patrol",
       "/api/map/actions/cancel",
       "/api/map/gohome",
       "/api/map/relocate",
@@ -1030,6 +1182,7 @@
     if (actionCommandPending) {
       throw new Error("已有底盘指令正在发送，请稍后操作。");
     }
+    actionStatusEpoch += 1;
     actionCommandPending = true;
     actionCommandReady = new Promise((resolve) => {
       resolveActionCommandReady = resolve;
@@ -1037,31 +1190,37 @@
   }
 
   function endActionCommand() {
+    actionStatusEpoch += 1;
     actionCommandPending = false;
     if (resolveActionCommandReady) resolveActionCommandReady();
     resolveActionCommandReady = null;
   }
 
   async function cancelTrackedRobotAction() {
-    cancelActionWhenCreated = true;
-    if (actionCommandPending) await actionCommandReady;
-    if (!serverActionActive && !currentActionId) {
-      cancelActionWhenCreated = false;
-      return;
-    }
+    actionStatusEpoch += 1;
     try {
-      await apiSend("POST", "/api/map/actions/cancel", {});
-    } catch (error) {
+      cancelActionWhenCreated = true;
+      if (actionCommandPending) await actionCommandReady;
+      if (!serverActionActive && !currentActionId) {
+        cancelActionWhenCreated = false;
+        return;
+      }
+      try {
+        await apiSend("POST", "/api/map/actions/cancel", {});
+      } catch (error) {
+        cancelActionWhenCreated = false;
+        throw error;
+      }
       cancelActionWhenCreated = false;
-      throw error;
+      currentActionId = null;
+      serverActionActive = false;
+      robot.moving = false;
+      robot.target = null;
+      setAction("空闲");
+      drawMap();
+    } finally {
+      actionStatusEpoch += 1;
     }
-    cancelActionWhenCreated = false;
-    currentActionId = null;
-    serverActionActive = false;
-    robot.moving = false;
-    robot.target = null;
-    setAction("空闲");
-    drawMap();
   }
 
   function logEvent(text) {
@@ -1114,12 +1273,15 @@
   }
 
   // 轮询 action 状态直到完成（status: 0 初始化 / 1 执行中 / 4 已完成）。
-  async function pollAction(actionId, { onTick } = {}) {
+  async function pollAction(
+    actionId,
+    { onTick, maxAttempts = 240, maxReadFailures = 3 } = {}
+  ) {
     const generation = connectionGeneration;
+    let consecutiveReadFailures = 0;
     currentActionId = actionId;
     try {
-      for (let attempt = 0; attempt < 240; attempt += 1) {
-        // 最长轮询约 2 分钟（240 * 500ms），超时按失败处理，避免死循环。
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         if (generation !== connectionGeneration || currentActionId !== actionId) {
           return { aborted: true };
         }
@@ -1129,11 +1291,18 @@
             "/api/map/actions/" + encodeURIComponent(actionId)
           ));
         } catch (error) {
-          if (generation === connectionGeneration) {
-            logEvent("查询动作状态失败：" + error.message);
+          if (generation !== connectionGeneration || currentActionId !== actionId) {
+            return { aborted: true };
           }
+          consecutiveReadFailures += 1;
+          if (consecutiveReadFailures <= maxReadFailures) {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            continue;
+          }
+          logEvent("连续查询动作状态失败：" + error.message);
           return { aborted: true, error };
         }
+        consecutiveReadFailures = 0;
         if (generation !== connectionGeneration || currentActionId !== actionId) {
           return { aborted: true };
         }
@@ -1147,11 +1316,24 @@
       }
       return { aborted: true, timeout: true };
     } finally {
-      if (currentActionId === actionId) currentActionId = null;
+      if (currentActionId === actionId) {
+        currentActionId = null;
+        actionStatusEpoch += 1;
+      }
     }
   }
 
-  async function navigateTo(target, { silent, speedMps, replaceCurrent = false } = {}) {
+  async function navigateTo(
+    target,
+    {
+      silent,
+      speedMps,
+      replaceCurrent = false,
+      routeTargets = null,
+      routeStartIndex = 0,
+    } = {}
+  ) {
+    const isPatrolRoute = Array.isArray(routeTargets) && routeTargets.length > 0;
     if (replaceCurrent && patrolRunning) {
       const error = new Error("巡逻任务正在运行，请先停止巡逻再切换导航。");
       logEvent(error.message);
@@ -1170,23 +1352,27 @@
       }
     }
     const generation = connectionGeneration;
-    robot.target = target;
+    robot.target = isPatrolRoute ? null : target;
     robot.moving = true;
-    setAction("执行中 → MoveToAction");
+    setAction(isPatrolRoute ? "执行中 → SeriesMoveToAction" : "执行中 → MoveToAction");
     const dockEl = mapStatusElement("map-dock-text");
     if (dockEl) dockEl.textContent = "未在桩上";
-    if (!silent) logEvent(`发送导航指令：x=${target.x.toFixed(2)}, y=${target.y.toFixed(2)}`);
+    if (!silent && target) {
+      logEvent(`发送导航指令：x=${target.x.toFixed(2)}, y=${target.y.toFixed(2)}`);
+    }
     drawMap();
     let response;
     beginActionCommand();
     try {
-      const payload = {
-        x: target.x,
-        y: target.y,
-        precise: true,
-      };
+      const payload = isPatrolRoute
+        ? { targets: routeTargets.map((point) => ({ x: point.x, y: point.y })) }
+        : { x: target.x, y: target.y, precise: true };
       if (Number.isFinite(speedMps)) payload.speed_mps = speedMps;
-      response = await apiSend("POST", "/api/map/navigate", payload);
+      response = await apiSend(
+        "POST",
+        isPatrolRoute ? "/api/map/patrol" : "/api/map/navigate",
+        payload
+      );
       if (generation !== connectionGeneration) {
         endActionCommand();
         return { aborted: true };
@@ -1195,7 +1381,7 @@
       endActionCommand();
       cancelActionWhenCreated = false;
       if (generation !== connectionGeneration) return { aborted: true, error };
-      logEvent("导航请求失败：" + error.message);
+      logEvent((isPatrolRoute ? "巡逻路径请求失败：" : "导航请求失败：") + error.message);
       robot.moving = false;
       robot.target = null;
       setAction("空闲");
@@ -1225,7 +1411,12 @@
       return { aborted: true, cancelled: true };
     }
     endActionCommand();
-    const outcome = await pollAction(actionId);
+    const outcome = await pollAction(actionId, {
+      maxAttempts: isPatrolRoute ? Infinity : 240,
+      onTick: isPatrolRoute
+        ? () => refreshPatrolPlan(actionId, routeTargets.length, routeStartIndex)
+        : undefined,
+    });
     if (generation !== connectionGeneration) return outcome;
     if (outcome.aborted) return outcome;
     robot.moving = false;
@@ -1237,8 +1428,8 @@
     if (outcome.done) {
       logEvent(
         outcome.result === 0
-          ? "到达目标点（result=0 成功）"
-          : `动作结束但未成功（result=${outcome.result}）`
+          ? (isPatrolRoute ? "本轮巡逻路径完成" : "到达目标点（result=0 成功）")
+          : `${isPatrolRoute ? "巡逻" : "导航"}动作未成功（result=${outcome.result}）`
       );
     } else if (outcome.timeout) {
       logEvent("导航动作轮询超时，请到机器人 / RS 端确认实际状态。");
@@ -1347,6 +1538,7 @@
     refreshPois();
     loadMapImage();
     loadZones();
+    refreshHomePose();
   };
 
   // 自动刷新地图：默认关闭。地图已建好、只做日常导航时没必要一直重拉图片；
@@ -1909,6 +2101,7 @@
       wrap.appendChild(chip);
     });
     wrap.querySelectorAll("button").forEach((btn) => {
+      btn.disabled = patrolRunning;
       btn.onclick = () => {
         patrolQueue.splice(Number(btn.dataset.qi), 1);
         renderPatrolQueue();
@@ -1922,20 +2115,35 @@
       stopPatrol();
       return;
     }
-    const poi = findPoiById(patrolQueue[patrolIndex]);
+    const routeStartIndex = patrolIndex;
+    const routePois = patrolQueue.slice(routeStartIndex)
+      .map((poiId) => findPoiById(poiId));
+    if (routePois.some((routePoi) => !routePoi)) {
+      logEvent("巡逻队列包含已失效的停留点，请重新加入后再开始。");
+      await stopPatrol();
+      return;
+    }
+    const routeTargets = routePois.map((routePoi) => ({
+      x: routePoi.x,
+      y: routePoi.y,
+    }));
+    const poi = findPoiById(patrolQueue[routeStartIndex]);
     document.getElementById("map-patrol-status").textContent =
-      `巡逻中：前往第 ${patrolIndex + 1}/${patrolQueue.length} 个点` + (poi ? ` · ${poi.name}` : "");
+      `巡逻中：第 ${routeStartIndex + 1}/${patrolQueue.length} 个点` +
+      (poi ? ` · ${poi.name}` : "");
     renderPatrolQueue();
-    if (!poi) {
-      advancePatrol();
+    if (!routeTargets.length) {
+      await stopPatrol();
       return;
     }
     let outcome;
     try {
-      outcome = await navigateTo(
-        { x: poi.x, y: poi.y },
-        { silent: true, speedMps: activePatrolSpeedMps }
-      );
+      outcome = await navigateTo(null, {
+        silent: true,
+        speedMps: activePatrolSpeedMps,
+        routeTargets,
+        routeStartIndex,
+      });
     } catch (error) {
       logEvent("巡逻中导航失败，任务已停止：" + error.message);
       stopPatrol();
@@ -1943,24 +2151,18 @@
     }
     if (!patrolRunning || patrolPaused) return;
     if (!outcome || !outcome.done || outcome.result !== 0) {
-      logEvent("巡逻点未确认到达，任务已停止。");
+      logEvent("巡逻路径未完成，任务已停止。");
       await stopPatrol();
       return;
     }
-    setTimeout(advancePatrol, 400);
-  }
-  function advancePatrol() {
-    if (!patrolRunning || patrolPaused) return;
-    patrolIndex += 1;
-    if (patrolIndex >= patrolQueue.length) {
-      if (document.getElementById("map-loop-toggle").checked) {
-        patrolIndex = 0;
-      } else {
-        stopPatrol();
-        return;
-      }
+    patrolPath = [];
+    if (document.getElementById("map-loop-toggle").checked) {
+      patrolIndex = 0;
+      patrolStep();
+    } else {
+      await stopPatrol();
+      document.getElementById("map-patrol-status").textContent = "巡逻已完成";
     }
-    patrolStep();
   }
   function startPatrol() {
     if (patrolControlPending || actionCommandPending || currentActionId || serverActionActive) {
@@ -1980,7 +2182,10 @@
     document.getElementById("map-btn-patrol-start").disabled = true;
     document.getElementById("map-btn-patrol-pause").disabled = false;
     document.getElementById("map-btn-patrol-stop").disabled = false;
-    logEvent(`开始巡逻任务（最高速度 ${activePatrolSpeedMps} m/s）`);
+    logEvent(
+      `开始连续多点巡逻（最高速度 ${activePatrolSpeedMps} m/s；` +
+      "有虚拟轨道时优先轨道，无轨道时自动规划）"
+    );
     patrolStep();
   }
   async function pausePatrol() {
@@ -1995,6 +2200,8 @@
       btn.textContent = "暂停中";
       try {
         await cancelTrackedRobotAction();
+        patrolPath = [];
+        drawMap();
         btn.textContent = "继续";
         logEvent("已暂停巡逻（取消当前动作）");
       } catch (error) {
@@ -2029,6 +2236,8 @@
     status.textContent = "正在停止巡逻";
     try {
       await cancelTrackedRobotAction();
+      patrolPath = [];
+      drawMap();
       activePatrolSpeedMps = null;
       if (patrolSpeedInput) patrolSpeedInput.disabled = !patrolSpeedLimitReady;
       startBtn.disabled = false;
@@ -2475,11 +2684,14 @@
     mapHasBeenFitted = false;
     zones = { areas: [], lines: [] };
     pois = [];
+    homePose = null;
+    patrolPath = [];
     patrolQueue = [];
     patrolIndex = 0;
     patrolRunning = false;
     patrolPaused = false;
     currentActionId = null;
+    actionStatusEpoch += 1;
     actionCommandPending = false;
     if (resolveActionCommandReady) resolveActionCommandReady();
     resolveActionCommandReady = null;
@@ -2489,6 +2701,8 @@
     patrolControlPending = false;
     patrolSpeedLimitReady = false;
     activePatrolSpeedMps = null;
+    patrolPlanRequestInFlight = false;
+    lastPatrolPlanRefreshAt = 0;
     if (patrolSpeedInput) {
       patrolSpeedInput.value = "";
       patrolSpeedInput.removeAttribute("max");
@@ -2651,6 +2865,7 @@
         loadZones(generation),
         refreshPois(generation),
         refreshPower(generation),
+        refreshHomePose(generation),
       ]);
       if (generation !== connectionGeneration) return;
       if (telemetryActive) {
@@ -2762,6 +2977,7 @@
             loadZones(nextGeneration),
             refreshPois(nextGeneration),
             refreshPower(nextGeneration),
+            refreshHomePose(nextGeneration),
           ]);
           if (telemetryActive) {
             refreshTelemetry();
@@ -2772,6 +2988,7 @@
         if (!configuredBaseUrl && nextBaseUrl) configuredBaseUrl = nextBaseUrl;
       }
       // 电源和当前动作是独立状态源，单项超时不应阻塞另一项更新。
+      const statusEpoch = actionStatusEpoch;
       const [powerResult, actionResult] = await Promise.all([
         read("/api/map/power"),
         read(pinnedRobotReadPath("/api/map/current-action")),
@@ -2784,7 +3001,9 @@
         // 保留最后一次有效电量，避免瞬时网络抖动造成状态栏跳变。
         setConnected(false, "未连接");
       }
-      if (actionResult.ok) applyCurrentActionStatus(actionResult.value);
+      if (actionResult.ok && statusEpoch === actionStatusEpoch) {
+        applyCurrentActionStatus(actionResult.value);
+      }
     } finally {
       if (generation === connectionGeneration) robotStatusRequestInFlight = false;
       if (telemetryActive) {
@@ -2849,6 +3068,7 @@
   refreshPois();
   loadMapImage();
   loadZones();
+  refreshHomePose();
   installMapLifecycle();
   logEvent("地图导航页已加载。");
 })(window);

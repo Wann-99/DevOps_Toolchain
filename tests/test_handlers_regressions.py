@@ -277,6 +277,44 @@ class HandlerRegressionTests(unittest.TestCase):
         self.assertEqual(data, {"active": True, "action": action})
         get_current_action.assert_called_once_with(expected_base_url=None)
 
+    def test_map_home_pose_and_patrol_plan_are_exposed_read_only(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        with patch.object(
+            handlers.robot_map_api,
+            "get_home_pose",
+            return_value={"x": 1.0, "y": 2.0, "yaw": 0.3},
+        ):
+            _handler, status, data = self._request(
+                "GET", "/api/map/home-pose", role=auth.ROLE_VIEWER
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["pose"]["yaw"], 0.3)
+
+        with patch.object(
+            handlers.robot_map_api,
+            "get_remaining_path",
+            return_value={"path_points": [[1, 2], [3, 4]]},
+        ) as get_path:
+            _handler, status, data = self._request(
+                "GET",
+                "/api/map/path?expected_robot_base_url=" + base_url,
+                role=auth.ROLE_VIEWER,
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["path_points"], [[1, 2], [3, 4]])
+        get_path.assert_called_once_with(expected_base_url=base_url)
+
+        with patch.object(
+            handlers.robot_map_api,
+            "get_home_pose",
+            side_effect=handlers.RobotApiError("timeout", status_code=504),
+        ):
+            _handler, status, data = self._request(
+                "GET", "/api/map/home-pose", role=auth.ROLE_VIEWER
+            )
+        self.assertEqual(status, 502)
+        self.assertEqual(data, {"error": "timeout"})
+
     def test_map_speed_limit_uses_the_current_robot_maximum(self) -> None:
         base_url = "http://192.168.5.9:1448"
         with patch.object(
@@ -322,6 +360,7 @@ class HandlerRegressionTests(unittest.TestCase):
     def test_viewer_cannot_trigger_map_control_actions(self) -> None:
         control_routes = (
             ("/api/map/navigate", b'{"x": 1, "y": 2}'),
+            ("/api/map/patrol", b'{"targets": [{"x": 1, "y": 2}], "speed_mps": 0.2}'),
             ("/api/map/actions/cancel", b"{}"),
             ("/api/map/gohome", b"{}"),
             ("/api/map/relocate", b"{}"),
@@ -332,6 +371,8 @@ class HandlerRegressionTests(unittest.TestCase):
             with self.subTest(path=path), patch.object(
                 handlers.robot_map_api, "move_to"
             ) as move_to, patch.object(
+                handlers.robot_map_api, "series_move_to"
+            ) as series_move_to, patch.object(
                 handlers.robot_map_api, "cancel_current_action"
             ) as cancel, patch.object(
                 handlers.robot_map_api, "go_home"
@@ -349,6 +390,7 @@ class HandlerRegressionTests(unittest.TestCase):
             self.assertIn("管理员", data["error"])
             self.assertEqual(handler.rfile.read(), b"")
             move_to.assert_not_called()
+            series_move_to.assert_not_called()
             cancel.assert_not_called()
             go_home.assert_not_called()
             relocate.assert_not_called()
@@ -411,6 +453,32 @@ class HandlerRegressionTests(unittest.TestCase):
             speed_ratio=0.8,
             expected_base_url=base_url,
             speed_mps=0.4,
+        )
+
+    def test_map_patrol_forwards_ordered_targets_and_real_speed(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        with patch.object(
+            handlers.robot_map_api,
+            "series_move_to",
+            return_value={"action_id": 8},
+        ) as series_move_to:
+            _handler, status, data = self._request(
+                "POST",
+                "/api/map/patrol",
+                role=auth.ROLE_ADMIN,
+                payload={
+                    "targets": [{"x": 1, "y": 2}, {"x": 3, "y": 4}],
+                    "speed_mps": 0.4,
+                    "expected_robot_base_url": base_url,
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data, {"action_id": 8})
+        series_move_to.assert_called_once_with(
+            [{"x": 1.0, "y": 2.0}, {"x": 3.0, "y": 4.0}],
+            speed_mps=0.4,
+            expected_base_url=base_url,
         )
 
     def test_map_navigate_rejects_a_stale_robot_endpoint(self) -> None:

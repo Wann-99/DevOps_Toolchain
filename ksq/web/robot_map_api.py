@@ -776,7 +776,7 @@ def get_home_pose() -> Optional[Dict[str, object]]:
         if error.status_code == 404:
             return None
         raise
-    return body if isinstance(body, dict) else None
+    return _normalize_pose_payload(body, required=True)
 
 
 _EXPLORE_HEADER_SIZE = 36
@@ -860,6 +860,36 @@ def _create_action(
     return body
 
 
+def _resolve_speed_ratio(
+    speed_ratio: object,
+    speed_mps: Optional[object],
+    *,
+    base_url: str,
+) -> float:
+    speed_value = _finite_motion_value(speed_ratio, "speed_ratio")
+    # ponytail: cap app-issued navigation at the configured chassis maximum;
+    # only raise this ceiling after an explicit field safety review.
+    if speed_value < 0.1 or speed_value > 1:
+        raise ValueError("speed_ratio 必须在 0.1~1 之间。")
+    if speed_mps is None:
+        return speed_value
+    speed_mps_value = _finite_motion_value(speed_mps, "speed_mps")
+    if speed_mps_value <= 0:
+        raise ValueError("巡逻速度必须大于 0 m/s。")
+    max_speed = _get_max_moving_speed_for(base_url)
+    min_speed = max_speed * 0.1
+    tolerance = 1e-9
+    if (
+        speed_mps_value < min_speed - tolerance
+        or speed_mps_value > max_speed + tolerance
+    ):
+        raise ValueError(
+            "巡逻速度必须在 "
+            f"{min_speed:.3g}~{max_speed:.3g} m/s 之间。"
+        )
+    return min(1.0, max(0.1, speed_mps_value / max_speed))
+
+
 def move_to(
     x: float,
     y: float,
@@ -873,18 +903,6 @@ def move_to(
 ) -> Dict[str, object]:
     x_value = _finite_motion_value(x, "x")
     y_value = _finite_motion_value(y, "y")
-    speed_value = _finite_motion_value(speed_ratio, "speed_ratio")
-    # ponytail: cap the app-side navigation speed at the configured maximum;
-    # raise this ceiling only after an explicit field safety review.
-    if speed_value < 0.1 or speed_value > 1:
-        raise ValueError("speed_ratio 必须在 0.1~1 之间。")
-    speed_mps_value = (
-        None
-        if speed_mps is None
-        else _finite_motion_value(speed_mps, "speed_mps")
-    )
-    if speed_mps_value is not None and speed_mps_value <= 0:
-        raise ValueError("巡逻速度必须大于 0 m/s。")
     yaw_value = None if yaw is None else _finite_motion_value(yaw, "yaw")
     flags: List[str] = []
     if precise:
@@ -893,19 +911,9 @@ def move_to(
         flags.append("with_yaw")
     with _ROBOT_CONNECTION_LOCK:
         base_url = _require_current_base_url_unlocked(expected_base_url)
-        if speed_mps_value is not None:
-            max_speed = _get_max_moving_speed_for(base_url)
-            min_speed = max_speed * 0.1
-            tolerance = 1e-9
-            if (
-                speed_mps_value < min_speed - tolerance
-                or speed_mps_value > max_speed + tolerance
-            ):
-                raise ValueError(
-                    "巡逻速度必须在 "
-                    f"{min_speed:.3g}~{max_speed:.3g} m/s 之间。"
-                )
-            speed_value = min(1.0, max(0.1, speed_mps_value / max_speed))
+        speed_value = _resolve_speed_ratio(
+            speed_ratio, speed_mps, base_url=base_url
+        )
         move_options: Dict[str, object] = {
             "mode": mode,
             "flags": flags,
@@ -922,6 +930,64 @@ def move_to(
             base_url=base_url,
         )
         return result
+
+
+def series_move_to(
+    targets: List[Dict[str, object]],
+    speed_ratio: float = 0.8,
+    *,
+    speed_mps: Optional[float] = None,
+    expected_base_url: object = None,
+) -> Dict[str, object]:
+    """Navigate a patrol queue as one continuous chassis action."""
+    if not isinstance(targets, list) or not targets:
+        raise ValueError("巡逻路线至少需要一个停留点。")
+    normalized_targets: List[Dict[str, object]] = []
+    for index, target in enumerate(targets, start=1):
+        if not isinstance(target, dict):
+            raise ValueError(f"第 {index} 个巡逻点格式无效。")
+        normalized_targets.append(
+            {
+                "x": _finite_motion_value(target.get("x"), f"第 {index} 个点 x"),
+                "y": _finite_motion_value(target.get("y"), f"第 {index} 个点 y"),
+                "z": 0,
+            }
+        )
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+        resolved_speed_ratio = _resolve_speed_ratio(
+            speed_ratio, speed_mps, base_url=base_url
+        )
+        navigation_mode = 0
+        try:
+            _, raw_tracks = _request(
+                "GET", "/api/core/artifact/v1/lines/tracks", base_url=base_url
+            )
+            tracks = (
+                raw_tracks
+                if isinstance(raw_tracks, list)
+                else raw_tracks.get("lines", [])
+                if isinstance(raw_tracks, dict)
+                else []
+            )
+            if tracks:
+                navigation_mode = 2
+        except RobotApiError:
+            # Missing/unsupported virtual tracks must not block free navigation.
+            pass
+        return _create_action(
+            "SeriesMoveToAction",
+            {
+                "targets": normalized_targets,
+                "move_options": {
+                    "mode": navigation_mode,
+                    "flags": [],
+                    "acceptable_precision": 0.3,
+                    "speed_ratio": resolved_speed_ratio,
+                },
+            },
+            base_url=base_url,
+        )
 
 
 def go_home(
@@ -981,6 +1047,26 @@ def get_current_action(*, expected_base_url: object = None) -> Dict[str, object]
         "GET", "/api/core/motion/v1/actions/:current", base_url=base_url
     )
     return body if isinstance(body, dict) else {}
+
+
+def get_remaining_path(*, expected_base_url: object = None) -> Dict[str, object]:
+    """Return the remaining chassis-planned path for the active action."""
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+    _, body = _request(
+        "GET", "/api/core/motion/v1/path", base_url=base_url
+    )
+    return body if isinstance(body, dict) else {"path_points": []}
+
+
+def get_remaining_milestones(*, expected_base_url: object = None) -> Dict[str, object]:
+    """Return the remaining targets for the active multi-point action."""
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+    _, body = _request(
+        "GET", "/api/core/motion/v1/milestones", base_url=base_url
+    )
+    return body if isinstance(body, dict) else {"path_points": []}
 
 
 def _cancel_current_action_for(base_url: str) -> None:

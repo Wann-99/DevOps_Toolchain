@@ -440,6 +440,46 @@ class RobotMapTelemetryTests(unittest.TestCase):
             "GET", "/api/core/motion/v1/actions/:current", base_url=base_url
         )
 
+    def test_home_pose_and_remaining_plan_use_read_only_chassis_endpoints(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        responses = [
+            (200, {"x": "1.5", "y": -2, "yaw": 0.25}),
+            (200, {"path_points": [[1, 2], [3, 4]]}),
+            (200, {"path_points": [[3, 4]]}),
+        ]
+        with (
+            patch.object(api, "_base_url", return_value=base_url),
+            patch.object(api, "_request", side_effect=responses) as request,
+        ):
+            self.assertEqual(
+                api.get_home_pose(),
+                {"x": 1.5, "y": -2.0, "yaw": 0.25},
+            )
+            self.assertEqual(
+                api.get_remaining_path(),
+                {"path_points": [[1, 2], [3, 4]]},
+            )
+            self.assertEqual(
+                api.get_remaining_milestones(),
+                {"path_points": [[3, 4]]},
+            )
+        self.assertEqual(
+            request.call_args_list,
+            [
+                call("GET", "/api/core/slam/v1/homepose"),
+                call("GET", "/api/core/motion/v1/path", base_url=base_url),
+                call("GET", "/api/core/motion/v1/milestones", base_url=base_url),
+            ],
+        )
+
+    def test_home_pose_returns_none_when_dock_is_not_configured(self) -> None:
+        with patch.object(
+            api,
+            "_request",
+            side_effect=api.RobotApiError("missing", status_code=404),
+        ):
+            self.assertIsNone(api.get_home_pose())
+
     def test_move_to_rejects_non_finite_and_out_of_range_motion_values(self) -> None:
         with patch.object(api, "_create_action") as create_action:
             for value in (float("nan"), float("inf"), float("-inf")):
@@ -503,6 +543,58 @@ class RobotMapTelemetryTests(unittest.TestCase):
             create_action.call_args.args[1]["move_options"]["speed_ratio"], 0.5
         )
         self.assertEqual(create_action.call_args.kwargs["base_url"], base_url)
+
+    def test_series_move_to_keeps_order_and_uses_non_precise_track_priority(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        with (
+            patch.object(api, "_base_url", return_value=base_url),
+            patch.object(
+                api,
+                "_request",
+                side_effect=[(200, "0.8"), (200, [{"id": "track-1"}])],
+            ),
+            patch.object(
+                api, "_create_action", return_value={"action_id": 9}
+            ) as create_action,
+        ):
+            result = api.series_move_to(
+                [{"x": 1, "y": 2}, {"x": "3.5", "y": -4}],
+                speed_mps=0.4,
+            )
+
+        self.assertEqual(result, {"action_id": 9})
+        create_action.assert_called_once_with(
+            "SeriesMoveToAction",
+            {
+                "targets": [
+                    {"x": 1.0, "y": 2.0, "z": 0},
+                    {"x": 3.5, "y": -4.0, "z": 0},
+                ],
+                "move_options": {
+                    "mode": 2,
+                    "flags": [],
+                    "acceptable_precision": 0.3,
+                    "speed_ratio": 0.5,
+                },
+            },
+            base_url=base_url,
+        )
+
+    def test_series_move_to_uses_free_navigation_without_virtual_tracks(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        with (
+            patch.object(api, "_base_url", return_value=base_url),
+            patch.object(
+                api, "_request", side_effect=[(200, "0.8"), (200, [])]
+            ),
+            patch.object(
+                api, "_create_action", return_value={"action_id": 10}
+            ) as create_action,
+        ):
+            api.series_move_to([{"x": 1, "y": 2}], speed_mps=0.4)
+
+        move_options = create_action.call_args.args[1]["move_options"]
+        self.assertEqual(move_options["mode"], 0)
 
     def test_move_to_rejects_unusable_or_out_of_range_mps(self) -> None:
         base_url = "http://192.168.5.9:1448"
