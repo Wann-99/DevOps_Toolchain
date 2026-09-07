@@ -1354,7 +1354,7 @@
     const generation = connectionGeneration;
     robot.target = isPatrolRoute ? null : target;
     robot.moving = true;
-    setAction(isPatrolRoute ? "执行中 → SeriesMoveToAction" : "执行中 → MoveToAction");
+    setAction(isPatrolRoute ? "生成巡逻轨道" : "执行中 → MoveToAction");
     const dockEl = mapStatusElement("map-dock-text");
     if (dockEl) dockEl.textContent = "未在桩上";
     if (!silent && target) {
@@ -1389,6 +1389,14 @@
       throw error;
     }
     const actionId = response.action_id;
+    if (isPatrolRoute) {
+      if (Array.isArray(response.patrol_tracks)) {
+        zones.lines = (zones.lines || []).filter((line) => line.usage !== "tracks")
+          .concat(response.patrol_tracks.map((line) => ({ ...line, usage: "tracks" })));
+      }
+      setAction("巡逻中 · 轨道优先");
+      drawMap();
+    }
     serverActionActive = true;
     if (cancelActionWhenCreated) {
       cancelActionWhenCreated = false;
@@ -2060,12 +2068,14 @@
           navigateTo({ x: poi.x, y: poi.y }, { replaceCurrent: true }).catch(() => {});
         }
         if (act === "add") {
+          if (patrolRunning) return;
           const poiId = poiKey(poi);
           if (!poiId) return;
           patrolQueue.push(poiId);
           renderPatrolQueue();
         }
         if (act === "del") {
+          if (patrolRunning) return;
           try {
             await apiSend("POST", "/api/map/pois/delete", { id: poi.id });
             patrolQueue = patrolQueue.filter((poiId) => poiId !== poiKey(poi));
@@ -2183,8 +2193,7 @@
     document.getElementById("map-btn-patrol-pause").disabled = false;
     document.getElementById("map-btn-patrol-stop").disabled = false;
     logEvent(
-      `开始连续多点巡逻（最高速度 ${activePatrolSpeedMps} m/s；` +
-      "有虚拟轨道时优先轨道，无轨道时自动规划）"
+      `生成巡逻轨道并按加入顺序执行（最高速度 ${activePatrolSpeedMps} m/s，轨道优先）`
     );
     patrolStep();
   }

@@ -75,6 +75,8 @@ _TELEMETRY_EXECUTOR = ThreadPoolExecutor(
 )
 _POI_CACHE_LOCK = threading.RLock()
 _ROBOT_CONNECTION_LOCK = threading.RLock()
+# Reuse the last generated network across patrol laps and pause/resume.
+_PATROL_TRACK_PLANS: Dict[str, dict] = {}
 
 
 class RobotApiError(RuntimeError):
@@ -198,7 +200,7 @@ def require_current_base_url(expected_base_url: object) -> str:
 def _request(
     method: str,
     path: str,
-    payload: Optional[Dict[str, object]] = None,
+    payload: Optional[object] = None,
     *,
     timeout: float = _REQUEST_TIMEOUT_SECONDS,
     base_url: Optional[str] = None,
@@ -932,6 +934,95 @@ def move_to(
         return result
 
 
+def _track_key(line: object) -> Optional[tuple]:
+    if not isinstance(line, dict):
+        return None
+    metadata = line.get("metadata") or {}
+    if not isinstance(metadata, dict) or "control_point1" in metadata or "control_point2" in metadata:
+        return None
+    points = []
+    for name in ("start", "end"):
+        point = line.get(name)
+        if not isinstance(point, dict):
+            return None
+        x, y = _finite_float(point.get("x")), _finite_float(point.get("y"))
+        if x is None or y is None:
+            return None
+        points.append((round(x, 5), round(y, 5)))
+    return tuple(sorted(points))
+
+
+def _prepare_patrol_tracks(targets: List[Dict[str, object]], base_url: str) -> list:
+    _, tracks = _request("GET", "/api/core/artifact/v1/lines/tracks", base_url=base_url)
+    if not isinstance(tracks, list):
+        raise RobotApiError("无法读取底盘虚拟轨道，巡逻未启动。")
+    existing = {_track_key(line) for line in tracks} - {None}
+    target_keys = {(point["x"], point["y"]) for point in targets}
+    previous = _PATROL_TRACK_PLANS.get(base_url)
+    if previous and target_keys <= previous["targets"] and previous["lines"] <= existing:
+        return tracks
+
+    _, raw_pose = _request("GET", "/api/core/slam/v1/localization/pose", base_url=base_url)
+    pose = _normalize_pose_payload(raw_pose, required=True)
+    pending = {}
+    origin = None
+    # ponytail: the firmware only searches from the current pose. Build a
+    # connected network from those official paths; arbitrary-start planning
+    # is needed before claiming a globally shortest multi-stop route.
+    for index, target in enumerate(targets, start=1):
+        try:
+            _, result = _request(
+                "POST", "/api/core/motion/v1/:search_path",
+                {"target": {"x": target["x"], "y": target["y"]}, "timeout": 3000},
+                base_url=base_url,
+            )
+        except RobotApiError as error:
+            raise RobotApiError(f"第 {index} 个巡逻点搜路失败，巡逻未启动：{error}") from error
+        raw_points = result.get("path_points") if isinstance(result, dict) else None
+        if not isinstance(raw_points, list) or not raw_points:
+            raise RobotApiError(f"第 {index} 个巡逻点无法搜路，巡逻未启动。")
+        points = []
+        for raw_point in raw_points:
+            if not isinstance(raw_point, list) or len(raw_point) != 2:
+                raise RobotApiError("底盘返回的巡逻路径格式无效。")
+            x, y = _finite_float(raw_point[0]), _finite_float(raw_point[1])
+            if x is None or y is None:
+                raise RobotApiError("底盘返回的巡逻路径坐标无效。")
+            points.append({"x": x, "y": y})
+        if math.hypot(points[-1]["x"] - target["x"], points[-1]["y"] - target["y"]) > 0.3:
+            raise RobotApiError(f"第 {index} 个巡逻点不可达，巡逻未启动。")
+        if math.hypot(points[0]["x"] - pose["x"], points[0]["y"] - pose["y"]) > 0.2:
+            raise RobotApiError("搜路期间底盘位置已变化，请停止底盘后重试。")
+        if origin is not None and points[0] != origin:
+            raise RobotApiError("搜路起点已变化，无法确认轨道连通，请停止底盘后重试。")
+        origin = points[0]
+        for start, end in zip(points, points[1:]):
+            line = {"start": start, "end": end}
+            key = _track_key(line)
+            if key[0] != key[1] and key not in existing:
+                pending[key] = line
+    if not pending and not existing:
+        raise RobotApiError("停留点与当前位置重合，无法生成巡逻轨道。")
+    _, final_pose = _request("GET", "/api/core/slam/v1/localization/pose", base_url=base_url)
+    final_pose = _normalize_pose_payload(final_pose, required=True)
+    if math.hypot(final_pose["x"] - pose["x"], final_pose["y"] - pose["y"]) > 0.1:
+        raise RobotApiError("搜路期间底盘位置已变化，请停止底盘后重试。")
+    if pending:
+        _, accepted = _request(
+            "POST", "/api/core/artifact/v1/lines/tracks", list(pending.values()),
+            base_url=base_url,
+        )
+        if accepted is not True:
+            raise RobotApiError("底盘未确认生成巡逻轨道，巡逻未启动。")
+        _, tracks = _request("GET", "/api/core/artifact/v1/lines/tracks", base_url=base_url)
+        if not isinstance(tracks, list) or not pending.keys() <= {
+            _track_key(line) for line in tracks
+        }:
+            raise RobotApiError("巡逻轨道校验失败，巡逻未启动。")
+    _PATROL_TRACK_PLANS[base_url] = {"targets": target_keys, "lines": existing | pending.keys()}
+    return tracks
+
+
 def series_move_to(
     targets: List[Dict[str, object]],
     speed_ratio: float = 0.8,
@@ -939,9 +1030,11 @@ def series_move_to(
     speed_mps: Optional[float] = None,
     expected_base_url: object = None,
 ) -> Dict[str, object]:
-    """Navigate a patrol queue as one continuous chassis action."""
+    """Generate virtual tracks, then navigate the ordered queue in mode 2."""
     if not isinstance(targets, list) or not targets:
         raise ValueError("巡逻路线至少需要一个停留点。")
+    if len(targets) > 32:
+        raise ValueError("单次巡逻最多支持 32 个停留点。")
     normalized_targets: List[Dict[str, object]] = []
     for index, target in enumerate(targets, start=1):
         if not isinstance(target, dict):
@@ -958,29 +1051,21 @@ def series_move_to(
         resolved_speed_ratio = _resolve_speed_ratio(
             speed_ratio, speed_mps, base_url=base_url
         )
-        navigation_mode = 0
         try:
-            _, raw_tracks = _request(
-                "GET", "/api/core/artifact/v1/lines/tracks", base_url=base_url
-            )
-            tracks = (
-                raw_tracks
-                if isinstance(raw_tracks, list)
-                else raw_tracks.get("lines", [])
-                if isinstance(raw_tracks, dict)
-                else []
-            )
-            if tracks:
-                navigation_mode = 2
-        except RobotApiError:
-            # Missing/unsupported virtual tracks must not block free navigation.
-            pass
-        return _create_action(
+            current = get_current_action(expected_base_url=base_url)
+        except RobotApiError as error:
+            if error.status_code != 404:
+                raise
+            current = None
+        if current is not None and current.get("state", current).get("status") != 4:
+            raise RobotApiError("已有底盘动作正在执行，请先停止后再开始巡逻。")
+        tracks = _prepare_patrol_tracks(normalized_targets, base_url)
+        result = _create_action(
             "SeriesMoveToAction",
             {
                 "targets": normalized_targets,
                 "move_options": {
-                    "mode": navigation_mode,
+                    "mode": 2,
                     "flags": [],
                     "acceptable_precision": 0.3,
                     "speed_ratio": resolved_speed_ratio,
@@ -988,6 +1073,7 @@ def series_move_to(
             },
             base_url=base_url,
         )
+        return {**result, "patrol_tracks": tracks}
 
 
 def go_home(

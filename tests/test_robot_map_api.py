@@ -546,55 +546,121 @@ class RobotMapTelemetryTests(unittest.TestCase):
 
     def test_series_move_to_keeps_order_and_uses_non_precise_track_priority(self) -> None:
         base_url = "http://192.168.5.9:1448"
+        existing = {"id": 1, "start": {"x": 0, "y": 0}, "end": {"x": 0, "y": 1}}
+        self.assertIsNone(api._track_key({**existing, "metadata": {"control_point1": "curve"}}))
+        paths = [
+            [[0, 0], [0, 1], [1, 1], [1, 0]],
+            [[0, 0], [0, 1], [1, 1], [2, 1], [2, 0]],
+        ]
+        tracks = [existing]
+        searched = []
+
+        def request(method, path, payload=None, **kwargs):
+            if path.endswith("param=base.max_moving_speed"):
+                return 200, "0.8"
+            if path.endswith("actions/:current"):
+                raise api.RobotApiError("idle", status_code=404)
+            if path.endswith("localization/pose"):
+                return 200, {"x": 0, "y": 0}
+            if path.endswith(":search_path"):
+                searched.append(payload["target"])
+                return 200, {"path_points": paths[len(searched) - 1]}
+            if path.endswith("lines/tracks"):
+                if method == "POST":
+                    self.assertEqual(len(searched), 2)
+                    tracks.extend(payload)
+                    return 200, True
+                return 200, tracks.copy()
+            self.fail(f"Unexpected request {method} {path}")
+
         with (
+            patch.dict(api._PATROL_TRACK_PLANS, {}, clear=True),
             patch.object(api, "_base_url", return_value=base_url),
-            patch.object(
-                api,
-                "_request",
-                side_effect=[(200, "0.8"), (200, [{"id": "track-1"}])],
-            ),
+            patch.object(api, "_request", side_effect=request) as requests,
             patch.object(
                 api, "_create_action", return_value={"action_id": 9}
             ) as create_action,
         ):
-            result = api.series_move_to(
-                [{"x": 1, "y": 2}, {"x": "3.5", "y": -4}],
-                speed_mps=0.4,
-            )
-
-        self.assertEqual(result, {"action_id": 9})
-        create_action.assert_called_once_with(
-            "SeriesMoveToAction",
-            {
-                "targets": [
-                    {"x": 1.0, "y": 2.0, "z": 0},
-                    {"x": 3.5, "y": -4.0, "z": 0},
-                ],
-                "move_options": {
-                    "mode": 2,
-                    "flags": [],
-                    "acceptable_precision": 0.3,
-                    "speed_ratio": 0.5,
+            targets = [{"x": 1, "y": 0}, {"x": "2", "y": 0}]
+            result = api.series_move_to(targets, speed_mps=0.4)
+            self.assertEqual(result["action_id"], 9)
+            self.assertEqual(result["patrol_tracks"], tracks)
+            self.assertEqual(tracks[0], existing)
+            self.assertEqual(len(tracks), 5)
+            self.assertEqual(searched, [{"x": 1, "y": 0}, {"x": 2, "y": 0}])
+            create_action.assert_called_once_with(
+                "SeriesMoveToAction",
+                {
+                    "targets": [{"x": 1.0, "y": 0.0, "z": 0}, {"x": 2.0, "y": 0.0, "z": 0}],
+                    "move_options": {
+                        "mode": 2, "flags": [], "acceptable_precision": 0.3,
+                        "speed_ratio": 0.5,
+                    },
                 },
-            },
-            base_url=base_url,
+                base_url=base_url,
+            )
+            requests.reset_mock()
+            # Resume the remaining suffix without duplicating the track network.
+            result = api.series_move_to(
+                targets[1:], speed_mps=0.4,
+            )
+            self.assertFalse(any(item.args[0] != "GET" for item in requests.call_args_list))
+            # A new/cleared map must rebuild tracks instead of falling back to mode 0.
+            tracks.clear()
+            searched.clear()
+            result = api.series_move_to(targets, speed_mps=0.4)
+            self.assertEqual(len(result["patrol_tracks"]), 5)
+            self.assertEqual(len(searched), 2)
+            self.assertEqual(create_action.call_args.args[1]["move_options"]["mode"], 2)
+
+    def test_patrol_planning_and_track_failures_never_start_motion(self) -> None:
+        failures = (
+            "busy", "unreachable", "later_unreachable", "invalid", "moved",
+            "search_error", "disconnected", "rejected", "unconfirmed",
         )
+        for failure in failures:
+            with self.subTest(failure=failure):
+                writes = []
+                pose_reads = 0
 
-    def test_series_move_to_uses_free_navigation_without_virtual_tracks(self) -> None:
-        base_url = "http://192.168.5.9:1448"
-        with (
-            patch.object(api, "_base_url", return_value=base_url),
-            patch.object(
-                api, "_request", side_effect=[(200, "0.8"), (200, [])]
-            ),
-            patch.object(
-                api, "_create_action", return_value={"action_id": 10}
-            ) as create_action,
-        ):
-            api.series_move_to([{"x": 1, "y": 2}], speed_mps=0.4)
+                def request(method, path, payload=None, **kwargs):
+                    nonlocal pose_reads
+                    if path.endswith("actions/:current"):
+                        return 200, {"state": {"status": 1 if failure == "busy" else 4}}
+                    if path.endswith("localization/pose"):
+                        pose_reads += 1
+                        return 200, {"x": 1 if failure == "moved" and pose_reads > 1 else 0, "y": 0}
+                    if path.endswith(":search_path"):
+                        if failure == "search_error":
+                            raise api.RobotApiError("search failed", status_code=500)
+                        points = [[0, 0], [payload["target"]["x"], 0]]
+                        if failure == "unreachable" or (
+                            failure == "later_unreachable" and payload["target"]["x"] == 2
+                        ):
+                            points = []
+                        if failure == "invalid":
+                            points = [[0, 0], [float("nan"), 0]]
+                        if failure == "disconnected" and payload["target"]["x"] == 2:
+                            points[0] = [0, 0.05]
+                        return 200, {"path_points": points}
+                    if path.endswith("lines/tracks"):
+                        if method == "POST":
+                            writes.append(payload)
+                            return 200, failure != "rejected"
+                        return 200, []
+                    self.fail(f"Unexpected request {method} {path}")
 
-        move_options = create_action.call_args.args[1]["move_options"]
-        self.assertEqual(move_options["mode"], 0)
+                with (
+                    patch.dict(api._PATROL_TRACK_PLANS, {}, clear=True),
+                    patch.object(api, "_base_url", return_value="http://192.168.5.9:1448"),
+                    patch.object(api, "_request", side_effect=request),
+                    patch.object(api, "_create_action") as create_action,
+                ):
+                    with self.assertRaises(api.RobotApiError):
+                        api.series_move_to([{"x": 1, "y": 0}, {"x": 2, "y": 0}])
+                    create_action.assert_not_called()
+                    if failure not in ("rejected", "unconfirmed"):
+                        self.assertEqual(writes, [])
 
     def test_move_to_rejects_unusable_or_out_of_range_mps(self) -> None:
         base_url = "http://192.168.5.9:1448"
