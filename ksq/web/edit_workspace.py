@@ -1,4 +1,4 @@
-"""In-memory editable working copy, export, and incremental write-back to originals."""
+"""Shelf-only editing and read-only exports from the loaded data copy."""
 
 from __future__ import annotations
 
@@ -14,15 +14,12 @@ from ksq import safe_io
 from ksq.models import Dataset, ShelfEntry
 from ksq.shelves import format_shelf_location, parse_shelf_locations, shelf_row_id
 from ksq.web import state
-from ksq.web.logs_api import services_for_written_files
 
 SHELF_FIELD_MAP = {
-    "商品编码": "out_item_id",
-    "药品名称": "name",
     "货架属性": "shelf_attribute",
     "挡板高度": "baffle_height",
 }
-LOCATION_SCOPED_FIELDS = frozenset({"库位", "货架属性", "挡板高度", "商品编码"})
+LOCATION_SCOPED_FIELDS = frozenset({"库位", "货架属性", "挡板高度"})
 SHELF_LOCATION_COLUMNS = ("shelf_number", "level", "bin_unit")
 
 SIDE_FILE_KEYS = {
@@ -83,15 +80,11 @@ def _build_dataset_from_workspace() -> Dataset:
     base = state.loaded_dataset
     if base is None:
         raise ValueError("尚未加载数据。")
-    knowledge_records = tuple(
-        deepcopy(workspace["knowledge_by_id"][item_id])
-        for item_id in sorted(workspace["knowledge_by_id"])
-    )
     shelf_entries = _shelf_entries_from_rows(
         workspace["shelf_fieldnames"], workspace["shelf_rows"]
     )
     return Dataset(
-        knowledge_records=knowledge_records,
+        knowledge_records=base.knowledge_records,
         shelf_entries=shelf_entries,
         report=base.report,
     )
@@ -108,27 +101,30 @@ def init_workspace_from_loaded() -> None:
         if not item_id:
             continue
         # Match query rendering: when duplicate records share an id, the
-        # first deterministic record is the one users see and edit.
+        # first deterministic record is the one users see and export.
         knowledge_by_id.setdefault(item_id, deepcopy(dict(record)))
 
-    fieldnames, rows = _read_csv_rows(state.configured_shelves)
+    shelves_path = state.loaded_path("shelves")
+    if shelves_path is None:
+        raise ValueError("未加载库位表，无法初始化编辑工作区。")
+    fieldnames, rows = _read_csv_rows(shelves_path)
     side_files: Dict[str, object] = {}
     side_json_indents: Dict[str, int] = {}
-    unavailable, unavailable_indent = _read_json_file(state.configured_unavailable)
+    unavailable, unavailable_indent = _read_json_file(state.loaded_path("unavailable"))
     if unavailable is not None:
         side_files["unavailabel_obj.json"] = unavailable
         side_json_indents["unavailabel_obj.json"] = unavailable_indent
-    tool_mapping_raw, tool_indent = _read_json_file(state.configured_tool_mapping)
+    tool_mapping_raw, tool_indent = _read_json_file(state.loaded_path("tool_mapping"))
     if tool_mapping_raw is not None:
         side_files["obj_tool_mapping.json"] = tool_mapping_raw
         side_json_indents["obj_tool_mapping.json"] = tool_indent
-    pick_strategy, pick_indent = _read_json_file(state.configured_pick_strategy)
+    pick_strategy, pick_indent = _read_json_file(state.loaded_path("pick_strategy"))
     if pick_strategy is not None:
         side_files["pick_strategy_obj.json"] = pick_strategy
         side_json_indents["pick_strategy_obj.json"] = pick_indent
 
     knowledge_indent = 4
-    knowledge_dir = state.configured_knowledge
+    knowledge_dir = state.loaded_path("knowledge")
     if knowledge_dir is not None and knowledge_dir.is_dir():
         for path in sorted(knowledge_dir.glob("*.json")):
             try:
@@ -137,75 +133,16 @@ def init_workspace_from_loaded() -> None:
             except OSError:
                 continue
 
-    tool_mapping = (
-        dict(state.loaded_tool_mapping) if state.loaded_tool_mapping else {}
-    )
-    closed_loop = (
-        set(state.loaded_closed_loop_ids) if state.loaded_closed_loop_ids else set()
-    )
-    unavailable_ids = (
-        set(state.loaded_unavailable_ids) if state.loaded_unavailable_ids else set()
-    )
-
     state.edit_workspace = {
         "knowledge_by_id": knowledge_by_id,
         "shelf_fieldnames": fieldnames,
         "shelf_rows": rows,
-        "tool_mapping": tool_mapping,
-        "closed_loop_ids": closed_loop,
-        "unavailable_ids": unavailable_ids,
         "side_files": side_files,
         "side_json_indents": side_json_indents,
         "knowledge_json_indent": knowledge_indent,
-        "dirty_knowledge_ids": set(),
-        "dirty_knowledge_fields": {},
         "dirty_shelf_ops": [],
-        "dirty_tool_ids": set(),
-        "dirty_closed_loop_ids": set(),
-        "dirty_unavailable_ids": set(),
         "shelves_dirty": False,
-        "side_dirty": False,
     }
-
-
-_BACKUP_STAMP_RE = safe_io.BACKUP_STAMP_RE
-_NON_KNOWLEDGE_BACKUP_KEEP_DAYS = 2
-# Rotating backups keep this many recent copies; safe_io always additionally
-# retains the earliest backup, which is the pre-edit original.
-_KNOWLEDGE_BACKUP_KEEP_COUNT = 1
-
-
-def _backup_original(
-    path: Path,
-    keep_latest: Optional[int],
-    keep_days: Optional[int],
-) -> Optional[Path]:
-    if keep_latest is None and keep_days is None:
-        raise ValueError("备份清理策略必须指定 keep_latest 或 keep_days。")
-    if not path.is_file():
-        raise FileNotFoundError(f"待备份文件不存在：{path}")
-    return safe_io.backup_file(path, keep_latest=keep_latest, keep_days=keep_days)
-
-
-def _backup_config_file(path: Path) -> Optional[Path]:
-    return _backup_original(
-        path,
-        keep_latest=None,
-        keep_days=_NON_KNOWLEDGE_BACKUP_KEEP_DAYS,
-    )
-
-
-def _backup_knowledge_file(path: Path) -> Optional[Path]:
-    return _backup_original(
-        path,
-        keep_latest=_KNOWLEDGE_BACKUP_KEEP_COUNT,
-        keep_days=None,
-    )
-
-
-def _write_text(path: Path, text: str) -> None:
-    # Backup is taken by the caller; here we only need a verified durable write.
-    safe_io.safe_write_text(path, text, backup=False)
 
 
 def _write_csv_rows(
@@ -244,15 +181,6 @@ def _mark_shelf_op(
         }
     )
     workspace["shelves_dirty"] = True
-
-
-def _mark_knowledge_field(
-    workspace: Dict[str, object], item_id: str, field: str
-) -> None:
-    dirty_ids: Set[str] = workspace["dirty_knowledge_ids"]  # type: ignore[assignment]
-    dirty_fields: Dict[str, Set[str]] = workspace["dirty_knowledge_fields"]  # type: ignore[assignment]
-    dirty_ids.add(item_id)
-    dirty_fields.setdefault(item_id, set()).add(field)
 
 
 def _normalize_location_token(value: str) -> Tuple[str, str, str]:
@@ -307,50 +235,9 @@ def _json_dump_bytes(payload: object, indent: int) -> bytes:
     )
 
 
-def _coerce_knowledge_value(original: object, text: str) -> object:
-    cleaned = text.strip()
-    if cleaned in {"", "-"}:
-        if isinstance(original, list):
-            return []
-        if isinstance(original, bool):
-            return False
-        return ""
-    if isinstance(original, list):
-        return [
-            part.strip()
-            for part in cleaned.replace("、", ",").split(",")
-            if part.strip()
-        ]
-    if isinstance(original, bool):
-        return cleaned in {"是", "true", "True", "1", "yes", "Y"}
-    if isinstance(original, int) and not isinstance(original, bool):
-        return int(float(cleaned))
-    if isinstance(original, float):
-        return float(cleaned)
-    return cleaned
-
-
-def _yes_no_to_bool(text: str) -> bool:
-    return text.strip() in {"是", "true", "True", "1", "yes", "Y"}
-
-
 def _rows_for_sku(workspace: Dict[str, object], item_id: str) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = workspace["shelf_rows"]  # type: ignore[assignment]
     return [row for row in rows if shelf_row_id(row) == item_id]
-
-
-def _side_item_id(
-    workspace: Dict[str, object], item_id: str, existing_ids: object
-) -> str:
-    candidates = [item_id]
-    candidates.extend(
-        str(row.get("sku_code") or "").strip()
-        for row in _rows_for_sku(workspace, item_id)
-    )
-    return next(
-        (candidate for candidate in dict.fromkeys(candidates) if candidate in existing_ids),
-        item_id,
-    )
 
 
 def _row_location(row: Dict[str, str]) -> str:
@@ -400,7 +287,7 @@ def save_field(
         raise ValueError("id 不能为空。")
     if not field:
         raise ValueError("field 不能为空。")
-    if field in {"id", "69码", "药品名称", "商品编码"}:
+    if field not in LOCATION_SCOPED_FIELDS:
         raise ValueError(f"不允许修改 {field}。")
 
     workspace = state.edit_workspace
@@ -408,7 +295,6 @@ def save_field(
         raise ValueError("尚未加载数据，无法保存修改。")
 
     text = str(value)
-    knowledge_by_id: Dict[str, Dict[str, object]] = workspace["knowledge_by_id"]  # type: ignore[assignment]
 
     if field in SHELF_FIELD_MAP:
         csv_key = SHELF_FIELD_MAP[field]
@@ -485,70 +371,8 @@ def save_field(
                         "bin_unit": bin_unit,
                     },
                 )
-    elif field == "使用工具":
-        mapping: Dict[str, str] = workspace["tool_mapping"]  # type: ignore[assignment]
-        side_item_id = _side_item_id(workspace, item_id, mapping)
-        cleaned = text.strip()
-        if cleaned in {"", "-"}:
-            mapping.pop(side_item_id, None)
-        else:
-            mapping[side_item_id] = cleaned
-        side = workspace["side_files"]
-        if isinstance(side, dict):
-            side["obj_tool_mapping.json"] = dict(mapping)
-        dirty_tools: Set[str] = workspace["dirty_tool_ids"]  # type: ignore[assignment]
-        dirty_tools.add(side_item_id)
-        workspace["side_dirty"] = True
-    elif field == "是否闭环":
-        closed: set = workspace["closed_loop_ids"]  # type: ignore[assignment]
-        side_item_id = _side_item_id(workspace, item_id, closed)
-        if _yes_no_to_bool(text):
-            closed.add(side_item_id)
-        else:
-            closed.discard(side_item_id)
-        side = workspace["side_files"]
-        if isinstance(side, dict):
-            current = side.get("pick_strategy_obj.json")
-            if isinstance(current, dict):
-                current = deepcopy(current)
-                current["closed_loop"] = sorted(closed)
-                side["pick_strategy_obj.json"] = current
-        dirty_closed: Set[str] = workspace["dirty_closed_loop_ids"]  # type: ignore[assignment]
-        dirty_closed.add(side_item_id)
-        workspace["side_dirty"] = True
-    elif field == "是否不可处理":
-        unavailable: set = workspace["unavailable_ids"]  # type: ignore[assignment]
-        side_item_id = _side_item_id(workspace, item_id, unavailable)
-        if _yes_no_to_bool(text):
-            unavailable.add(side_item_id)
-        else:
-            unavailable.discard(side_item_id)
-        side = workspace["side_files"]
-        if isinstance(side, dict):
-            current = side.get("unavailabel_obj.json")
-            if isinstance(current, dict):
-                current = deepcopy(current)
-                current["unavailable_obj"] = sorted(unavailable)
-                side["unavailabel_obj.json"] = current
-            else:
-                side["unavailabel_obj.json"] = {"unavailable_obj": sorted(unavailable)}
-        dirty_unavailable: Set[str] = workspace["dirty_unavailable_ids"]  # type: ignore[assignment]
-        dirty_unavailable.add(side_item_id)
-        workspace["side_dirty"] = True
-    else:
-        record = knowledge_by_id.get(item_id)
-        if record is None:
-            record = {"id": item_id}
-            knowledge_by_id[item_id] = record
-        original = record.get(field)
-        record[field] = _coerce_knowledge_value(original, text)
-        _mark_knowledge_field(workspace, item_id, field)
-
     dataset = _build_dataset_from_workspace()
     state.loaded_dataset = dataset
-    state.loaded_tool_mapping = dict(workspace["tool_mapping"])  # type: ignore[arg-type]
-    state.loaded_closed_loop_ids = frozenset(workspace["closed_loop_ids"])  # type: ignore[arg-type]
-    state.loaded_unavailable_ids = frozenset(workspace["unavailable_ids"])  # type: ignore[arg-type]
     revision = state.bump_data_revision()
     return {
         "ok": True,
@@ -577,7 +401,7 @@ def _persist_shelves(workspace: Dict[str, object]) -> Optional[Dict[str, object]
     ops: List[Dict[str, object]] = workspace["dirty_shelf_ops"]  # type: ignore[assignment]
     if not ops:
         return None
-    path = state.configured_shelves
+    path = state.loaded_path("shelves")
     if path is None:
         raise ValueError("未配置库位表路径，无法写回。")
     if not path.is_file():
@@ -600,224 +424,29 @@ def _persist_shelves(workspace: Dict[str, object]) -> Optional[Dict[str, object]
                 continue
             target_row[column_name] = str(value)
         updated_skus.add(sku_code)
-    backup_path = _backup_config_file(path)
     _write_csv_rows(path, fieldnames, rows)
     return {
         "path": str(path),
-        "backup": None if backup_path is None else str(backup_path),
+        "backup": None,
         "updated_keys": len(updated_skus),
     }
-
-
-def _persist_tool_mapping(workspace: Dict[str, object]) -> Optional[Dict[str, object]]:
-    dirty_ids: Set[str] = workspace["dirty_tool_ids"]  # type: ignore[assignment]
-    if not dirty_ids:
-        return None
-    path = state.configured_tool_mapping
-    if path is None:
-        raise ValueError("未配置工具映射路径，无法写回。")
-    if not path.is_file():
-        raise FileNotFoundError(f"工具映射不存在：{path}")
-    payload, indent = _read_json_file(path)
-    if not isinstance(payload, dict):
-        raise ValueError(f"工具映射根节点必须是对象：{path}")
-    mapping: Dict[str, str] = workspace["tool_mapping"]  # type: ignore[assignment]
-    for item_id in dirty_ids:
-        if item_id in mapping:
-            payload[item_id] = mapping[item_id]
-        else:
-            payload.pop(item_id, None)
-    backup_path = _backup_config_file(path)
-    _write_text(
-        path,
-        json.dumps(payload, ensure_ascii=False, indent=indent) + "\n",
-    )
-    return {
-        "path": str(path),
-        "backup": None if backup_path is None else str(backup_path),
-        "updated_keys": len(dirty_ids),
-    }
-
-
-def _persist_id_list_file(
-    path: Optional[Path],
-    list_key: str,
-    dirty_ids: Set[str],
-    active_ids: Set[str],
-) -> Optional[Dict[str, object]]:
-    if not dirty_ids:
-        return None
-    if path is None:
-        raise ValueError(f"未配置 {list_key} 文件路径，无法写回。")
-    if not path.is_file():
-        raise FileNotFoundError(f"文件不存在：{path}")
-    payload, indent = _read_json_file(path)
-    if not isinstance(payload, dict):
-        raise ValueError(f"根节点必须是对象：{path}")
-    raw_items = payload.get(list_key)
-    if raw_items is None:
-        items: List[str] = []
-    elif isinstance(raw_items, list):
-        items = [str(item).strip() for item in raw_items if str(item).strip()]
-    else:
-        raise ValueError(f"{path} 缺少数组字段 {list_key}")
-    item_set = set(items)
-    for item_id in dirty_ids:
-        if item_id in active_ids:
-            item_set.add(item_id)
-        else:
-            item_set.discard(item_id)
-    payload[list_key] = sorted(item_set)
-    backup_path = _backup_config_file(path)
-    _write_text(
-        path,
-        json.dumps(payload, ensure_ascii=False, indent=indent) + "\n",
-    )
-    return {
-        "path": str(path),
-        "backup": None if backup_path is None else str(backup_path),
-        "updated_keys": len(dirty_ids),
-    }
-
-
-def _persist_knowledge(workspace: Dict[str, object]) -> List[Dict[str, object]]:
-    dirty_fields: Dict[str, Set[str]] = workspace["dirty_knowledge_fields"]  # type: ignore[assignment]
-    if not dirty_fields:
-        return []
-    knowledge_dir = state.configured_knowledge
-    if knowledge_dir is None:
-        raise ValueError("未配置 knowledge 目录，无法写回。")
-    if not knowledge_dir.is_dir():
-        raise FileNotFoundError(f"knowledge 目录不存在：{knowledge_dir}")
-    knowledge_root = knowledge_dir.resolve()
-    knowledge_by_id: Dict[str, Dict[str, object]] = workspace["knowledge_by_id"]  # type: ignore[assignment]
-    indent = int(workspace.get("knowledge_json_indent") or 4)
-    results: List[Dict[str, object]] = []
-    for item_id, fields in sorted(dirty_fields.items()):
-        item_id = _validate_item_id(item_id)
-        record = knowledge_by_id.get(item_id)
-        if record is None:
-            raise ValueError(f"内存中缺少商品 {item_id} 的 knowledge。")
-        path = (knowledge_root / f"{item_id}.json").resolve()
-        try:
-            path.relative_to(knowledge_root)
-        except ValueError as error:
-            raise ValueError("knowledge 目标路径超出配置目录。") from error
-        if path.is_file():
-            payload, file_indent = _read_json_file(path)
-            if not isinstance(payload, dict):
-                raise ValueError(f"knowledge 根节点必须是对象：{path}")
-            indent = file_indent
-            backup_path = _backup_knowledge_file(path)
-        else:
-            payload = {"id": item_id}
-            backup_path = None
-        for field in fields:
-            if field in record:
-                payload[field] = deepcopy(record[field])
-        if "id" not in payload:
-            payload["id"] = item_id
-        _write_text(
-            path,
-            json.dumps(payload, ensure_ascii=False, indent=indent) + "\n",
-        )
-        results.append(
-            {
-                "path": str(path),
-                "backup": None if backup_path is None else str(backup_path),
-                "updated_keys": 1,
-                "fields": sorted(fields),
-            }
-        )
-        # Drop this item's dirty marks immediately: if a later item fails, a
-        # retry must not back up and rewrite the files that already landed.
-        dirty_fields.pop(item_id, None)
-        dirty_ids = workspace.get("dirty_knowledge_ids")
-        if isinstance(dirty_ids, set):
-            dirty_ids.discard(item_id)
-    return results
 
 
 def persist_dirty_files() -> Dict[str, object]:
     workspace = state.edit_workspace
     if workspace is None:
-        raise ValueError("尚未加载数据，无法写回原文件。")
-    written: List[Dict[str, object]] = []
-
-    # Each group clears its own dirty flags as soon as its file is on disk. If a
-    # later group fails, the caller can retry without re-writing (and re-backing
-    # up) files that already succeeded.
-    def _finish(kind: str, result: Optional[Dict[str, object]], *keys: str) -> None:
-        if result is None:
-            return
-        written.append({"kind": kind, **result})
-        for key in keys:
-            current = workspace.get(key)
-            if isinstance(current, dict):
-                workspace[key] = {}
-            elif isinstance(current, list):
-                workspace[key] = []
-            elif isinstance(current, set):
-                workspace[key] = set()
-            elif isinstance(current, bool):
-                workspace[key] = False
-
-    try:
-        _finish(
-            "shelves",
-            _persist_shelves(workspace),
-            "dirty_shelf_ops",
-            "shelves_dirty",
-        )
-        _finish(
-            "tool_mapping",
-            _persist_tool_mapping(workspace),
-            "dirty_tool_ids",
-        )
-        _finish(
-            "pick_strategy",
-            _persist_id_list_file(
-                state.configured_pick_strategy,
-                "closed_loop",
-                workspace["dirty_closed_loop_ids"],  # type: ignore[arg-type]
-                set(workspace["closed_loop_ids"]),  # type: ignore[arg-type]
-            ),
-            "dirty_closed_loop_ids",
-        )
-        _finish(
-            "unavailable",
-            _persist_id_list_file(
-                state.configured_unavailable,
-                "unavailable_obj",
-                workspace["dirty_unavailable_ids"],  # type: ignore[arg-type]
-                set(workspace["unavailable_ids"]),  # type: ignore[arg-type]
-            ),
-            "dirty_unavailable_ids",
-        )
-        for item in _persist_knowledge(workspace):
-            written.append({"kind": "knowledge", **item})
-    except (OSError, ValueError, FileNotFoundError) as error:
-        if written:
-            # Partial success: report what landed so the operator knows the
-            # originals are already changed.
-            raise OSError(
-                f"部分文件已写回（{len(written)} 个），随后失败：{error}。"
-                "已写回的文件不会重复写入，可修复后重试。"
-            ) from error
-        raise
-    if not written:
-        raise ValueError("没有可写回的修改。")
-    # Knowledge flags are cleared last, together, since _persist_knowledge
-    # writes many files in one pass.
-    workspace["dirty_knowledge_ids"] = set()
-    workspace["dirty_knowledge_fields"] = {}
-    workspace["side_dirty"] = False
+        raise ValueError("尚未加载数据，无法保存工作副本。")
+    result = _persist_shelves(workspace)
+    if result is None:
+        raise ValueError("没有可保存的修改。")
+    workspace["dirty_shelf_ops"] = []
+    workspace["shelves_dirty"] = False
     revision = state.bump_data_revision()
     return {
         "ok": True,
-        "wrote_original": True,
-        "files": written,
-        "restart_services": services_for_written_files(written),
+        "wrote_original": False,
+        "files": [{"kind": "shelves", **result}],
+        "restart_services": [],
         "data_revision": revision,
     }
 
@@ -835,9 +464,9 @@ def list_export_files() -> Dict[str, object]:
     return {
         "files": files,
         "knowledge_count": len(knowledge_ids),
-        "dirty_knowledge": len(workspace["dirty_knowledge_ids"]),  # type: ignore[arg-type]
+        "dirty_knowledge": 0,
         "shelves_dirty": bool(workspace["shelves_dirty"]),
-        "side_dirty": bool(workspace["side_dirty"]),
+        "side_dirty": False,
     }
 
 

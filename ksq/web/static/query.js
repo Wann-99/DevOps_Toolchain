@@ -910,13 +910,15 @@ async function loadRecords() {
 }
 
 async function reloadData() {
+  if (window.KsqLoadProgress.isBusy()) return;
+  const wasDisabled = reloadButton.disabled;
   reloadButton.disabled = true;
   reloadStatus.textContent = "加载中...";
   reloadStatus.className = "meta compact";
   try {
-    const response = await fetch("/api/reload", { method: "POST" });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "重新加载失败");
+    await window.KsqLoadProgress.request("/api/reload", {
+      onProgress: (progress) => { reloadStatus.innerHTML = window.KsqLoadProgress.html(progress); },
+    });
     await loadRecords();
     reloadStatus.textContent = "";
     scanInput.focus();
@@ -925,7 +927,7 @@ async function reloadData() {
       '<span class="error">' + escapeHtml(error.message) + "</span>";
     if (window.KsqStatus && window.KsqStatus.error) window.KsqStatus.error(error.message);
   } finally {
-    reloadButton.disabled = false;
+    if (!reloadButton.hasAttribute("data-admin-only")) reloadButton.disabled = wasDisabled;
   }
 }
 

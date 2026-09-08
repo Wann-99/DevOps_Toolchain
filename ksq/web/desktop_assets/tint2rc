@@ -1,0 +1,82 @@
+# Panel
+rounded = 0
+border_width = 0
+background_color = #273131 100
+
+# Inactive task
+rounded = 4
+border_width = 1
+background_color = #344141 100
+border_color = #4b5959 100
+background_color_hover = #465858 100
+border_color_hover = #8aa7a4 100
+
+# Active task
+rounded = 4
+border_width = 1
+background_color = #176c65 100
+border_color = #47998f 100
+background_color_hover = #237e75 100
+border_color_hover = #78bcb3 100
+
+panel_items = TSC
+panel_size = 100% 44
+panel_margin = 0 0
+panel_padding = 8 5 8
+panel_background_id = 1
+panel_position = bottom center horizontal
+panel_layer = top
+panel_monitor = all
+autohide = 0
+strut_policy = follow_size
+disable_transparency = 1
+wm_menu = 0
+mouse_effects = 1
+font_shadow = 0
+
+taskbar_mode = single_desktop
+taskbar_name = 0
+taskbar_padding = 0 0 6
+taskbar_background_id = 0
+taskbar_always_show_all_desktop_tasks = 1
+taskbar_hide_inactive_tasks = 0
+taskbar_hide_different_monitor = 0
+taskbar_hide_different_desktop = 0
+task_align = left
+task_text = 1
+task_icon = 1
+task_centered = 0
+task_maximum_size = 240 34
+task_padding = 8 2 8
+task_font = Sans 11
+task_font_color = #e4eded 100
+task_active_font_color = #ffffff 100
+task_iconified_font_color = #bcc9c9 100
+task_background_id = 2
+task_active_background_id = 3
+task_iconified_background_id = 2
+task_urgent_background_id = 3
+task_tooltip = 1
+mouse_left = toggle_iconify
+mouse_middle = none
+mouse_right = none
+mouse_scroll_up = none
+mouse_scroll_down = none
+
+systray_padding = 6 0 6
+systray_icon_size = 22
+systray_background_id = 0
+time1_format = %H:%M
+time1_font = Sans Bold 11
+time2_format = %m-%d
+time2_font = Sans 9
+clock_font_color = #e4eded 100
+clock_padding = 10 0
+clock_background_id = 0
+clock_tooltip = %Y-%m-%d %A
+tooltip_show_timeout = 0.4
+tooltip_hide_timeout = 0.1
+tooltip_padding = 8 6
+tooltip_background_id = 1
+tooltip_font = Sans 11
+tooltip_font_color = #ffffff 100

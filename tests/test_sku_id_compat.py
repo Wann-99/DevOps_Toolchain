@@ -104,11 +104,6 @@ class SkuIdCompatibilityTests(unittest.TestCase):
         }
         workspace = {"shelf_rows": [row]}
         self.assertEqual(edit_workspace._rows_for_sku(workspace, "sku-new"), [row])
-        self.assertEqual(
-            edit_workspace._side_item_id(workspace, "sku-new", {"690001"}),
-            "690001",
-        )
-
         broker_body = {"items": [{"item_id": "OUT-1", "barcode": "690001"}]}
         local_body = order_api._local_request_body(
             broker_body,

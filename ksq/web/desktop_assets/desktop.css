@@ -1,0 +1,42 @@
+
+/* KSQ desktop: preserve the upstream viewer and its controls. */
+:root {
+    --novnc-blue: #273131;
+    --novnc-darkblue: #176c65;
+}
+body, #noVNC_container {
+    background: #dce5e5;
+}
+#noVNC_control_bar, .noVNC_right #noVNC_control_bar {
+    background-color: #273131;
+    border-radius: 0;
+}
+#noVNC_control_bar.noVNC_open,
+#noVNC_control_bar.noVNC_open::before,
+#noVNC_control_bar_handle {
+    box-shadow: none;
+}
+#noVNC_control_bar_handle {
+    background-color: #176c65;
+    background-image: none;
+}
+#noVNC_control_bar .noVNC_button {
+    border-color: #596a6a;
+    border-radius: 4px;
+}
+#noVNC_control_bar .noVNC_button:hover,
+#noVNC_control_bar .noVNC_button.noVNC_selected {
+    background-color: #176c65;
+    border-color: #85b9b2;
+}
+.noVNC_panel {
+    color: #304242;
+    border: 1px solid #bdcccc;
+    border-radius: 6px;
+    box-shadow: 0 4px 16px #27313126;
+}
+.noVNC_panel .noVNC_heading {
+    background-color: #273131;
+    font-size: 16px;
+    border-radius: 4px;
+}

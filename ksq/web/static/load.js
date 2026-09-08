@@ -30,43 +30,8 @@
   };
 
   let activeMethod = "path";
-  let loadBusy = false;
   let missingSort = { key: "", dir: "" };
   const EXCLUDE_UNAVAILABLE_KEY = "ksq-exclude-unavailable";
-
-  const loadControls = Array.from(
-    document.querySelectorAll(
-      '#view-load button[type="submit"], #view-load #auto-load-btn, #view-load input[type="file"]'
-    )
-  );
-  const loadControlDisabledState = new WeakMap();
-
-  function setLoadBusy(next) {
-    loadBusy = Boolean(next);
-    loadControls.forEach((control) => {
-      if (loadBusy) {
-        if (!loadControlDisabledState.has(control)) {
-          loadControlDisabledState.set(control, Boolean(control.disabled));
-        }
-        control.disabled = true;
-        return;
-      }
-      if (!loadControlDisabledState.has(control)) return;
-      const wasDisabled = loadControlDisabledState.get(control);
-      loadControlDisabledState.delete(control);
-      // auth.js marks viewer-only controls with data-admin-only; do not
-      // accidentally re-enable those controls after an upload finishes.
-      if (!control.hasAttribute("data-admin-only")) {
-        control.disabled = wasDisabled;
-      }
-    });
-  }
-
-  function beginLoad() {
-    if (loadBusy) return false;
-    setLoadBusy(true);
-    return true;
-  }
 
   try {
     excludeUnavailable.checked = global.localStorage.getItem(EXCLUDE_UNAVAILABLE_KEY) === "1";
@@ -88,6 +53,31 @@
     if (input) initialPathValues[id] = input.value;
   });
   const filePickerPlaceholders = new WeakMap();
+  const loadSource = document.getElementById("load-source");
+  const shelvesInput = document.getElementById("shelves-path");
+  let shelvesSource = loadSource.dataset.source === "cloud" ? "cloud" : "local";
+  let localShelvesPath = shelvesInput.value;
+
+  function renderShelvesSource() {
+    const cloud = shelvesSource === "cloud";
+    shelvesInput.value = cloud ? "" : localShelvesPath;
+    shelvesInput.disabled = cloud;
+    shelvesInput.required = !cloud;
+    loadSource.querySelectorAll("input").forEach((input) => {
+      input.checked = input.value === shelvesSource;
+    });
+  }
+
+  loadSource.querySelectorAll("input").forEach((input) => {
+    input.addEventListener("change", () => {
+      if (!global.KsqLoadProgress.isBusy()) {
+        if (shelvesSource === "local") localShelvesPath = shelvesInput.value;
+        shelvesSource = input.value;
+      }
+      renderShelvesSource();
+    });
+  });
+  renderShelvesSource();
 
   const escapeHtml = (value) =>
     String(value)
@@ -206,6 +196,7 @@
 
   function setActiveMethod(method) {
     activeMethod = method;
+    loadSource.hidden = method !== "path";
     renderActivePanel();
   }
 
@@ -246,7 +237,7 @@
       PATH_INPUT_IDS.forEach((id) => {
         const input = document.getElementById(id);
         if (input && Object.prototype.hasOwnProperty.call(initialPathValues, id)) {
-          input.value = initialPathValues[id];
+          setPathValue(id, initialPathValues[id]);
         }
       });
       return;
@@ -269,20 +260,8 @@
     });
   }
 
-  function renderProgress(method, label, percent, indeterminate) {
-    const width = indeterminate
-      ? ""
-      : ' style="width:' + Math.max(0, Math.min(100, percent)) + '%"';
-    const html =
-      '<div class="progress-wrap"><div class="progress-label"><span>' +
-      escapeHtml(label) +
-      "</span><span>" +
-      (indeterminate ? "处理中" : Math.round(percent) + "%") +
-      '</span></div><div class="progress-track"><div class="progress-bar' +
-      (indeterminate ? " indeterminate" : "") +
-      '"' +
-      width +
-      "></div></div></div>";
+  function renderProgress(method, progress) {
+    const html = global.KsqLoadProgress.html(progress);
     panelState[method].statusHtml = html;
     panelState[method].showNext = false;
     if (method === activeMethod) {
@@ -474,65 +453,23 @@
     missingExportTemplates.addEventListener("click", () => exportMissing("zip"));
   }
 
-  async function postJson(endpoint, payload) {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "请求失败");
-    return data;
-  }
-
-  function postForm(method, endpoint, formData) {
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open("POST", endpoint);
-      xhr.upload.onprogress = (event) => {
-        if (!event.lengthComputable) {
-          renderProgress(method, "上传中...", 0, true);
-          return;
-        }
-        const percent = (event.loaded / event.total) * 100;
-        renderProgress(
-          method,
-          percent >= 100 ? "解析中..." : "上传中...",
-          percent,
-          percent >= 100
-        );
-      };
-      xhr.upload.onload = () => renderProgress(method, "解析中...", 0, true);
-      xhr.onerror = () => reject(new Error("网络错误"));
-      xhr.onload = () => {
-        let data;
-        try {
-          data = JSON.parse(xhr.responseText || "{}");
-        } catch (error) {
-          reject(new Error("服务器返回了无效响应"));
-          return;
-        }
-        if (xhr.status < 200 || xhr.status >= 300) {
-          reject(new Error(data.error || "上传失败"));
-          return;
-        }
-        resolve(data);
-      };
-      xhr.send(formData);
+  function loadRequest(method, endpoint, body) {
+    return global.KsqLoadProgress.request(endpoint, {
+      body: body, onProgress: (progress) => renderProgress(method, progress),
     });
   }
 
   document.getElementById("path-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (!beginLoad()) return;
+    if (global.KsqLoadProgress.isBusy()) return;
     clearPanelResult("path");
-    renderProgress("path", "加载中...", 0, true);
     try {
       applyLoad(
         "path",
-        await postJson("/load-paths", {
+        await loadRequest("path", "/load-paths", {
           knowledge: document.getElementById("knowledge-path").value.trim(),
-          shelves: document.getElementById("shelves-path").value.trim(),
+          shelves: shelvesSource === "cloud" ? "" : shelvesInput.value.trim(),
+          shelves_source: shelvesSource,
           unavailable: document.getElementById("unavailable-path").value.trim(),
           tool_mapping: document.getElementById("tool-mapping-path").value.trim(),
           pick_strategy: document.getElementById("pick-strategy-path").value.trim(),
@@ -540,23 +477,25 @@
       );
     } catch (error) {
       await showLoadError("path", "数据加载失败", error);
-    } finally {
-      setLoadBusy(false);
     }
   });
 
   function setPathValue(id, value) {
     if (typeof value !== "string") return;
+    if (id === "shelves-path") {
+      localShelvesPath = value;
+      renderShelvesSource();
+      return;
+    }
     var el = document.getElementById(id);
     if (el) el.value = value;
   }
 
   document.getElementById("auto-load-btn").addEventListener("click", async () => {
-    if (!beginLoad()) return;
+    if (global.KsqLoadProgress.isBusy()) return;
     clearPanelResult("path");
-    renderProgress("path", "一键加载中...", 0, true);
     try {
-      var data = await postJson("/load-auto", {});
+      var data = await loadRequest("path", "/load-auto", { shelves_source: shelvesSource });
       if (data.paths) {
         setPathValue("knowledge-path", data.paths.knowledge);
         setPathValue("shelves-path", data.paths.shelves);
@@ -567,55 +506,42 @@
       applyLoad("path", data);
     } catch (error) {
       await showLoadError("path", "一键加载失败", error);
-    } finally {
-      setLoadBusy(false);
     }
   });
 
   document.getElementById("bundle-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (!beginLoad()) return;
+    if (global.KsqLoadProgress.isBusy()) return;
     const zipFile = document.getElementById("bundle-zip").files[0];
     if (!zipFile) {
-      try {
-        await showLoadError(
-          "bundle",
-          "无法加载配置包",
-          new Error("请先选择配置压缩包")
-        );
-      } finally {
-        setLoadBusy(false);
-      }
+      await showLoadError(
+        "bundle",
+        "无法加载配置包",
+        new Error("请先选择配置压缩包")
+      );
       return;
     }
     const form = new FormData();
     form.append("bundle_zip", zipFile, zipFile.name);
     clearPanelResult("bundle");
-    renderProgress("bundle", "上传中...", 0, false);
     try {
-      applyLoad("bundle", await postForm("bundle", "/load-upload", form));
+      applyLoad("bundle", await loadRequest("bundle", "/load-upload", form));
     } catch (error) {
       await showLoadError("bundle", "配置包加载失败", error);
-    } finally {
-      setLoadBusy(false);
     }
   });
 
   document.getElementById("import-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (!beginLoad()) return;
+    if (global.KsqLoadProgress.isBusy()) return;
     const input = document.getElementById("import-files");
     const files = Array.from((input && input.files) || []);
     if (!files.length) {
-      try {
-        await showLoadError(
-          "import",
-          "无法导入",
-          new Error("请先选择压缩包或文件")
-        );
-      } finally {
-        setLoadBusy(false);
-      }
+      await showLoadError(
+        "import",
+        "无法导入",
+        new Error("请先选择压缩包或文件")
+      );
       return;
     }
     const form = new FormData();
@@ -623,13 +549,10 @@
       form.append("files", file, file.name);
     });
     clearPanelResult("import");
-    renderProgress("import", "上传中...", 0, false);
     try {
-      applyImportResult(await postForm("import", "/api/import", form));
+      applyImportResult(await loadRequest("import", "/api/import", form));
     } catch (error) {
       await showLoadError("import", "导入失败", error);
-    } finally {
-      setLoadBusy(false);
     }
   });
 

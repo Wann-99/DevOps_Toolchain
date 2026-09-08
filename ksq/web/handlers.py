@@ -21,6 +21,8 @@ from ksq.web import (
     auth,
     dashboard_api,
     edit_workspace,
+    files_api,
+    load_progress,
     logs_api,
     order_api,
     robot_map_api,
@@ -28,12 +30,15 @@ from ksq.web import (
     test_order_api,
 )
 from ksq.web.robot_map_api import RobotApiError
+from ksq.web import robot_mapping_api, robot_mapping_objects
 from ksq.web.import_api import import_uploaded_files
 from ksq.web.loader import (
+    CLOUD_SHELVES_URL,
     apply_configured_paths_reload,
     load_from_configured_paths,
     load_uploaded_zip,
     parse_optional_path,
+    parse_shelves_source,
     resolve_knowledge_path,
     resolve_input_path,
 )
@@ -154,6 +159,7 @@ _LOAD_PATH_STATE_FIELDS = (
     "configured_knowledge",
     "configured_knowledge_root",
     "configured_shelves",
+    "shelves_source",
     "configured_unavailable",
     "configured_tool_mapping",
     "configured_pick_strategy",
@@ -162,6 +168,7 @@ _LOAD_PATH_STATE_FIELDS = (
     "loaded_tool_mapping",
     "loaded_closed_loop_ids",
     "loaded_unavailable_ids",
+    "loaded_paths",
     "data_source_ready",
     "data_load_method",
     "edit_workspace",
@@ -244,6 +251,7 @@ class QueryHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_logout(self) -> None:
+        files_api.close_terminals(auth.token_from_cookie(self.headers.get("Cookie", "")))
         auth.destroy_session(
             auth.token_from_cookie(self.headers.get("Cookie", ""))
         )
@@ -280,6 +288,15 @@ class QueryHandler(BaseHTTPRequestHandler):
             return
         session = self._require_session(path)
         if session is None:
+            return
+        if files_api.handle_request(self, session):
+            return
+        if path == "/api/load-progress":
+            load_id = (parse_qs(parsed.query).get("id") or [""])[0]
+            self._send_json(
+                HTTPStatus.OK,
+                load_progress.snapshot(load_id, str(session.get("username") or "")),
+            )
             return
         if path == "/":
             self._send_html(HTTPStatus.OK, home_page_html())
@@ -538,7 +555,9 @@ class QueryHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/test-order/state":
             try:
-                self._send_json(HTTPStatus.OK, test_order_api.get_state())
+                with state.DATASET_LOCK:
+                    result = test_order_api.get_state()
+                self._send_json(HTTPStatus.OK, result)
             except (ValueError, FileNotFoundError, OSError) as error:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
@@ -643,6 +662,35 @@ class QueryHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._send_json(HTTPStatus.OK, {"status": status, "data": data})
+            return
+        if path in ("/api/map/mapping", "/api/map/mapping/objects", "/api/map/mapping/export"):
+            try:
+                query = parse_qs(urlparse(self.path).query)
+                expected = _expected_robot_base_url({
+                    "expected_robot_base_url": query.get("expected_robot_base_url", [""])[0]
+                })
+                if path == "/api/map/mapping":
+                    self._send_json(HTTPStatus.OK, robot_mapping_api.get_status(expected))
+                elif path.endswith("/objects"):
+                    with robot_map_api._ROBOT_CONNECTION_LOCK:
+                        base_url = robot_map_api.require_current_base_url(expected)
+                    result = robot_mapping_objects.list_objects(base_url)
+                    with robot_map_api._ROBOT_CONNECTION_LOCK:
+                        robot_map_api.require_current_base_url(base_url)
+                    self._send_json(HTTPStatus.OK, result)
+                else:
+                    content = robot_mapping_api.export_map(expected)
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Disposition", 'attachment; filename="map.stcm"')
+                    self.send_header("Content-Length", str(len(content)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(content)
+            except RobotApiError as error:
+                self._send_json(HTTPStatus(error.status_code), {"error": str(error)})
+            except (ValueError, OSError) as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
         if path == "/api/map/settings":
             self._send_json(HTTPStatus.OK, robot_map_api.load_settings())
@@ -928,6 +976,26 @@ class QueryHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
 
     def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        if path not in load_progress.LOAD_ENDPOINTS:
+            self._do_POST()
+            return
+        session = self._current_session()
+        if session is None:
+            self._do_POST()
+            return
+        self._ksq_request_body_consumed = 0
+        try:
+            with load_progress.track(
+                self.headers.get("X-Load-ID", ""),
+                str(session.get("username") or ""),
+            ):
+                self._do_POST()
+        except ValueError as error:
+            _drain_request_body(self)
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+
+    def _do_POST(self) -> None:
         # A handler instance may serve multiple HTTP/1.1 requests.  Reset the
         # per-request counter before any authentication branch can drain it.
         self._ksq_request_body_consumed = 0
@@ -937,7 +1005,12 @@ class QueryHandler(BaseHTTPRequestHandler):
             return
         session = self._require_session(path)
         if session is None:
+            if path.startswith(("/api/files/", "/api/terminal/")):
+                self.close_connection = True
+                return
             _drain_request_body(self)
+            return
+        if files_api.handle_request(self, session):
             return
         if path == "/api/auth/logout":
             _drain_request_body(self)
@@ -1196,22 +1269,24 @@ class QueryHandler(BaseHTTPRequestHandler):
                 return
             if path == "/load-paths":
                 payload = read_json_body(self)
+                shelves_source = parse_shelves_source(payload.get("shelves_source", "local"))
                 knowledge_raw = payload.get("knowledge")
                 shelves_raw = payload.get("shelves")
                 if not isinstance(knowledge_raw, str) or not knowledge_raw.strip():
                     raise ValueError("knowledge 路径不能为空。")
-                if not isinstance(shelves_raw, str) or not shelves_raw.strip():
+                if shelves_source == "local" and (not isinstance(shelves_raw, str) or not shelves_raw.strip()):
                     raise ValueError("shelves 路径不能为空。")
                 knowledge_base, config_base = path_field_bases()
                 knowledge_path = resolve_knowledge_path(
                     knowledge_raw, knowledge_base
                 )
-                shelves_path = resolve_input_path(
-                    shelves_raw, "库位表", config_base
+                shelves_path = (
+                    resolve_input_path(shelves_raw, "库位表", config_base)
+                    if shelves_source == "local" else None
                 )
                 if not knowledge_path.is_dir():
                     raise FileNotFoundError(f"Knowledge 目录不存在：{knowledge_path}")
-                if not shelves_path.is_file():
+                if shelves_path is not None and not shelves_path.is_file():
                     raise FileNotFoundError(f"库位表不存在：{shelves_path}")
                 unavailable_path = parse_optional_path(
                     payload.get("unavailable"), "不可处理列表", config_base
@@ -1226,13 +1301,17 @@ class QueryHandler(BaseHTTPRequestHandler):
                     snapshot = _snapshot_load_path_state()
                     try:
                         state.configured_knowledge = knowledge_path
-                        state.configured_shelves = shelves_path
+                        state.shelves_source = shelves_source
+                        if shelves_path is not None:
+                            state.configured_shelves = shelves_path
                         state.configured_unavailable = unavailable_path
                         state.configured_tool_mapping = tool_mapping_path
                         state.configured_pick_strategy = pick_strategy_path
                         # Mark user-submitted non-empty paths as explicit so
                         # reload_config_pnp_paths() preserves them over config.py.
-                        explicit_keys = {"knowledge", "shelves"}
+                        explicit_keys = {"knowledge"}
+                        if shelves_path is not None:
+                            explicit_keys.add("shelves")
                         if unavailable_path is not None:
                             explicit_keys.add("unavailable")
                         if tool_mapping_path is not None:
@@ -1245,18 +1324,6 @@ class QueryHandler(BaseHTTPRequestHandler):
                         dataset, tool_mapping, closed_loop_ids, unavailable_ids, elapsed = (
                             load_from_configured_paths()
                         )
-                        state.loaded_dataset = dataset
-                        state.loaded_tool_mapping = tool_mapping
-                        state.loaded_closed_loop_ids = closed_loop_ids
-                        state.loaded_unavailable_ids = (
-                            None
-                            if unavailable_path is None
-                            else frozenset(unavailable_ids)
-                        )
-                        state.data_source_ready = True
-                        state.data_load_method = "paths"
-                        edit_workspace.init_workspace_from_loaded()
-                        state.bump_data_revision()
                     except Exception:
                         _restore_load_path_state(snapshot)
                         raise
@@ -1266,9 +1333,9 @@ class QueryHandler(BaseHTTPRequestHandler):
                         "html": format_status_html(
                             dataset,
                             elapsed,
-                            "已从本机路径加载",
+                            "已加载云端库位表与本地配置" if shelves_source == "cloud" else "已从本机路径加载",
                             str(knowledge_path),
-                            str(shelves_path),
+                            CLOUD_SHELVES_URL if shelves_source == "cloud" else str(shelves_path),
                             unavailable_path is not None,
                             tool_mapping_path is not None,
                             pick_strategy_path is not None,
@@ -1277,12 +1344,14 @@ class QueryHandler(BaseHTTPRequestHandler):
                         "unavailable_ids": unavailable_ids,
                         "has_unavailable": unavailable_path is not None,
                         "load_method": "paths",
+                        "shelves_source": shelves_source,
                         "capabilities": state.load_capabilities("paths"),
                     },
                 )
                 return
             if path == "/load-auto":
-                _drain_request_body(self)
+                payload = read_json_body(self) if _request_content_length(self) else {}
+                shelves_source = parse_shelves_source(payload.get("shelves_source", "local"))
                 paths: Dict[str, str] = {}
                 load_snapshot: Optional[Dict[str, object]] = None
                 try:
@@ -1319,19 +1388,21 @@ class QueryHandler(BaseHTTPRequestHandler):
                         return
                     with state.DATASET_LOCK:
                         load_snapshot = _snapshot_load_path_state()
-                        # One-click load discards page/import overrides, while
-                        # restoring startup CLI values and their priority.
-                        # Clear a stale root when returning to legacy VfmApp
-                        # mode; root mode stores the selected templates base.
-                        state.configured_knowledge_root = state._cli_knowledge_root
-                        if state._cli_knowledge_path is not None:
-                            state.configured_knowledge = state._cli_knowledge_path
-                        for key, value in state._cli_config_paths.items():
-                            setattr(state, f"configured_{key}", value)
-                        state._explicit_config_keys = frozenset(
-                            state._cli_config_paths
-                        )
-                        result = apply_configured_paths_reload()
+                        try:
+                            # One-click load restores startup source paths.
+                            state.shelves_source = shelves_source
+                            state.configured_knowledge_root = state._cli_knowledge_root
+                            if state._cli_knowledge_path is not None:
+                                state.configured_knowledge = state._cli_knowledge_path
+                            for key, value in state._cli_config_paths.items():
+                                setattr(state, f"configured_{key}", value)
+                            state._explicit_config_keys = frozenset(
+                                state._cli_config_paths
+                            )
+                            result = apply_configured_paths_reload()
+                        except Exception:
+                            _restore_load_path_state(load_snapshot)
+                            raise
                         paths = configured_path_field_values()
                         dataset = state.loaded_dataset
                         has_unavailable = (
@@ -1349,9 +1420,9 @@ class QueryHandler(BaseHTTPRequestHandler):
                             "html": format_status_html(
                                 dataset,
                                 result["elapsed_seconds"],
-                                "已从本机路径加载",
+                                "已加载云端库位表与本地配置" if shelves_source == "cloud" else "已从本机路径加载",
                                 str(state.configured_knowledge),
-                                str(state.configured_shelves),
+                                CLOUD_SHELVES_URL if shelves_source == "cloud" else str(state.configured_shelves),
                                 has_unavailable,
                                 has_tool_mapping,
                                 has_pick_strategy,
@@ -1360,15 +1431,13 @@ class QueryHandler(BaseHTTPRequestHandler):
                             "unavailable_ids": result["unavailable_ids"],
                             "has_unavailable": has_unavailable,
                             "load_method": "paths",
+                            "shelves_source": shelves_source,
                             "capabilities": state.load_capabilities("paths"),
                             "paths": paths,
                         },
                     )
                     return
                 except Exception as error:
-                    if load_snapshot is not None:
-                        with state.DATASET_LOCK:
-                            _restore_load_path_state(load_snapshot)
                     self._send_json(
                         HTTPStatus.BAD_REQUEST,
                         {"error": str(error), "paths": paths},
@@ -1385,36 +1454,18 @@ class QueryHandler(BaseHTTPRequestHandler):
                 )
                 _mark_request_body_consumed(self, _request_content_length(self))
                 started = time.perf_counter()
-                (
-                    dataset,
-                    tool_mapping,
-                    closed_loop_ids,
-                    unavailable_ids,
-                    knowledge_path,
-                    shelves_path,
-                    unavailable_path,
-                    tool_mapping_path,
-                    pick_strategy_path,
-                ) = load_uploaded_zip(form)
                 with state.DATASET_LOCK:
-                    state.loaded_dataset = dataset
-                    state.loaded_tool_mapping = tool_mapping
-                    state.loaded_closed_loop_ids = closed_loop_ids
-                    state.loaded_unavailable_ids = (
-                        None
-                        if unavailable_path is None
-                        else frozenset(unavailable_ids)
-                    )
-                    state.configured_knowledge = knowledge_path
-                    state.configured_shelves = shelves_path
-                    state.configured_unavailable = unavailable_path
-                    state.configured_tool_mapping = tool_mapping_path
-                    state.configured_pick_strategy = pick_strategy_path
-                    # Bundle preview: query-only; do not treat as writable source.
-                    state.data_source_ready = True
-                    state.data_load_method = "bundle"
-                    state.edit_workspace = None
-                    state.bump_data_revision()
+                    (
+                        dataset,
+                        tool_mapping,
+                        closed_loop_ids,
+                        unavailable_ids,
+                        knowledge_path,
+                        shelves_path,
+                        unavailable_path,
+                        tool_mapping_path,
+                        pick_strategy_path,
+                    ) = load_uploaded_zip(form)
                 self._send_json(
                     HTTPStatus.OK,
                     {
@@ -1593,6 +1644,20 @@ class QueryHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(HTTPStatus.OK, result)
                 return
+            if path == "/api/map/mapping":
+                if _request_content_length(self) > 45 * 1024 * 1024:
+                    self.close_connection = True
+                    self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "地图文件过大，最多支持 32 MiB。"})
+                    return
+                payload = read_json_body(self)
+                _expected_robot_base_url(payload)
+                try:
+                    result = robot_mapping_api.execute(payload)
+                except RobotApiError as error:
+                    self._send_json(HTTPStatus(error.status_code), {"error": str(error)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
             if path == "/api/map/navigate":
                 payload = read_json_body(self)
                 try:
@@ -1633,35 +1698,37 @@ class QueryHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(HTTPStatus.OK, result)
                 return
-            if path == "/api/map/patrol":
+            if path in ("/api/map/patrol", "/api/map/patrol/plan"):
                 payload = read_json_body(self)
                 try:
-                    raw_targets = payload.get("targets")
-                    if not isinstance(raw_targets, list) or not raw_targets:
-                        raise ValueError("巡逻路线至少需要一个停留点。")
-                    targets = []
-                    for index, target in enumerate(raw_targets, start=1):
-                        if not isinstance(target, dict):
-                            raise ValueError(f"第 {index} 个巡逻点格式无效。")
-                        targets.append(
-                            {
-                                "x": _parse_finite_float(
-                                    target.get("x"), f"第 {index} 个点 x"
-                                ),
-                                "y": _parse_finite_float(
-                                    target.get("y"), f"第 {index} 个点 y"
-                                ),
-                            }
+                    options = {
+                        "loop": payload.get("loop", False),
+                        "track_priority": payload.get("track_priority", False),
+                        "expected_base_url": _expected_robot_base_url(payload),
+                    }
+                    if path == "/api/map/patrol/plan":
+                        result = robot_map_api.plan_patrol(payload.get("targets"), **options)
+                    else:
+                        speed_mps = _parse_finite_float(payload.get("speed_mps"), "speed_mps")
+                        if speed_mps <= 0:
+                            raise ValueError("巡逻速度必须大于 0 m/s。")
+                        result = robot_map_api.series_move_to(
+                            payload.get("targets"), speed_mps=speed_mps,
+                            plan_id=payload.get("plan_id"), **options,
                         )
-                    speed_mps = _parse_finite_float(
-                        payload.get("speed_mps"), "speed_mps"
-                    )
-                    if speed_mps <= 0:
-                        raise ValueError("巡逻速度必须大于 0 m/s。")
-                    result = robot_map_api.series_move_to(
-                        targets,
-                        speed_mps=speed_mps,
-                        expected_base_url=_expected_robot_base_url(payload),
+                except ValueError as error:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                    return
+                except RobotApiError as error:
+                    self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path == "/api/map/tracks/delete":
+                payload = read_json_body(self)
+                try:
+                    result = robot_map_api.delete_tracks(
+                        payload.get("tracks"), expected_base_url=_expected_robot_base_url(payload),
                     )
                 except ValueError as error:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
@@ -1820,6 +1887,8 @@ class QueryHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_json(self, status: HTTPStatus, payload: Dict[str, object]) -> None:
+        load_progress.finish(str(payload.get("error") or "加载失败")
+                             if int(status) >= 400 else "")
         if int(status) >= 400:
             LOGGER.warning(
                 "HTTP 请求返回错误 method=%s path=%s status=%s error=%s",
@@ -1831,6 +1900,8 @@ class QueryHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        if urlparse(self.path).path.startswith(("/api/files/", "/api/terminal/")):
+            self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

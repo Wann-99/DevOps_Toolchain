@@ -207,6 +207,7 @@
 
   let pois = []; // { id, name, x, y }
   let zones = { areas: [], lines: [] }; // 禁行/危险/电梯等矩形区域 + 虚拟墙/轨道
+  let zonesRequestVersion = 0;
   let robot = { x: 0, y: 0, yaw: 0, target: null, moving: false, hasFix: false };
   let homePose = null;
   let patrolPath = [];
@@ -261,6 +262,10 @@
   let patrolIndex = 0;
   let patrolRunning = false;
   let patrolPaused = false;
+  let patrolPlanning = false;
+  let patrolRoutePlan = null;
+  let tracksDeleting = false;
+  const selectedTracks = new Map();
   let currentActionId = null;
   let actionCommandPending = false;
   let actionCommandReady = Promise.resolve();
@@ -984,6 +989,26 @@
   };
   const LINE_COLORS = { walls: "#eab308", tracks: "#22d3ee" };
 
+  function trackIdentity(line) {
+    return JSON.stringify([line.id, line.start, line.end, line.metadata || {}]);
+  }
+
+  function trackPath(line) {
+    if (!line.start || !line.end) return null;
+    const points = [line.start, line.end];
+    const metadata = line.metadata || {};
+    if (metadata.control_point1 && metadata.control_point2) {
+      points.push(metadata.control_point1, metadata.control_point2);
+    }
+    if (points.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y))) return null;
+    const [start, end, control1, control2] = points.map((point) => worldToPx(point.x, point.y));
+    const path = new Path2D();
+    path.moveTo(start.x, start.y);
+    if (control1 && control2) path.bezierCurveTo(control1.x, control1.y, control2.x, control2.y, end.x, end.y);
+    else path.lineTo(end.x, end.y);
+    return path;
+  }
+
   function drawZones() {
     const pxPerMeter = mapMeta ? 1 / mapMeta.resolution : 1 / RES;
 
@@ -1030,25 +1055,44 @@
       if (!start || !end) return;
       const p1 = worldToPx(start.x, start.y);
       const p2 = worldToPx(end.x, end.y);
-      const color = LINE_COLORS[line.usage] || "#cccccc";
+      const selected = line.usage === "tracks" && selectedTracks.has(String(line.id));
+      const color = selected ? "#d97706" : LINE_COLORS[line.usage] || "#cccccc";
       ctx.strokeStyle = color;
-      ctx.lineWidth = screenPx(3);
+      ctx.lineWidth = screenPx(selected ? 5 : 3);
       if (line.usage === "tracks") ctx.setLineDash([screenPx(6), screenPx(4)]);
-      ctx.beginPath();
-      ctx.moveTo(p1.x, p1.y);
-      ctx.lineTo(p2.x, p2.y);
-      ctx.stroke();
+      const path = trackPath(line);
+      if (path) ctx.stroke(path);
       ctx.setLineDash([]);
+      if (selected) {
+        ctx.fillStyle = color;
+        ctx.font = `bold ${screenPx(12)}px sans-serif`;
+        ctx.fillText(`#${line.id}`, (p1.x + p2.x) / 2, (p1.y + p2.y) / 2 - screenPx(8));
+      }
+      if (line.usage === "tracks" && !(line.metadata || {}).control_point1 && Math.hypot(p2.x - p1.x, p2.y - p1.y) >= screenPx(24)) {
+        ctx.save();
+        ctx.translate((p1.x + p2.x) / 2, (p1.y + p2.y) / 2);
+        ctx.rotate(Math.atan2(p2.y - p1.y, p2.x - p1.x));
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(screenPx(5), 0);
+        ctx.lineTo(-screenPx(4), -screenPx(4));
+        ctx.lineTo(-screenPx(4), screenPx(4));
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
     });
   }
 
   async function loadZones(generation = connectionGeneration) {
+    const requestVersion = ++zonesRequestVersion;
     try {
       const nextZones = await apiGet("/api/map/zones");
-      if (generation !== connectionGeneration) return false;
+      if (generation !== connectionGeneration || requestVersion !== zonesRequestVersion) return false;
       zones = nextZones;
+      renderTrackList();
     } catch (error) {
-      if (generation !== connectionGeneration) return false;
+      if (generation !== connectionGeneration || requestVersion !== zonesRequestVersion) return false;
       logEvent("获取区域/虚拟墙配置失败：" + error.message);
     }
     drawMap();
@@ -1142,6 +1186,8 @@
     const isRobotWrite = [
       "/api/map/navigate",
       "/api/map/patrol",
+      "/api/map/patrol/plan",
+      "/api/map/tracks/delete",
       "/api/map/actions/cancel",
       "/api/map/gohome",
       "/api/map/relocate",
@@ -1153,6 +1199,10 @@
     }
     if (connectionSwitching && isRobotWrite && path !== "/api/map/actions/cancel") {
       throw new Error("底盘连接正在切换，请稍后操作。");
+    }
+    if (isRobotWrite && path !== "/api/map/actions/cancel" &&
+        global.KsqMapping && global.KsqMapping.blocksNavigation()) {
+      throw new Error("建图或地图修改正在进行，请结束后再执行导航和巡逻操作。");
     }
     const requestPayload = Object.assign({}, payload || {});
     if (path.startsWith("/api/map/") && configuredBaseUrl) {
@@ -1334,6 +1384,7 @@
     } = {}
   ) {
     const isPatrolRoute = Array.isArray(routeTargets) && routeTargets.length > 0;
+    if (patrolPlanning || tracksDeleting) throw new Error("路线正在更新，请稍后发送导航指令。");
     if (replaceCurrent && patrolRunning) {
       const error = new Error("巡逻任务正在运行，请先停止巡逻再切换导航。");
       logEvent(error.message);
@@ -1352,9 +1403,10 @@
       }
     }
     const generation = connectionGeneration;
+    if (!isPatrolRoute) invalidatePatrolRoute();
     robot.target = isPatrolRoute ? null : target;
     robot.moving = true;
-    setAction(isPatrolRoute ? "生成巡逻轨道" : "执行中 → MoveToAction");
+    setAction(isPatrolRoute ? "启动巡逻" : "执行中 → MoveToAction");
     const dockEl = mapStatusElement("map-dock-text");
     if (dockEl) dockEl.textContent = "未在桩上";
     if (!silent && target) {
@@ -1365,7 +1417,12 @@
     beginActionCommand();
     try {
       const payload = isPatrolRoute
-        ? { targets: routeTargets.map((point) => ({ x: point.x, y: point.y })) }
+        ? {
+          targets: routeTargets.map((point) => ({ x: point.x, y: point.y })),
+          loop: document.getElementById("map-loop-toggle").checked && routeStartIndex === 0,
+          plan_id: patrolRoutePlan && patrolRoutePlan.id,
+          track_priority: document.getElementById("map-track-priority-toggle").checked,
+        }
         : { x: target.x, y: target.y, precise: true };
       if (Number.isFinite(speedMps)) payload.speed_mps = speedMps;
       response = await apiSend(
@@ -1391,10 +1448,12 @@
     const actionId = response.action_id;
     if (isPatrolRoute) {
       if (Array.isArray(response.patrol_tracks)) {
+        zonesRequestVersion += 1;
         zones.lines = (zones.lines || []).filter((line) => line.usage !== "tracks")
           .concat(response.patrol_tracks.map((line) => ({ ...line, usage: "tracks" })));
+        renderTrackList();
       }
-      setAction("巡逻中 · 轨道优先");
+      setAction("巡逻中 · " + (document.getElementById("map-track-priority-toggle").checked ? "轨道优先" : "自由导航"));
       drawMap();
     }
     serverActionActive = true;
@@ -1454,6 +1513,31 @@
   function handleMapClick(e, rect) {
     const { x: cx, y: cy } = clientToCanvasPx(e.clientX, e.clientY);
     const mapPt = canvasPxToMapPx(cx, cy);
+    if (global.KsqMapping && global.KsqMapping.selectPoint(pxToWorld(mapPt.x, mapPt.y))) {
+      popover.hidden = true;
+      return;
+    }
+    if (document.getElementById("map-track-select-toggle").checked) {
+      if (patrolRunning || patrolPlanning || tracksDeleting || patrolControlPending) return;
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.lineWidth = screenPx(14);
+      ctx.setLineDash([]);
+      const hit = (zones.lines || []).find((line) => {
+        if (line.usage !== "tracks" || !Number.isInteger(line.id)) return false;
+        const path = trackPath(line);
+        return path && ctx.isPointInStroke(path, mapPt.x, mapPt.y);
+      });
+      ctx.restore();
+      if (hit) {
+        const key = String(hit.id);
+        if (selectedTracks.has(key)) selectedTracks.delete(key);
+        else selectedTracks.set(key, hit);
+        renderTrackList();
+        drawMap();
+      }
+      return;
+    }
     const world = pxToWorld(mapPt.x, mapPt.y);
     pendingClick = world;
     drawMap();
@@ -1526,19 +1610,64 @@
     drawMap();
     navigateTo(target, { replaceCurrent: true }).catch(() => {});
   };
-  document.getElementById("map-btn-save-here").onclick = async () => {
-    const name = prompt("停留点名称：", `停留点${pois.length + 1}`);
-    if (!name) return;
-    const target = pendingClick;
+  const poiDialog = document.getElementById("map-poi-dialog");
+  const poiNameInput = document.getElementById("map-poi-name");
+  const poiError = document.getElementById("map-poi-error");
+  const poiSaveButton = document.getElementById("map-btn-poi-save");
+  let poiDialogTarget = null;
+  let poiSaving = false;
+
+  document.getElementById("map-btn-save-here").onclick = () => {
+    if (!pendingClick) return;
+    poiDialogTarget = { ...pendingClick };
     pendingClick = null;
     popover.hidden = true;
+    poiNameInput.value = `停留点${pois.length + 1}`;
+    poiNameInput.setCustomValidity("");
+    poiError.hidden = true;
+    document.getElementById("map-poi-coord").textContent =
+      `x=${poiDialogTarget.x.toFixed(2)}, y=${poiDialogTarget.y.toFixed(2)}`;
+    poiDialog.showModal();
+    poiNameInput.select();
+    drawMap();
+  };
+  document.getElementById("map-btn-poi-cancel").onclick = () => poiDialog.close();
+  poiNameInput.oninput = () => poiNameInput.setCustomValidity("");
+  poiDialog.addEventListener("close", () => { poiDialogTarget = null; });
+  poiDialog.addEventListener("cancel", (event) => {
+    if (poiSaving) event.preventDefault();
+  });
+  document.getElementById("map-poi-form").onsubmit = async (event) => {
+    event.preventDefault();
+    if (poiSaving || !poiDialogTarget) return;
+    const name = poiNameInput.value.trim();
+    poiNameInput.setCustomValidity(name ? "" : "请输入停留点名称。");
+    if (!poiNameInput.reportValidity()) return;
+    const target = poiDialogTarget;
+    const generation = connectionGeneration;
+    poiSaving = true;
+    poiSaveButton.disabled = true;
+    poiSaveButton.textContent = "保存中";
+    poiNameInput.disabled = true;
+    document.getElementById("map-btn-poi-cancel").disabled = true;
+    poiError.hidden = true;
     try {
       await apiSend("POST", "/api/map/pois", { name, x: target.x, y: target.y });
+      if (generation !== connectionGeneration) return;
+      poiDialog.close();
       logEvent(`新增停留点「${name}」`);
-      await refreshPois();
+      await refreshPois(generation);
     } catch (error) {
+      if (generation !== connectionGeneration) return;
       logEvent("保存停留点失败：" + error.message);
-      alert("保存停留点失败：" + error.message);
+      poiError.textContent = "保存失败：" + error.message;
+      poiError.hidden = false;
+    } finally {
+      poiSaving = false;
+      poiSaveButton.disabled = false;
+      poiSaveButton.textContent = "保存";
+      poiNameInput.disabled = false;
+      document.getElementById("map-btn-poi-cancel").disabled = false;
     }
     drawMap();
   };
@@ -2059,6 +2188,7 @@
       wrap.appendChild(row);
     });
     wrap.querySelectorAll("button").forEach((btn) => {
+      btn.disabled = patrolPlanning || tracksDeleting || (patrolRunning && btn.dataset.act !== "go");
       btn.onclick = async () => {
         const i = Number(btn.dataset.i);
         const act = btn.dataset.act;
@@ -2068,14 +2198,14 @@
           navigateTo({ x: poi.x, y: poi.y }, { replaceCurrent: true }).catch(() => {});
         }
         if (act === "add") {
-          if (patrolRunning) return;
+          if (patrolRunning || patrolPlanning || tracksDeleting) return;
           const poiId = poiKey(poi);
           if (!poiId) return;
           patrolQueue.push(poiId);
           renderPatrolQueue();
         }
         if (act === "del") {
-          if (patrolRunning) return;
+          if (patrolRunning || patrolPlanning || tracksDeleting) return;
           try {
             await apiSend("POST", "/api/map/pois/delete", { id: poi.id });
             patrolQueue = patrolQueue.filter((poiId) => poiId !== poiKey(poi));
@@ -2092,7 +2222,209 @@
   // ---------------------------------------------------------------------
   // 巡逻队列
   // ---------------------------------------------------------------------
+  function renderTrackList() {
+    const tracks = (zones.lines || []).filter((line) => line.usage === "tracks");
+    const selectable = tracks.filter((line) => Number.isInteger(line.id));
+    const busy = patrolPlanning || patrolRunning || patrolControlPending || tracksDeleting;
+    for (const [key, selected] of selectedTracks) {
+      if (!selectable.some((line) => String(line.id) === key && trackIdentity(line) === trackIdentity(selected))) {
+        selectedTracks.delete(key);
+      }
+    }
+    const list = document.getElementById("map-track-list");
+    list.innerHTML = "";
+    if (!tracks.length) list.textContent = "暂无虚拟轨道";
+    tracks.forEach((line, index) => {
+      const row = document.createElement("label");
+      row.className = "map-track-item";
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = selectedTracks.has(String(line.id));
+      input.disabled = busy || !Number.isInteger(line.id);
+      input.onchange = () => {
+        if (input.checked) selectedTracks.set(String(line.id), line);
+        else selectedTracks.delete(String(line.id));
+        renderTrackList();
+        drawMap();
+      };
+      const label = document.createElement("span");
+      label.textContent = Number.isInteger(line.id) ? `轨道 #${line.id}` : `轨道 ${index + 1}（无编号）`;
+      const coord = document.createElement("small");
+      const pointText = (point) => point && Number.isFinite(point.x) && Number.isFinite(point.y)
+        ? `${point.x.toFixed(2)}, ${point.y.toFixed(2)}` : "--";
+      coord.textContent = `${pointText(line.start)} → ${pointText(line.end)}`;
+      label.appendChild(coord);
+      row.appendChild(input);
+      row.appendChild(label);
+      list.appendChild(row);
+    });
+    const selectAll = document.getElementById("map-track-select-all");
+    selectAll.disabled = busy || !selectable.length;
+    selectAll.checked = selectable.length > 0 && selectedTracks.size === selectable.length;
+    selectAll.indeterminate = selectedTracks.size > 0 && !selectAll.checked;
+    document.getElementById("map-track-select-toggle").disabled = busy;
+    document.getElementById("map-btn-tracks-delete").disabled = busy || !selectedTracks.size;
+    document.getElementById("map-btn-tracks-delete").textContent = tracksDeleting ? "删除中" : "删除选中";
+  }
+
+  async function deleteSelectedTracks() {
+    if (tracksDeleting || patrolRunning || patrolPlanning || patrolControlPending || !selectedTracks.size) return;
+    if (actionCommandPending || currentActionId || serverActionActive) {
+      alert("已有底盘动作正在执行，请先停止后再删除轨道。");
+      return;
+    }
+    const generation = connectionGeneration;
+    const tracks = [...selectedTracks.values()];
+    tracksDeleting = true;
+    renderTrackList();
+    renderPatrolQueue();
+    renderPoiList();
+    const status = document.getElementById("map-track-status");
+    try {
+      const message = `删除选中的 ${tracks.length} 条虚拟轨道？此操作会修改底盘地图，不能撤销。`;
+      const confirmed = global.KsqDialog
+        ? await global.KsqDialog.confirm({ title: "删除虚拟轨道", message, confirmText: "删除" })
+        : global.confirm(message);
+      if (!confirmed || generation !== connectionGeneration) return;
+      invalidatePatrolRoute();
+      const response = await apiSend("POST", "/api/map/tracks/delete", { tracks });
+      if (generation !== connectionGeneration) return;
+      if (!Array.isArray(response.patrol_tracks) || !Array.isArray(response.deleted_ids)) {
+        throw new Error("底盘未返回删除结果，请刷新确认。");
+      }
+      selectedTracks.clear();
+      zonesRequestVersion += 1;
+      zones.lines = (zones.lines || []).filter((line) => line.usage !== "tracks")
+        .concat(response.patrol_tracks.map((line) => ({ ...line, usage: "tracks" })));
+      status.textContent = `已删除 ${response.deleted_ids.length} 条轨道`;
+      logEvent(status.textContent);
+      drawMap();
+    } catch (error) {
+      if (generation !== connectionGeneration) return;
+      status.textContent = "删除未完成：" + error.message;
+      logEvent(status.textContent);
+      await loadZones(generation);
+    } finally {
+      if (generation === connectionGeneration) {
+        tracksDeleting = false;
+        renderTrackList();
+        renderPatrolQueue();
+        renderPoiList();
+      }
+    }
+  }
+
+  document.getElementById("map-track-select-all").onchange = (event) => {
+    selectedTracks.clear();
+    if (event.target.checked) {
+      (zones.lines || []).filter((line) => line.usage === "tracks" && Number.isInteger(line.id))
+        .forEach((line) => selectedTracks.set(String(line.id), line));
+    }
+    renderTrackList();
+    drawMap();
+  };
+  document.getElementById("map-track-select-toggle").onchange = (event) => {
+    canvas.classList.toggle("is-selecting-tracks", event.target.checked);
+    pendingClick = null;
+    popover.hidden = true;
+    drawMap();
+  };
+  document.getElementById("map-btn-tracks-delete").onclick = deleteSelectedTracks;
+
+  function patrolRouteKey() {
+    return JSON.stringify({
+      points: patrolQueue.map((id) => {
+        const poi = findPoiById(id);
+        return [id, poi ? Number(poi.x) : null, poi ? Number(poi.y) : null];
+      }),
+      loop: document.getElementById("map-loop-toggle").checked,
+      track_priority: document.getElementById("map-track-priority-toggle").checked,
+    });
+  }
+
+  function invalidatePatrolRoute() {
+    if (patrolRoutePlan && !patrolRunning) {
+      document.getElementById("map-patrol-status").textContent = "请重新规划路线";
+    }
+    patrolRoutePlan = null;
+    patrolPath = [];
+    drawMap();
+    document.getElementById("map-btn-patrol-start").disabled = true;
+  }
+
+  function syncPatrolControls() {
+    if (patrolRoutePlan && patrolRoutePlan.key !== patrolRouteKey()) {
+      invalidatePatrolRoute();
+    }
+    const busy = patrolPlanning || patrolRunning || patrolControlPending || tracksDeleting;
+    document.getElementById("map-btn-patrol-plan").disabled = busy || !patrolQueue.length;
+    document.getElementById("map-btn-patrol-plan").textContent = patrolPlanning ? "规划中" : "规划路线";
+    document.getElementById("map-btn-patrol-start").disabled = busy || !patrolRoutePlan;
+    document.getElementById("map-loop-toggle").disabled = busy;
+    document.getElementById("map-track-priority-toggle").disabled = busy;
+  }
+
+  async function planPatrolRoute() {
+    if (patrolPlanning || patrolRunning || patrolControlPending || tracksDeleting) return;
+    if (actionCommandPending || currentActionId || serverActionActive) {
+      alert("已有底盘动作正在执行，请先停止后再规划路线。");
+      return;
+    }
+    const routePois = patrolQueue.map(findPoiById);
+    if (!routePois.length || routePois.some((poi) => !poi)) {
+      alert("请先加入有效的巡逻点。");
+      return;
+    }
+    const generation = connectionGeneration;
+    const key = patrolRouteKey();
+    invalidatePatrolRoute();
+    patrolPlanning = true;
+    renderPatrolQueue();
+    renderPoiList();
+    const status = document.getElementById("map-patrol-status");
+    status.textContent = "正在规划路线";
+    try {
+      const response = await apiSend("POST", "/api/map/patrol/plan", {
+        targets: routePois.map((poi) => ({ x: poi.x, y: poi.y })),
+        loop: document.getElementById("map-loop-toggle").checked,
+        track_priority: document.getElementById("map-track-priority-toggle").checked,
+      });
+      if (generation !== connectionGeneration) return;
+      if (key !== patrolRouteKey()) {
+        status.textContent = "路线已变更，请重新规划";
+        return;
+      }
+      const trackPriority = document.getElementById("map-track-priority-toggle").checked;
+      if (!response.plan_id || (trackPriority && !Array.isArray(response.patrol_tracks))) {
+        throw new Error("未取得有效路线，请重新规划。");
+      }
+      patrolRoutePlan = { id: response.plan_id, key };
+      if (Array.isArray(response.patrol_tracks)) {
+        zonesRequestVersion += 1;
+        zones.lines = (zones.lines || []).filter((line) => line.usage !== "tracks")
+          .concat(response.patrol_tracks.map((line) => ({ ...line, usage: "tracks" })));
+      }
+      patrolPath = normalizePathPoints(response.patrol_path || []);
+      const mode = trackPriority ? "轨道优先" : "自由导航";
+      status.textContent = `${mode}路线已规划，待开始`;
+      logEvent(`${mode}路线已规划：${routePois.length} 个点，尚未启动`);
+      drawMap();
+    } catch (error) {
+      if (generation !== connectionGeneration) return;
+      status.textContent = "规划失败：" + error.message;
+      logEvent("巡逻路线规划失败：" + error.message);
+    } finally {
+      if (generation === connectionGeneration) {
+        patrolPlanning = false;
+        renderPatrolQueue();
+        renderPoiList();
+      }
+    }
+  }
+
   function renderPatrolQueue() {
+    syncPatrolControls();
+    renderTrackList();
     const wrap = document.getElementById("map-patrol-queue");
     wrap.innerHTML = "";
     if (!patrolQueue.length) {
@@ -2111,8 +2443,9 @@
       wrap.appendChild(chip);
     });
     wrap.querySelectorAll("button").forEach((btn) => {
-      btn.disabled = patrolRunning;
+      btn.disabled = patrolRunning || patrolPlanning || tracksDeleting;
       btn.onclick = () => {
+        if (patrolRunning || patrolPlanning || tracksDeleting) return;
         patrolQueue.splice(Number(btn.dataset.qi), 1);
         renderPatrolQueue();
       };
@@ -2121,6 +2454,11 @@
 
   async function patrolStep() {
     if (!patrolRunning || patrolPaused) return;
+    if (!patrolRoutePlan || patrolRoutePlan.key !== patrolRouteKey()) {
+      logEvent("巡逻路线已失效，请重新规划。");
+      await stopPatrol();
+      return;
+    }
     if (!patrolQueue.length) {
       stopPatrol();
       return;
@@ -2175,12 +2513,18 @@
     }
   }
   function startPatrol() {
+    if (patrolRunning || patrolPlanning || tracksDeleting) return;
     if (patrolControlPending || actionCommandPending || currentActionId || serverActionActive) {
       alert("已有底盘动作正在执行，请先停止后再开始巡逻。");
       return;
     }
     if (!patrolQueue.length) {
       alert("请先加入至少一个巡逻点");
+      return;
+    }
+    syncPatrolControls();
+    if (!patrolRoutePlan) {
+      alert("请先规划路线，再开始巡逻。");
       return;
     }
     activePatrolSpeedMps = readPatrolSpeedMps();
@@ -2193,8 +2537,10 @@
     document.getElementById("map-btn-patrol-pause").disabled = false;
     document.getElementById("map-btn-patrol-stop").disabled = false;
     logEvent(
-      `生成巡逻轨道并按加入顺序执行（最高速度 ${activePatrolSpeedMps} m/s，轨道优先）`
+      `按已规划路线开始巡逻（最高速度 ${activePatrolSpeedMps} m/s，` +
+      (document.getElementById("map-track-priority-toggle").checked ? "轨道优先）" : "自由导航）")
     );
+    renderPoiList();
     patrolStep();
   }
   async function pausePatrol() {
@@ -2234,6 +2580,7 @@
     patrolControlPending = true;
     patrolRunning = false;
     patrolPaused = false;
+    invalidatePatrolRoute();
     const startBtn = document.getElementById("map-btn-patrol-start");
     const pauseBtn = document.getElementById("map-btn-patrol-pause");
     const stopBtn = document.getElementById("map-btn-patrol-stop");
@@ -2249,7 +2596,6 @@
       drawMap();
       activePatrolSpeedMps = null;
       if (patrolSpeedInput) patrolSpeedInput.disabled = !patrolSpeedLimitReady;
-      startBtn.disabled = false;
       status.textContent = "巡逻已停止";
       logEvent("巡逻任务结束");
     } catch (error) {
@@ -2259,8 +2605,12 @@
     } finally {
       patrolControlPending = false;
       renderPatrolQueue();
+      renderPoiList();
     }
   }
+  document.getElementById("map-btn-patrol-plan").onclick = planPatrolRoute;
+  document.getElementById("map-loop-toggle").onchange = () => renderPatrolQueue();
+  document.getElementById("map-track-priority-toggle").onchange = () => renderPatrolQueue();
   document.getElementById("map-btn-patrol-start").onclick = startPatrol;
   document.getElementById("map-btn-patrol-pause").onclick = pausePatrol;
   document.getElementById("map-btn-patrol-stop").onclick = stopPatrol;
@@ -2269,10 +2619,11 @@
   // 回桩 / 重定位
   // ---------------------------------------------------------------------
   document.getElementById("map-btn-relocate").onclick = async () => {
-    if (actionCommandPending || currentActionId || serverActionActive) {
+    if (patrolPlanning || tracksDeleting || actionCommandPending || currentActionId || serverActionActive) {
       logEvent("已有底盘动作正在执行，请先停止后再重定位。");
       return;
     }
+    invalidatePatrolRoute();
     const generation = connectionGeneration;
     const btn = document.getElementById("map-btn-relocate");
     btn.disabled = true;
@@ -2311,10 +2662,11 @@
     }
   };
   document.getElementById("map-btn-gohome").onclick = async () => {
-    if (actionCommandPending || currentActionId || serverActionActive) {
+    if (patrolPlanning || tracksDeleting || actionCommandPending || currentActionId || serverActionActive) {
       logEvent("已有底盘动作正在执行，请先停止后再回桩。");
       return;
     }
+    invalidatePatrolRoute();
     const generation = connectionGeneration;
     const btn = document.getElementById("map-btn-gohome");
     btn.disabled = true;
@@ -2691,6 +3043,7 @@
     const mapWrap = canvas.closest(".map-wrap");
     if (mapWrap) mapWrap.style.removeProperty("background-color");
     mapHasBeenFitted = false;
+    zonesRequestVersion += 1;
     zones = { areas: [], lines: [] };
     pois = [];
     homePose = null;
@@ -2699,6 +3052,14 @@
     patrolIndex = 0;
     patrolRunning = false;
     patrolPaused = false;
+    patrolPlanning = false;
+    patrolRoutePlan = null;
+    tracksDeleting = false;
+    selectedTracks.clear();
+    document.getElementById("map-track-select-toggle").checked = false;
+    document.getElementById("map-track-priority-toggle").checked = false;
+    document.getElementById("map-track-status").textContent = "";
+    canvas.classList.remove("is-selecting-tracks");
     currentActionId = null;
     actionStatusEpoch += 1;
     actionCommandPending = false;
@@ -2720,6 +3081,8 @@
     lastTrailFrameKey = null;
     pendingClick = null;
     popover.hidden = true;
+    if (poiDialog.open) poiDialog.close();
+    poiDialogTarget = null;
     telemetry.latest = null;
     telemetry.points = [];
     telemetry.scanPoints = [];
@@ -2754,7 +3117,7 @@
       const element = mapStatusElement(id);
       if (element) element.textContent = text;
     });
-    document.getElementById("map-btn-patrol-start").disabled = false;
+    document.getElementById("map-btn-patrol-start").disabled = true;
     document.getElementById("map-btn-patrol-pause").disabled = true;
     document.getElementById("map-btn-patrol-pause").textContent = "暂停";
     document.getElementById("map-btn-patrol-stop").disabled = true;
@@ -3053,6 +3416,27 @@
     activate: activateTelemetry,
     deactivate: deactivateTelemetry,
     refreshTelemetry,
+    logEvent,
+    mappingContext: () => ({
+      robotBaseUrl: configuredBaseUrl,
+      switching: connectionSwitching,
+      active: telemetryActive,
+      busy: patrolRunning || patrolPlanning || tracksDeleting || actionCommandPending || serverActionActive,
+      pose: robot.hasFix ? { x: robot.x, y: robot.y, yaw: robot.yaw } : null,
+      quality: telemetry.latest && telemetry.latest.localization_quality,
+      hasMap: !!mapMeta,
+    }),
+    refreshMapping: async (reset = false) => {
+      invalidatePatrolRoute();
+      selectedTracks.clear();
+      if (reset) {
+        connectionGeneration += 1;
+        clearConnectedRobotView();
+      }
+      await Promise.all([loadMapImage(), loadZones(), refreshPois(), refreshHomePose(), refreshPower()]);
+      if (reset) refreshTelemetry();
+    },
+    refreshMappingImage: () => loadMapImage(),
   };
 
   // ---------------------------------------------------------------------

@@ -116,7 +116,6 @@
     "是否不可处理",
   ];
   const WRAP_COLUMNS = new Set(["药品名称", "库位", "货架属性", "包装类型", "表面结构"]);
-  const READONLY_COLUMNS = new Set(["id", "69码", "商品编码", "药品名称"]);
   const LOCATION_SCOPED_COLUMNS = new Set(["库位", "货架属性", "挡板高度"]);
   const CHOICE_COLUMNS = new Set([
     "货架属性",
@@ -407,7 +406,7 @@
       if (editToggleBtn) {
         editToggleBtn.disabled = saveBusy || !canEdit;
         editToggleBtn.title = canEdit
-          ? "点击后可编辑单元格"
+          ? "编辑库位、货架属性和挡板高度"
           : capabilityMessage || "当前加载方式不支持编辑";
       }
       if (saveBtn && !canEdit) {
@@ -468,7 +467,7 @@
         button.setAttribute("aria-pressed", editMode ? "true" : "false");
         button.disabled = saveBusy || !canEdit;
       }
-      if (label) label.textContent = editMode ? "编辑中" : "编辑";
+      if (label) label.textContent = editMode ? "库位编辑中" : "编辑库位";
       root.classList.toggle("edit-mode-on", editMode);
     }
 
@@ -587,18 +586,9 @@
           return;
         }
       }
-      if (field === "商品编码") record.out_item_id = display;
-      else if (field === "药品名称") record.name = display;
-      else if (field === "库位") record.locations = display;
+      if (field === "库位") record.locations = display;
       else if (field === "货架属性") record.shelf_attribute = display;
       else if (field === "挡板高度") record.baffle_height = display;
-      else if (field === "使用工具") record.tool = display;
-      else if (field === "是否闭环") record.closed_loop = display;
-      else if (field === "是否不可处理") record.unavailable = display;
-      else {
-        if (!record.knowledge) record.knowledge = {};
-        record.knowledge[field] = display;
-      }
     }
 
     function allColumns() {
@@ -1234,7 +1224,7 @@
           if (
             !isOrder &&
             editMode &&
-            !READONLY_COLUMNS.has(column) &&
+            LOCATION_SCOPED_COLUMNS.has(column) &&
             scopedReady &&
             !showEditLocPicker
           ) {
@@ -1414,10 +1404,10 @@
     function beginEdit(cell, record, column) {
       if (saveBusy) return;
       if (!editMode) {
-        setStatus("请先点击「编辑」进入编辑模式", true);
+        setStatus("请先点击「编辑库位」进入编辑模式", true);
         return;
       }
-      if (READONLY_COLUMNS.has(column)) return;
+      if (!LOCATION_SCOPED_COLUMNS.has(column)) return;
       if (LOCATION_SCOPED_COLUMNS.has(column) && isMultiLocation(record)) {
         const chosen = editLocationFor(record);
         if (!chosen) {
@@ -1518,8 +1508,8 @@
           message:
             "确认将 " +
             count +
-            " 处修改写回原文件？\n写回前会按 原文件名.bak日期_时间 备份，并仅按商品编码增量更新改动项。",
-          confirmText: "确定写回",
+            " 处库位修改保存到当前数据副本？重新加载会重新复制来源文件。",
+          confirmText: "确定保存",
           cancelText: "取消",
         });
         if (!confirmed) {
@@ -1551,7 +1541,7 @@
         });
         const persistData = await persistResponse.json();
         if (!persistResponse.ok) {
-          throw new Error(persistData.error || "写回原文件失败");
+          throw new Error(persistData.error || "保存数据副本失败");
         }
         const fileCount = Array.isArray(persistData.files)
           ? persistData.files.length
@@ -1560,48 +1550,7 @@
         activeEdit = null;
         syncSaveButton();
         await loadRecords();
-        let statusText =
-          "已保存 " + count + " 处并写回 " + fileCount + " 个文件（已自动备份）";
-        const restartServices = Array.isArray(persistData.restart_services)
-          ? persistData.restart_services
-          : [];
-        if (restartServices.length) {
-          const lines = restartServices.map(
-            (item) =>
-              "- " +
-              (item.name || "") +
-              (item.reason ? "：" + item.reason : "")
-          );
-          const shouldRestart = await window.KsqDialog.confirm({
-            title: "需要重启服务",
-            message:
-              "文件已写回。以下服务需重启后配置才生效：\n" +
-              lines.join("\n") +
-              "\n\n点击「立即重启」执行重启，或稍后手动重启。",
-            confirmText: "立即重启",
-            cancelText: "稍后手动",
-          });
-          if (shouldRestart) {
-            setStatus("正在重启服务...");
-            const names = restartServices.map((item) => item.name).filter(Boolean);
-            const restartResponse = await fetch("/api/services/restart", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ services: names }),
-            });
-            const restartData = await restartResponse.json();
-            if (!restartResponse.ok) {
-              throw new Error(restartData.error || "服务重启失败");
-            }
-            const restarted = Array.isArray(restartData.services)
-              ? restartData.services.map((item) => item.name).join("、")
-              : names.join("、");
-            statusText += "；已重启 " + restarted;
-          } else {
-            statusText += "；已跳过服务重启";
-          }
-        }
-        setStatus(statusText);
+        setStatus("已保存 " + count + " 处库位修改到 " + fileCount + " 个数据副本文件");
         await refreshExportFileOptions();
       } catch (error) {
         await reportError(error);
@@ -1978,10 +1927,12 @@
           if (!discard) return;
         }
         if (reloadButton) reloadButton.disabled = true;
-        setStatus("加载中...");
-        const response = await fetch("/api/reload", { method: "POST" });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "重新加载失败");
+        setStatus("");
+        await global.KsqLoadProgress.request("/api/reload", {
+          onProgress: (progress) => {
+            if (statusNode) statusNode.innerHTML = global.KsqLoadProgress.html(progress);
+          },
+        });
         await loadRecords();
         setStatus("");
         if (scanInput) scanInput.focus();

@@ -22,15 +22,17 @@ loaded_dataset: Optional[Dataset] = None
 loaded_tool_mapping: Optional[Dict[str, str]] = None
 loaded_closed_loop_ids: Optional[FrozenSet[str]] = None
 loaded_unavailable_ids: Optional[FrozenSet[str]] = None
+loaded_paths: Dict[str, Optional[Path]] = {}
 edit_workspace: Optional[Dict[str, object]] = None
 order_access_token: Optional[str] = None
 order_access_token_key: str = ""
 order_access_tokens: Dict[str, str] = {}
 configured_knowledge: Path = DEFAULT_KNOWLEDGE
-# Optional root used to resolve/display relative Knowledge paths.  The actual
-# dataset is always read from ``configured_knowledge``.
+# Optional root used to resolve/display source Knowledge paths. Runtime readers
+# use loaded_paths after the source files have been copied into data/current.
 configured_knowledge_root: Optional[Path] = None
 configured_shelves: Path = DEFAULT_SHELVES
+shelves_source: str = "local"
 configured_unavailable: Optional[Path] = DEFAULT_UNAVAILABLE
 configured_tool_mapping: Optional[Path] = DEFAULT_TOOL_MAPPING
 configured_pick_strategy: Optional[Path] = DEFAULT_PICK_STRATEGY
@@ -57,6 +59,12 @@ data_revision: int = 0
 BUNDLE_CAPABILITY_MESSAGE = (
     "当前为包加载（仅查看）。如需使用该功能，请切换到「本机路径」加载。"
 )
+
+
+def loaded_path(key: str) -> Optional[Path]:
+    if loaded_paths:
+        return loaded_paths.get(key)
+    return globals()["configured_" + key]
 
 
 def bump_data_revision() -> int:

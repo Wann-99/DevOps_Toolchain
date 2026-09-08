@@ -16,7 +16,7 @@ ACTION="${1:-}"
 VERSION="${2:-dev}"
 APP_BIN="${APP_DIR}/deploy/standalone/bin/knowledge_shelf_query.bin"
 [[ -n "${ACTION}" ]] || {
-    echo "[ERROR] 缺少动作参数。用法: bash up.sh {start|restart|build-bin|down|pull-runtime|reset-state} [版本]"
+    echo "[ERROR] 缺少动作参数。用法: bash up.sh {start|restart|build-bin|down|host-files [start|stop|status]|desktop install|pull-runtime|reset-state} [版本]"
     exit 1
 }
 
@@ -110,6 +110,10 @@ build_bin() {
     python3 "${APP_DIR}/deploy/build_app_bin.py" "${VERSION}" --output "${APP_BIN}"
 }
 
+host_files() {
+    bash "${APP_DIR}/deploy/standalone/host-files.sh" "$1" "${APP_BIN}" "${SCRIPT_DIR}/host-files"
+}
+
 ensure_paths() {
     local missing=0
     if [[ ! -d "${CONFIG_PNP_DIR}" ]]; then
@@ -139,6 +143,7 @@ case "${ACTION}" in
         ensure_paths
         ensure_files
         build_bin
+        host_files start
         compose_cli up -d
         ;;
     restart)
@@ -146,6 +151,7 @@ case "${ACTION}" in
         ensure_files
         reset_state
         build_bin
+        host_files start
         compose_cli up -d --force-recreate
         ;;
     build-bin)
@@ -153,6 +159,14 @@ case "${ACTION}" in
         ;;
     down)
         compose_cli down
+        host_files stop
+        ;;
+    host-files)
+        host_files "${2:-status}"
+        ;;
+    desktop)
+        [[ "${2:-}" == install ]] || { echo "用法: bash up.sh desktop install" >&2; exit 1; }
+        host_files install-desktop
         ;;
     reset-state)
         reset_state
@@ -162,7 +176,7 @@ case "${ACTION}" in
         ;;
     *)
         echo "[ERROR] 不支持的动作: ${ACTION}"
-        echo "用法: bash up.sh {start|restart|build-bin|down|pull-runtime|reset-state} [版本]"
+        echo "用法: bash up.sh {start|restart|build-bin|down|host-files [start|stop|status]|desktop install|pull-runtime|reset-state} [版本]"
         exit 1
         ;;
 esac

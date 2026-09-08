@@ -160,8 +160,12 @@ def save_settings(payload: Dict[str, object]) -> Dict[str, object]:
                 timeout=3,
                 base_url=base_url,
             )
+            from ksq.web import robot_mapping_api
+
+            robot_mapping_api.revoke_drive(current)
             try:
                 _cancel_current_action_for(current)
+                robot_mapping_api.restore_drive_speeds(current)
             except RobotApiError as error:
                 if not force_switch:
                     raise RobotConnectionSwitchRequired(
@@ -171,6 +175,7 @@ def save_settings(payload: Dict[str, object]) -> Dict[str, object]:
             ROBOT_MAP_SETTINGS_FILE,
             json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
         )
+        _PATROL_TRACK_PLANS.clear()
         _invalidate_telemetry_cache()
         return settings
 
@@ -305,12 +310,13 @@ def _finite_float(value: object) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
-def _get_max_moving_speed_for(base_url: str) -> float:
+def _get_max_moving_speed_for(base_url: str, *, timeout: float = _REQUEST_TIMEOUT_SECONDS) -> float:
     _, body = _request(
         "GET",
         "/api/core/system/v1/parameter?param=base.max_moving_speed",
         base_url=base_url,
         accept="text/plain",
+        timeout=timeout,
     )
     if isinstance(body, dict):
         body = next(
@@ -326,7 +332,10 @@ def _get_max_moving_speed_for(base_url: str) -> float:
 def get_max_moving_speed(*, expected_base_url: object = None) -> float:
     with _ROBOT_CONNECTION_LOCK:
         base_url = _require_current_base_url_unlocked(expected_base_url)
-        return _get_max_moving_speed_for(base_url)
+    value = _get_max_moving_speed_for(base_url)
+    with _ROBOT_CONNECTION_LOCK:
+        _require_current_base_url_unlocked(base_url)
+    return value
 
 
 def _normalize_pose_payload(
@@ -851,6 +860,9 @@ def _create_action(
     *,
     base_url: Optional[str] = None,
 ) -> Dict[str, object]:
+    from ksq.web.robot_mapping_api import require_navigation_allowed
+
+    require_navigation_allowed(base_url or _base_url())
     _, body = _request(
         "POST",
         "/api/core/motion/v1/actions",
@@ -949,26 +961,16 @@ def _track_key(line: object) -> Optional[tuple]:
         if x is None or y is None:
             return None
         points.append((round(x, 5), round(y, 5)))
-    return tuple(sorted(points))
+    return tuple(points)
 
 
-def _prepare_patrol_tracks(targets: List[Dict[str, object]], base_url: str) -> list:
-    _, tracks = _request("GET", "/api/core/artifact/v1/lines/tracks", base_url=base_url)
-    if not isinstance(tracks, list):
-        raise RobotApiError("无法读取底盘虚拟轨道，巡逻未启动。")
-    existing = {_track_key(line) for line in tracks} - {None}
-    target_keys = {(point["x"], point["y"]) for point in targets}
-    previous = _PATROL_TRACK_PLANS.get(base_url)
-    if previous and target_keys <= previous["targets"] and previous["lines"] <= existing:
-        return tracks
-
+def _search_patrol_entry(targets: List[Dict[str, object]], base_url: str) -> tuple:
     _, raw_pose = _request("GET", "/api/core/slam/v1/localization/pose", base_url=base_url)
     pose = _normalize_pose_payload(raw_pose, required=True)
-    pending = {}
-    origin = None
-    # ponytail: the firmware only searches from the current pose. Build a
-    # connected network from those official paths; arbitrary-start planning
-    # is needed before claiming a globally shortest multi-stop route.
+    origin = {"x": pose["x"], "y": pose["y"]}
+    entry = []
+    # The native search accepts only a target, so every check starts at the
+    # current pose. Only the first result is a sequential route preview.
     for index, target in enumerate(targets, start=1):
         try:
             _, result = _request(
@@ -993,20 +995,35 @@ def _prepare_patrol_tracks(targets: List[Dict[str, object]], base_url: str) -> l
             raise RobotApiError(f"第 {index} 个巡逻点不可达，巡逻未启动。")
         if math.hypot(points[0]["x"] - pose["x"], points[0]["y"] - pose["y"]) > 0.2:
             raise RobotApiError("搜路期间底盘位置已变化，请停止底盘后重试。")
-        if origin is not None and points[0] != origin:
-            raise RobotApiError("搜路起点已变化，无法确认轨道连通，请停止底盘后重试。")
-        origin = points[0]
-        for start, end in zip(points, points[1:]):
-            line = {"start": start, "end": end}
-            key = _track_key(line)
-            if key[0] != key[1] and key not in existing:
-                pending[key] = line
-    if not pending and not existing:
-        raise RobotApiError("停留点与当前位置重合，无法生成巡逻轨道。")
+        if index == 1:
+            entry = [origin, *points, {"x": target["x"], "y": target["y"]}]
     _, final_pose = _request("GET", "/api/core/slam/v1/localization/pose", base_url=base_url)
     final_pose = _normalize_pose_payload(final_pose, required=True)
     if math.hypot(final_pose["x"] - pose["x"], final_pose["y"] - pose["y"]) > 0.1:
         raise RobotApiError("搜路期间底盘位置已变化，请停止底盘后重试。")
+    return origin, entry
+
+
+def _prepare_patrol_tracks(
+    targets: List[Dict[str, object]], base_url: str, entry: list, *, loop: bool,
+) -> tuple:
+    _, tracks = _request("GET", "/api/core/artifact/v1/lines/tracks", base_url=base_url)
+    if not isinstance(tracks, list):
+        raise RobotApiError("无法读取底盘虚拟轨道，巡逻未启动。")
+    existing = {_track_key(line) for line in tracks} - {None}
+    # Guide segments express POI order; mode 2 still avoids obstacles.
+    points = entry + [{"x": target["x"], "y": target["y"]} for target in targets[1:]]
+    if loop and len(targets) > 1:
+        points.append({"x": targets[0]["x"], "y": targets[0]["y"]})
+    lines = {}
+    for start, end in zip(points, points[1:]):
+        line = {"start": start, "end": end}
+        key = _track_key(line)
+        if key[0] != key[1]:
+            lines[key] = line
+    if not lines:
+        raise RobotApiError("停留点与当前位置重合，无法生成巡逻轨道。")
+    pending = {key: line for key, line in lines.items() if key not in existing}
     if pending:
         _, accepted = _request(
             "POST", "/api/core/artifact/v1/lines/tracks", list(pending.values()),
@@ -1019,18 +1036,16 @@ def _prepare_patrol_tracks(targets: List[Dict[str, object]], base_url: str) -> l
             _track_key(line) for line in tracks
         }:
             raise RobotApiError("巡逻轨道校验失败，巡逻未启动。")
-    _PATROL_TRACK_PLANS[base_url] = {"targets": target_keys, "lines": existing | pending.keys()}
-    return tracks
+    return tracks, set(lines)
 
 
-def series_move_to(
-    targets: List[Dict[str, object]],
-    speed_ratio: float = 0.8,
-    *,
-    speed_mps: Optional[float] = None,
-    expected_base_url: object = None,
-) -> Dict[str, object]:
-    """Generate virtual tracks, then navigate the ordered queue in mode 2."""
+def _normalize_patrol_targets(
+    targets: object, loop: object, track_priority: object,
+) -> List[Dict[str, object]]:
+    if not isinstance(loop, bool):
+        raise ValueError("loop 必须是布尔值。")
+    if not isinstance(track_priority, bool):
+        raise ValueError("track_priority 必须是布尔值。")
     if not isinstance(targets, list) or not targets:
         raise ValueError("巡逻路线至少需要一个停留点。")
     if len(targets) > 32:
@@ -1046,26 +1061,161 @@ def series_move_to(
                 "z": 0,
             }
         )
+    return normalized_targets
+
+
+def _require_patrol_idle(base_url: str) -> None:
+    from ksq.web.robot_mapping_api import require_navigation_allowed
+
+    require_navigation_allowed(base_url)
+    try:
+        current = get_current_action(expected_base_url=base_url)
+    except RobotApiError as error:
+        if error.status_code != 404:
+            raise
+        current = None
+    if current is not None and current.get("state", current).get("status") != 4:
+        raise RobotApiError("已有底盘动作正在执行，请先停止后再操作巡逻。")
+
+
+def delete_tracks(tracks: object, *, expected_base_url: object = None) -> Dict[str, object]:
+    """Delete only explicitly selected, unchanged track IDs, never a whole map."""
+    if not isinstance(tracks, list) or not tracks:
+        raise ValueError("请先选择要删除的轨道。")
+    selected = {}
+    for track in tracks:
+        if not isinstance(track, dict):
+            raise ValueError("轨道格式无效。")
+        if "usage" in track and track["usage"] != "tracks":
+            raise ValueError("只能删除虚拟轨道，不能删除其他地图图层。")
+        track_id = track.get("id")
+        if type(track_id) is not int or track_id < 0 or track_id in selected:
+            raise ValueError("轨道编号无效或重复，请刷新后重试。")
+        for name in ("start", "end"):
+            point = track.get(name)
+            if not isinstance(point, dict):
+                raise ValueError("轨道端点格式无效。")
+            for axis in ("x", "y"):
+                _finite_motion_value(point.get(axis), f"轨道 {name}.{axis}")
+        if track.get("metadata") is not None and not isinstance(track["metadata"], dict):
+            raise ValueError("轨道元数据格式无效。")
+        selected[track_id] = track
     with _ROBOT_CONNECTION_LOCK:
         base_url = _require_current_base_url_unlocked(expected_base_url)
+        _require_patrol_idle(base_url)
+        path = "/api/core/artifact/v1/lines/tracks"
+        _, current = _request("GET", path, base_url=base_url)
+        if not isinstance(current, list) or any(
+            not isinstance(line, dict) or type(line.get("id")) is not int for line in current
+        ):
+            raise RobotApiError("无法读取底盘虚拟轨道，未执行删除。")
+        for track_id, track in selected.items():
+            matching = [line for line in current if isinstance(line, dict) and line.get("id") == track_id]
+            if len(matching) != 1 or any(
+                matching[0].get(name) != track.get(name) for name in ("start", "end")
+            ) or (matching[0].get("metadata") or {}) != (track.get("metadata") or {}):
+                raise RobotApiError(f"轨道 {track_id} 已变化，请刷新后重新选择。")
+        # Even a partial/uncertain deletion invalidates the planned network.
+        _PATROL_TRACK_PLANS.pop(base_url, None)
+        deleted_ids = []
+        try:
+            for track_id in selected:
+                _, accepted = _request("DELETE", f"{path}/{track_id}", base_url=base_url)
+                if accepted is not True:
+                    raise RobotApiError(f"底盘未确认删除轨道 {track_id}。")
+                deleted_ids.append(track_id)
+            _, remaining = _request("GET", path, base_url=base_url)
+            if not isinstance(remaining, list) or any(
+                not isinstance(line, dict) or type(line.get("id")) is not int
+                or line["id"] in selected for line in remaining
+            ) or not ({line["id"] for line in current} - selected.keys()) <= {
+                line["id"] for line in remaining
+            }:
+                raise RobotApiError("轨道删除校验失败。")
+        except RobotApiError as error:
+            raise RobotApiError(f"删除未全部确认（已确认 {len(deleted_ids)} 条），请刷新轨道后重试：{error}") from error
+        return {"patrol_tracks": remaining, "deleted_ids": deleted_ids}
+
+
+def plan_patrol(
+    targets: List[Dict[str, object]],
+    *,
+    loop: bool = False,
+    track_priority: bool = False,
+    expected_base_url: object = None,
+) -> Dict[str, object]:
+    """Check reachability and optionally create tracks, without moving."""
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+        _PATROL_TRACK_PLANS.pop(base_url, None)
+        normalized_targets = _normalize_patrol_targets(targets, loop, track_priority)
+        _require_patrol_idle(base_url)
+        origin, entry = _search_patrol_entry(normalized_targets, base_url)
+        plan_id = uuid.uuid4().hex
+        plan = {
+            "plan_id": plan_id,
+            "targets": tuple((point["x"], point["y"]) for point in normalized_targets),
+            "loop": loop, "track_priority": track_priority,
+            "origin": origin, "started": False,
+        }
+        result = {"plan_id": plan_id, "track_priority": track_priority, "patrol_path": entry}
+        if track_priority:
+            result["patrol_tracks"], plan["lines"] = _prepare_patrol_tracks(
+                normalized_targets, base_url, entry, loop=loop,
+            )
+        _PATROL_TRACK_PLANS[base_url] = plan
+        return result
+
+
+def series_move_to(
+    targets: List[Dict[str, object]],
+    speed_ratio: float = 0.8,
+    *,
+    speed_mps: Optional[float] = None,
+    loop: bool = False,
+    track_priority: bool = False,
+    plan_id: object = None,
+    expected_base_url: object = None,
+) -> Dict[str, object]:
+    """Run the explicitly prepared patrol in its selected navigation mode."""
+    normalized_targets = _normalize_patrol_targets(targets, loop, track_priority)
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+        plan = _PATROL_TRACK_PLANS.get(base_url)
+        if not isinstance(plan_id, str) or not plan_id or not plan or plan.get("plan_id") != plan_id:
+            raise ValueError("请先规划路线，再开始巡逻。")
+        if track_priority != plan["track_priority"]:
+            raise ValueError("巡逻导航模式已变化，请重新规划路线。")
+        target_keys = tuple((point["x"], point["y"]) for point in normalized_targets)
+        if not (
+            (target_keys == plan["targets"] and loop == plan["loop"])
+            or (
+                plan["started"] and not loop and len(target_keys) < len(plan["targets"])
+                and target_keys == plan["targets"][-len(target_keys):]
+            )
+        ):
+            raise ValueError("停留点顺序或循环设置已变化，请重新规划路线。")
         resolved_speed_ratio = _resolve_speed_ratio(
             speed_ratio, speed_mps, base_url=base_url
         )
-        try:
-            current = get_current_action(expected_base_url=base_url)
-        except RobotApiError as error:
-            if error.status_code != 404:
-                raise
-            current = None
-        if current is not None and current.get("state", current).get("status") != 4:
-            raise RobotApiError("已有底盘动作正在执行，请先停止后再开始巡逻。")
-        tracks = _prepare_patrol_tracks(normalized_targets, base_url)
+        _require_patrol_idle(base_url)
+        if track_priority:
+            _, tracks = _request("GET", "/api/core/artifact/v1/lines/tracks", base_url=base_url)
+            if not isinstance(tracks, list) or not plan["lines"] <= {_track_key(line) for line in tracks}:
+                _PATROL_TRACK_PLANS.pop(base_url, None)
+                raise RobotApiError("底盘轨道已变化，请重新规划路线。")
+        if not plan["started"]:
+            _, raw_pose = _request("GET", "/api/core/slam/v1/localization/pose", base_url=base_url)
+            pose = _normalize_pose_payload(raw_pose, required=True)
+            if math.hypot(pose["x"] - plan["origin"]["x"], pose["y"] - plan["origin"]["y"]) > 0.2:
+                _PATROL_TRACK_PLANS.pop(base_url, None)
+                raise RobotApiError("底盘已离开规划起点，请重新规划路线。")
         result = _create_action(
             "SeriesMoveToAction",
             {
                 "targets": normalized_targets,
                 "move_options": {
-                    "mode": 2,
+                    "mode": 2 if track_priority else 0,
                     "flags": [],
                     "acceptable_precision": 0.3,
                     "speed_ratio": resolved_speed_ratio,
@@ -1073,7 +1223,8 @@ def series_move_to(
             },
             base_url=base_url,
         )
-        return {**result, "patrol_tracks": tracks}
+        plan["started"] = True
+        return {**result, "track_priority": track_priority, **({"patrol_tracks": tracks} if track_priority else {})}
 
 
 def go_home(
@@ -1164,9 +1315,13 @@ def _cancel_current_action_for(base_url: str) -> None:
 
 
 def cancel_current_action(*, expected_base_url: object = None) -> None:
+    from ksq.web import robot_mapping_api
+
     with _ROBOT_CONNECTION_LOCK:
         base_url = _require_current_base_url_unlocked(expected_base_url)
+        robot_mapping_api.revoke_drive(base_url)
         _cancel_current_action_for(base_url)
+        robot_mapping_api.restore_drive_speeds(base_url)
 
 
 # --------------------------------------------------------------------------

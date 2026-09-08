@@ -1,4 +1,4 @@
-"""Import files into configured target paths (write-only, with backup)."""
+"""Import dataset files into managed copies and preserve source directories."""
 
 from __future__ import annotations
 
@@ -6,26 +6,20 @@ import cgi
 import io
 import json
 import shutil
-import tempfile
 import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from ksq import safe_io
 from ksq.constants import (
-    DEFAULT_KNOWLEDGE,
-    DEFAULT_PICK_STRATEGY,
-    DEFAULT_SHELVES,
-    DEFAULT_TOOL_MAPPING,
-    DEFAULT_UNAVAILABLE,
     ORDER_CONFIG_FILE,
     ORDER_CONFIG_PROD_FILE,
     PICK_STRATEGY_FILE_NAME,
-    RUNTIME_UPLOAD_DIRECTORY,
     SHELVES_FILE_NAME,
     TOOL_MAPPING_FILE_NAME,
 )
-from ksq.knowledge import load_knowledge_from_mapping
+from ksq.knowledge import list_knowledge_files, load_knowledge_from_mapping
+from ksq.models import BundlePaths
 from ksq.naming import classify_import_kind
 from ksq.order.config import validate_order_config_types
 from ksq.side_data import (
@@ -34,11 +28,12 @@ from ksq.side_data import (
     load_unavailable_ids,
 )
 from ksq.shelves import parse_shelf_locations
-from ksq.web import state
+from ksq.web import data_storage, load_progress, state
 from ksq.web.loader import (
-    apply_configured_paths_reload,
-    configured_paths_ready,
+    bundle_path_map,
+    configured_bundle,
     get_uploaded_files,
+    install_staged_dataset,
 )
 
 DATASET_IMPORT_KINDS = frozenset(
@@ -65,23 +60,6 @@ KIND_LABELS = {
 }
 
 
-def _target_paths() -> Dict[str, Path]:
-    knowledge = state.configured_knowledge or DEFAULT_KNOWLEDGE
-    shelves = state.configured_shelves or DEFAULT_SHELVES
-    unavailable = state.configured_unavailable or DEFAULT_UNAVAILABLE
-    tool_mapping = state.configured_tool_mapping or DEFAULT_TOOL_MAPPING
-    pick_strategy = state.configured_pick_strategy or DEFAULT_PICK_STRATEGY
-    return {
-        "knowledge": Path(knowledge),
-        "shelves": Path(shelves),
-        "unavailable": Path(unavailable),
-        "tool_mapping": Path(tool_mapping),
-        "pick_strategy": Path(pick_strategy),
-        "order_config": ORDER_CONFIG_FILE,
-        "order_config_prod": ORDER_CONFIG_PROD_FILE,
-    }
-
-
 def _write_bytes(destination: Path, payload: bytes) -> Optional[str]:
     """Backup then write, sharing the retention scheme with edit write-back."""
     backup_path = safe_io.safe_write_bytes(
@@ -90,23 +68,6 @@ def _write_bytes(destination: Path, payload: bytes) -> Optional[str]:
         keep_days=_IMPORT_BACKUP_KEEP_DAYS,
     )
     return None if backup_path is None else str(backup_path)
-
-
-def _collect_entries_from_zip(zip_path: Path) -> List[Tuple[str, str, bytes]]:
-    entries: List[Tuple[str, str, bytes]] = []
-    with zipfile.ZipFile(zip_path) as archive:
-        for member_name in archive.namelist():
-            if member_name.endswith("/"):
-                continue
-            file_name = Path(member_name).name
-            if not file_name or file_name.startswith("."):
-                continue
-            kind = classify_import_kind(file_name, member_name)
-            if kind == "unknown":
-                continue
-            with archive.open(member_name) as raw_file:
-                entries.append((kind, file_name, raw_file.read()))
-    return entries
 
 
 def _collect_entries_from_zip_payload(payload: bytes) -> List[Tuple[str, str, bytes]]:
@@ -210,27 +171,24 @@ def _safe_knowledge_destination(knowledge_dir: Path, file_name: str) -> Path:
     return destination
 
 
-def _plan_destination(kind: str, file_name: str, targets: Dict[str, Path]) -> Path:
-    if kind == "knowledge":
-        knowledge_dir = targets["knowledge"]
-        if knowledge_dir.exists() and not knowledge_dir.is_dir():
-            raise ValueError(
-                f"Knowledge 目标不是目录：{knowledge_dir}。请先在本机路径中设置目录。"
-            )
-        return _safe_knowledge_destination(knowledge_dir, file_name)
-    destination = targets[kind]
-    if destination.is_dir():
-        if kind == "shelves":
-            return destination / SHELVES_FILE_NAME
-        if kind == "unavailable":
-            return destination / "unavailabel_obj.json"
-        if kind == "tool_mapping":
-            return destination / TOOL_MAPPING_FILE_NAME
-        if kind == "pick_strategy":
-            return destination / PICK_STRATEGY_FILE_NAME
-    if destination.exists() and not destination.is_file():
-        raise ValueError(f"导入目标不是文件：{destination}")
-    return destination
+def _copy_import_base(targets: Dict[str, Path]) -> None:
+    sources = state.loaded_paths or bundle_path_map(configured_bundle())
+    copies = []
+    for kind in DATASET_IMPORT_KINDS:
+        source = sources.get(kind)
+        if source is None:
+            continue
+        source = Path(source)
+        if kind == "knowledge" and source.is_dir():
+            targets[kind].mkdir(parents=True, exist_ok=True)
+            files, _ = list_knowledge_files(source)
+            copies.extend((path, targets[kind] / path.name) for path in files)
+        elif kind != "knowledge" and source.is_file():
+            copies.append((source, targets[kind]))
+    for done, (source, target) in enumerate(copies, 1):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        load_progress.update("copy", f"复制当前加载文件 {done}/{len(copies)}", done, len(copies))
 
 
 def _snapshot_targets(destinations: List[Path]) -> Dict[Path, Optional[bytes]]:
@@ -273,35 +231,20 @@ def import_uploaded_files(form: cgi.FieldStorage) -> Dict[str, object]:
     if not uploads:
         raise ValueError("请选择要导入的压缩包或文件。")
 
-    # Keep the transaction workspace beside the app runtime, but separate from
-    # the live upload directory.  A bad upload therefore cannot erase a bundle
-    # that is currently being viewed.
-    staging_parent = RUNTIME_UPLOAD_DIRECTORY.parent
-    staging_parent.mkdir(parents=True, exist_ok=True)
-    staging_root = Path(
-        tempfile.mkdtemp(prefix=".ksq-import-", dir=str(staging_parent))
-    )
     state_snapshot = {
-        "configured_knowledge": state.configured_knowledge,
-        "configured_knowledge_root": state.configured_knowledge_root,
-        "configured_shelves": state.configured_shelves,
-        "configured_unavailable": state.configured_unavailable,
-        "configured_tool_mapping": state.configured_tool_mapping,
-        "configured_pick_strategy": state.configured_pick_strategy,
-        "explicit": state._explicit_config_keys,
-        "loaded_dataset": state.loaded_dataset,
-        "loaded_tool_mapping": state.loaded_tool_mapping,
-        "loaded_closed_loop_ids": state.loaded_closed_loop_ids,
-        "loaded_unavailable_ids": state.loaded_unavailable_ids,
-        "data_source_ready": state.data_source_ready,
-        "data_load_method": state.data_load_method,
-        "edit_workspace": state.edit_workspace,
-        "data_revision": state.data_revision,
+        key: getattr(state, key) for key in (
+            "configured_knowledge", "configured_knowledge_root", "configured_shelves",
+            "configured_unavailable", "configured_tool_mapping", "configured_pick_strategy",
+            "_explicit_config_keys", "loaded_dataset", "loaded_tool_mapping",
+            "loaded_closed_loop_ids", "loaded_unavailable_ids", "loaded_paths",
+            "data_source_ready", "data_load_method", "edit_workspace", "data_revision", "shelves_source",
+        )
     }
     snapshots: Dict[Path, Optional[bytes]] = {}
     try:
         entries: List[Tuple[str, str, bytes]] = []
         source_names: List[str] = []
+        load_progress.update("upload", "接收导入文件")
         for uploaded in uploads:
             name = Path(uploaded.filename or "").name
             if not name:
@@ -312,75 +255,116 @@ def import_uploaded_files(form: cgi.FieldStorage) -> Dict[str, object]:
         if not entries:
             raise ValueError("未从上传内容中识别到可导入的配置或数据文件。")
 
-        # Validate every entry and resolve every destination before the first
-        # configured file is touched.
-        targets = _target_paths()
-        plans: List[Tuple[str, str, bytes, Path]] = []
-        for index, (kind, file_name, payload) in enumerate(entries):
-            _validate_entry(kind, file_name, payload, staging_root, index)
-            destination = _plan_destination(kind, file_name, targets)
-            plans.append((kind, file_name, payload, destination))
-        snapshots = _snapshot_targets([plan[3] for plan in plans])
-
-        written: List[Dict[str, str]] = []
-        knowledge_count = sum(1 for plan in plans if plan[0] == "knowledge")
-        shelves_written = any(plan[0] == "shelves" for plan in plans)
-        backup_count = 0
-        for kind, file_name, payload, destination in plans:
-            backup_path = _write_bytes(destination, payload)
-            item = {
-                "kind": kind,
-                "label": KIND_LABELS[kind],
-                "source": file_name,
-                "target": str(destination),
+        touched = {kind for kind, _name, _payload in entries} & DATASET_IMPORT_KINDS
+        reload_info = None
+        with data_storage.staged_dataset() as staging:
+            config = staging / "config_pnp"
+            targets = {
+                "knowledge": staging / "knowledge",
+                "shelves": config / SHELVES_FILE_NAME,
+                "unavailable": config / "unavailable_obj.json",
+                "tool_mapping": config / TOOL_MAPPING_FILE_NAME,
+                "pick_strategy": config / PICK_STRATEGY_FILE_NAME,
+                "order_config": ORDER_CONFIG_FILE,
+                "order_config_prod": ORDER_CONFIG_PROD_FILE,
             }
-            if backup_path:
-                item["backup"] = backup_path
-                backup_count += 1
-            written.append(item)
+            plans = []
+            for index, (kind, file_name, payload) in enumerate(entries):
+                _validate_entry(kind, file_name, payload, staging, index)
+                destination = (
+                    _safe_knowledge_destination(targets[kind], file_name)
+                    if kind == "knowledge" else targets[kind]
+                )
+                plans.append((kind, file_name, payload, destination))
+                load_progress.update("validate", f"校验导入文件 {index + 1}/{len(entries)}", index + 1, len(entries))
+            if touched:
+                load_progress.update("copy", "复制当前加载文件")
+                _copy_import_base(targets)
+            snapshots = _snapshot_targets([
+                destination for kind, _name, _payload, destination in plans
+                if kind not in DATASET_IMPORT_KINDS
+            ])
+            written = []
+            backup_count = 0
+            for done, (kind, file_name, payload, destination) in enumerate(plans, 1):
+                backup_path = None
+                if kind in DATASET_IMPORT_KINDS:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(payload)
+                    target = data_storage.CURRENT_DIRECTORY / destination.relative_to(staging)
+                else:
+                    backup_path = _write_bytes(destination, payload)
+                    target = destination
+                item = {
+                    "kind": kind, "label": KIND_LABELS[kind],
+                    "source": file_name, "target": str(target),
+                }
+                if backup_path:
+                    item["backup"] = backup_path
+                    backup_count += 1
+                written.append(item)
+                load_progress.update("import", f"写入导入文件 {done}/{len(plans)}", done, len(plans))
 
-        # Update path state only after all writes have succeeded.
-        for kind, _file_name, _payload, destination in plans:
-            if kind == "shelves":
-                state.configured_shelves = destination
-            elif kind == "unavailable":
-                state.configured_unavailable = destination
-            elif kind == "tool_mapping":
-                state.configured_tool_mapping = destination
-            elif kind == "pick_strategy":
-                state.configured_pick_strategy = destination
-        if knowledge_count and not (
-            state.configured_knowledge and Path(state.configured_knowledge).is_dir()
-        ):
-            state.configured_knowledge = targets["knowledge"]
+            if touched:
+                available = {
+                    kind: path for kind, path in targets.items()
+                    if kind in DATASET_IMPORT_KINDS
+                    and (path.is_dir() if kind == "knowledge" else path.is_file())
+                }
+                complete = "knowledge" in available and "shelves" in available
+                if not complete and state.data_source_ready:
+                    raise ValueError("当前加载文件不完整，已保留正在使用的数据；请补齐 Knowledge 和库位表后重试。")
+                backup_count += int(data_storage.CURRENT_DIRECTORY.exists())
+                if complete:
+                    bundle = BundlePaths(
+                        available["knowledge"], available["shelves"],
+                        available.get("unavailable"), available.get("tool_mapping"),
+                        available.get("pick_strategy"),
+                    )
+                    dataset, tools, closed, unavailable, elapsed = install_staged_dataset(
+                        staging, bundle,
+                        shelves_source="local" if "shelves" in touched else state.shelves_source,
+                    )
+                    reload_info = {
+                        "count": len(dataset.shelf_entries),
+                        "knowledge_dictionary_count": len(dataset.knowledge_records),
+                        "elapsed_seconds": round(elapsed, 2),
+                        "unavailable_ids": unavailable,
+                        "tool_mapping_count": 0 if tools is None else len(tools),
+                        "closed_loop_count": 0 if closed is None else len(closed),
+                        "load_method": "paths", "capabilities": state.load_capabilities("paths"),
+                        "shelves_source": state.shelves_source,
+                    }
+                else:
+                    load_progress.update("publish", "备份上次数据并保存导入副本")
+                    with data_storage.publish_dataset(staging) as current:
+                        state.loaded_paths = {
+                            kind: current / path.relative_to(staging)
+                            for kind, path in available.items()
+                        }
+                for kind in touched:
+                    setattr(state, f"configured_{kind}", state.loaded_paths[kind])
+                if "knowledge" in touched:
+                    state.configured_knowledge_root = data_storage.CURRENT_DIRECTORY
+                state._explicit_config_keys = state._explicit_config_keys | touched
 
-        message = f"已导入 {len(written)} 项到配置路径。"
+        knowledge_count = sum(1 for kind, _name, _payload in entries if kind == "knowledge")
+        message = f"已导入 {len(written)} 项。"
         if backup_count:
-            message += f" 其中 {backup_count} 个同名文件已备份。"
+            message += f" 已生成 {backup_count} 份备份。"
 
         result: Dict[str, object] = {
             "ok": True,
             "source_files": source_names,
             "written": written,
             "knowledge_files": knowledge_count,
-            "shelves_updated": shelves_written,
+            "shelves_updated": "shelves" in touched,
             "backup_count": backup_count,
             "reloaded": False,
             "message": message,
         }
 
-        # Mark imported paths as explicit so reload_config_pnp_paths() won't
-        # override them with config.py on the next reload.
-        explicit_kinds = {
-            kind for kind, _name, _payload, _destination in plans
-            if kind in DATASET_IMPORT_KINDS
-        }
-        if explicit_kinds:
-            state._explicit_config_keys = state._explicit_config_keys | explicit_kinds
-
-        touched_dataset = bool(explicit_kinds)
-        if touched_dataset and configured_paths_ready():
-            reload_info = apply_configured_paths_reload()
+        if reload_info is not None:
             result["reloaded"] = True
             result["reload"] = reload_info
             result["load_method"] = "paths"
@@ -388,7 +372,7 @@ def import_uploaded_files(form: cgi.FieldStorage) -> Dict[str, object]:
             result["message"] = (
                 message + f" 已自动重新加载数据（{reload_info['count']} 条）。"
             )
-        elif touched_dataset:
+        elif touched:
             result["message"] = (
                 message + " 尚未同时具备 Knowledge 目录与库位表，请到「本机路径」加载。"
             )
@@ -399,21 +383,6 @@ def import_uploaded_files(form: cgi.FieldStorage) -> Dict[str, object]:
     except Exception:
         if snapshots:
             _restore_targets(snapshots)
-        state.configured_knowledge = state_snapshot["configured_knowledge"]  # type: ignore[assignment]
-        state.configured_knowledge_root = state_snapshot["configured_knowledge_root"]  # type: ignore[assignment]
-        state.configured_shelves = state_snapshot["configured_shelves"]  # type: ignore[assignment]
-        state.configured_unavailable = state_snapshot["configured_unavailable"]  # type: ignore[assignment]
-        state.configured_tool_mapping = state_snapshot["configured_tool_mapping"]  # type: ignore[assignment]
-        state.configured_pick_strategy = state_snapshot["configured_pick_strategy"]  # type: ignore[assignment]
-        state._explicit_config_keys = state_snapshot["explicit"]  # type: ignore[assignment]
-        state.loaded_dataset = state_snapshot["loaded_dataset"]  # type: ignore[assignment]
-        state.loaded_tool_mapping = state_snapshot["loaded_tool_mapping"]  # type: ignore[assignment]
-        state.loaded_closed_loop_ids = state_snapshot["loaded_closed_loop_ids"]  # type: ignore[assignment]
-        state.loaded_unavailable_ids = state_snapshot["loaded_unavailable_ids"]  # type: ignore[assignment]
-        state.data_source_ready = bool(state_snapshot["data_source_ready"])
-        state.data_load_method = str(state_snapshot["data_load_method"])
-        state.edit_workspace = state_snapshot["edit_workspace"]  # type: ignore[assignment]
-        state.data_revision = int(state_snapshot["data_revision"])
+        for key, value in state_snapshot.items():
+            setattr(state, key, value)
         raise
-    finally:
-        shutil.rmtree(staging_root, ignore_errors=True)

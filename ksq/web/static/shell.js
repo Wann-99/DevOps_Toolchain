@@ -8,6 +8,7 @@
     "test-order",
     "map",
     "logs",
+    "files",
     "settings",
   ];
   let current = "load";
@@ -36,6 +37,7 @@
     },
     map: { title: "地图导航", subtitle: "实时地图与底盘控制" },
     logs: { title: "日志查询", subtitle: "查看机器人相关服务的运行日志与状态" },
+    files: { title: "文件管理", subtitle: "" },
     settings: {
       title: "设置",
       subtitle: "配置工作模式、下单 Broker、虚拟键盘与飞书表单",

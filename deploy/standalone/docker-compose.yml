@@ -32,7 +32,11 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       # 可写配置/状态固定在 /app，不跟随应用包的临时解压目录。
       KSQ_APP_DIRECTORY: /app
+      KSQ_HOST_FILES_SOCKET: /run/ksq-host/host.sock
+      # 已部署的浏览器远程桌面地址；必须能从访问页面的设备连接。
+      KSQ_DESKTOP_URL: ${KSQ_DESKTOP_URL:-}
     volumes:
+      - ./host-files:/run/ksq-host:ro
       - /etc/localtime:/etc/localtime:ro
       # 应用代码单文件；更新该文件并重建容器即可，无需更换镜像。
       - ./bin/knowledge_shelf_query.bin:/opt/ksq/knowledge_shelf_query.bin:ro
@@ -47,6 +51,8 @@ services:
       - ./config/users.json:/app/users.json
       # knowledge_shelf_query 自身运行日志（与业务容器日志查询分开）
       - ./logs:/app/logs
+      # 加载副本和整批备份，容器重建后保留。
+      - ./data:/app/data
       # 业务数据（设备自带；KNOWLEDGE_DIR 指向 templates 根，页面可选择其下任意目录）
       - ${CONFIG_PNP_DIR:-/home/nvidia/compiled/PNPApp_deploy/config_pnp}:/data/config_pnp
       - ${KNOWLEDGE_DIR:-/home/nvidia/compiled/VfmApp_deploy/model/templates}:/data/knowledge

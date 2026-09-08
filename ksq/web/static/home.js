@@ -54,22 +54,6 @@ document.querySelectorAll("[data-file-pick]").forEach((picker) => {
   });
 });
 
-function renderProgress(label, percent, indeterminate) {
-  const width = indeterminate
-    ? ""
-    : ' style="width:' + Math.max(0, Math.min(100, percent)) + '%"';
-  loadStatus.innerHTML =
-    '<div class="progress-wrap"><div class="progress-label"><span>' +
-    escapeHtml(label) +
-    "</span><span>" +
-    (indeterminate ? "处理中" : Math.round(percent) + "%") +
-    '</span></div><div class="progress-track"><div class="progress-bar' +
-    (indeterminate ? " indeterminate" : "") +
-    '"' +
-    width +
-    "></div></div></div>";
-}
-
 function renderMissing() {
   missingSection.hidden = false;
   excludeUnavailableLabel.hidden = !hasUnavailable;
@@ -112,57 +96,21 @@ function applyLoad(data) {
 
 excludeUnavailable.addEventListener("change", renderMissing);
 
-async function postJson(endpoint, payload) {
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "请求失败");
-  return data;
-}
-
-function postForm(endpoint, formData) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", endpoint);
-    xhr.upload.onprogress = (event) => {
-      if (!event.lengthComputable) {
-        renderProgress("上传中...", 0, true);
-        return;
-      }
-      const percent = (event.loaded / event.total) * 100;
-      renderProgress(percent >= 100 ? "解析中..." : "上传中...", percent, percent >= 100);
-    };
-    xhr.upload.onload = () => renderProgress("解析中...", 0, true);
-    xhr.onerror = () => reject(new Error("网络错误"));
-    xhr.onload = () => {
-      let data;
-      try {
-        data = JSON.parse(xhr.responseText || "{}");
-      } catch (error) {
-        reject(new Error("服务器返回了无效响应"));
-        return;
-      }
-      if (xhr.status < 200 || xhr.status >= 300) {
-        reject(new Error(data.error || "上传失败"));
-        return;
-      }
-      resolve(data);
-    };
-    xhr.send(formData);
+function loadRequest(endpoint, body) {
+  return window.KsqLoadProgress.request(endpoint, {
+    body: body,
+    onProgress: (progress) => { loadStatus.innerHTML = window.KsqLoadProgress.html(progress); },
   });
 }
 
 document.getElementById("path-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (window.KsqLoadProgress.isBusy()) return;
   clearMissing();
   queryLink.hidden = true;
-  renderProgress("加载中...", 0, true);
   try {
     applyLoad(
-      await postJson("/load-paths", {
+      await loadRequest("/load-paths", {
         knowledge: document.getElementById("knowledge-path").value.trim(),
         shelves: document.getElementById("shelves-path").value.trim(),
         unavailable: document.getElementById("unavailable-path").value.trim(),
@@ -177,15 +125,15 @@ document.getElementById("path-form").addEventListener("submit", async (event) =>
 
 document.getElementById("upload-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (window.KsqLoadProgress.isBusy()) return;
   const zipFile = document.getElementById("bundle-zip").files[0];
   if (!zipFile) return;
   const form = new FormData();
   form.append("bundle_zip", zipFile, zipFile.name);
   clearMissing();
   queryLink.hidden = true;
-  renderProgress("上传中...", 0, false);
   try {
-    applyLoad(await postForm("/load-upload", form));
+    applyLoad(await loadRequest("/load-upload", form));
   } catch (error) {
     showLoadError(error.message);
   }

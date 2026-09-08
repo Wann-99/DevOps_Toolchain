@@ -21,6 +21,9 @@
   // 仅覆盖三类编辑操作：库位编辑保存、设置配置（工作模式切换除外）、导入。
   // 服务端仍做最终拦截，此处仅为交互提示。
   const ADMIN_ONLY_SELECTORS = [
+    ".sidebar-nav [data-view='files']",
+    "#view-files input",
+    "#view-files button",
     // 数据加载：仅「导入」方式受限（本机路径 / 包加载放行）
     "#import-form input",
     "#import-form button",

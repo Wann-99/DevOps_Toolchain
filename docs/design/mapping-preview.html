@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' data:; connect-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>建图 · 界面预览</title>
+  <link rel="stylesheet" href="../../ksq/web/static/app.css">
+  <link rel="stylesheet" href="mapping-preview.css">
+  <script src="mapping-preview.js" defer></script>
+</head>
+<body class="mapping-preview">
+  <header class="preview-topbar">
+    <div class="preview-brand"><img src="../../ksq/web/static/logo.png" alt="DevOps Toolchain"><div><strong>地图导航</strong><span>DevOps Toolchain</span></div></div>
+    <div class="preview-session"><span class="preview-badge">界面预览</span><span class="connection-state"><i></i>未连接底盘</span><span class="preview-admin">管理员</span></div>
+  </header>
+  <main class="preview-workspace" id="workspace">
+    <aside class="preview-events" aria-label="事件记录">
+      <div class="section-heading"><h2>事件记录</h2><button class="preview-btn icon-btn" id="clear-events" title="清空预览记录" aria-label="清空预览记录"><span class="icon icon-x"></span></button></div>
+      <ol class="event-items" id="event-items"></ol>
+      <div class="events-footer"><span class="status-dot"></span>本地预览</div>
+    </aside>
+    <div class="preview-resizer" data-resize="events" tabindex="0" role="separator" aria-orientation="vertical" aria-label="调整事件记录宽度"></div>
+    <div class="preview-map">
+      <div class="preview-map-toolbar">
+        <div class="map-toolbar-left"><h2>地图</h2><span class="map-name" id="canvas-map-name">A 区 · 一层</span></div>
+        <div class="map-toolbar-right">
+          <div class="preview-zoom"><button class="preview-btn icon-btn" id="zoom-out" aria-label="缩小" title="缩小">−</button><output id="zoom-level">100%</output><button class="preview-btn icon-btn" id="zoom-in" aria-label="放大" title="放大">+</button></div>
+          <button class="preview-btn icon-btn" id="zoom-reset" aria-label="重置视图" title="重置视图"><span class="icon icon-refresh"></span></button>
+        </div>
+      </div>
+      <div class="map-context-bar"><span id="map-context">当前地图</span><span class="map-context-right"><span class="legend-dot"></span>参考地图<span class="context-divider"></span><span id="mapping-state-caption">待开始</span></span></div>
+      <div class="preview-map-surface"><canvas id="preview-canvas" aria-label="建图地图预览"></canvas><div class="map-selection-badge" id="map-selection-badge" hidden>选择位置</div><div class="preview-map-status"><span class="connection-state"><i></i>未连接</span><span>电量 <b>--</b></span><span>定位 <b>--</b></span><span id="movement-status">静止</span></div></div>
+    </div>
+    <div class="preview-resizer" data-resize="drawer" tabindex="0" role="separator" aria-orientation="vertical" aria-label="调整功能区域宽度"></div>
+    <aside class="preview-drawer" id="drawer">
+      <div class="drawer-content" id="drawer-content">
+        <div id="mapping-content">
+          <div class="drawer-heading"><h2>建图</h2><span class="state-chip" id="mapping-state">待开始</span></div>
+          <nav class="mapping-tabs" aria-label="建图功能">
+            <button class="mapping-tab is-selected" data-pane="capture" aria-current="page">采集</button>
+            <button class="mapping-tab" data-pane="maps">地图</button>
+            <button class="mapping-tab" data-pane="deploy">部署</button>
+          </nav>
+          <section class="mapping-pane" id="pane-capture">
+            <div class="map-identity"><div><span class="field-label">当前地图</span><strong data-map-name>A 区 · 一层</strong></div><button class="preview-btn icon-btn" data-command="rename" title="重命名地图" aria-label="重命名地图"><span class="icon icon-edit"></span></button></div>
+            <div class="action-grid"><button class="preview-btn secondary" data-command="new-map">新建地图</button><button class="preview-btn secondary" data-command="continue-map">继续当前地图</button></div>
+            <div class="mapping-state-row"><span id="capture-caption">准备采集</span><span class="quiet" id="capture-time">00:00</span></div>
+            <button class="preview-btn primary primary-cta" id="start-mapping">开始建图</button>
+            <div class="action-grid capture-actions"><button class="preview-btn secondary" id="pause-mapping" disabled>暂停</button><button class="preview-btn secondary" id="finish-mapping" disabled>结束建图</button></div>
+            <div class="section-heading section-divider"><h3>建图速度</h3></div>
+            <div class="number-fields"><label class="field"><span>线速度</span><span class="input-unit"><input id="linear-speed" type="number" min="0.01" max="0.4" step="0.01" value="0.20" required><span>m/s</span></span></label><label class="field"><span>角速度</span><span class="input-unit"><input id="angular-speed" type="number" min="0.01" max="0.6" step="0.01" value="0.30" required><span>rad/s</span></span></label></div>
+            <div class="section-heading section-divider"><h3>移动控制</h3><span class="state-chip quiet-chip" id="drive-state">未启用</span></div>
+            <div class="drive-layout"><div class="drive-pad" aria-label="移动方向">
+              <button class="preview-btn drive-key forward" data-drive="前进" aria-label="前进" title="前进" disabled><span class="icon icon-up"></span></button>
+              <button class="preview-btn drive-key left" data-drive="左转" aria-label="左转" title="左转" disabled><span class="icon icon-up"></span></button>
+              <button class="preview-btn drive-key stop" id="stop-pad" aria-label="停止移动" title="停止移动"><span class="symbol-square"></span></button>
+              <button class="preview-btn drive-key right" data-drive="右转" aria-label="右转" title="右转" disabled><span class="icon icon-up"></span></button>
+              <button class="preview-btn drive-key back" data-drive="后退" aria-label="后退" title="后退" disabled><span class="icon icon-up"></span></button>
+            </div><div class="drive-info"><span>移动状态</span><strong id="drive-action">静止</strong><span>定位质量</span><strong>--</strong></div></div>
+            <label class="toggle-line"><span>自动闭环</span><input id="loop-closure" type="checkbox" role="switch" checked></label>
+            <div class="draft-footer"><span id="save-state">尚未修改</span><button class="preview-btn primary" data-command="save-map" id="capture-save" disabled><span class="icon icon-upload"></span>上传到固件</button></div>
+          </section>
+          <section class="mapping-pane" id="pane-maps" hidden>
+            <div class="map-file-summary"><span class="field-label">当前地图</span><strong data-map-name>A 区 · 一层</strong><span class="quiet">单层地图 · STCM</span></div>
+            <div class="file-actions"><button class="preview-btn primary" data-command="save-map"><span class="icon icon-upload"></span>上传到固件</button><button class="preview-btn secondary" data-command="export"><span class="icon icon-download"></span>导出文件</button><button class="preview-btn secondary" data-command="import"><span class="icon icon-upload"></span>导入地图</button><button class="preview-btn secondary" data-command="backup">创建备份</button></div>
+            <div class="section-heading section-divider"><h3>地图备份</h3><span class="quiet" id="backup-count">2 份</span></div>
+            <div class="backup-list" id="backup-list"></div>
+            <div class="danger-zone"><h3>重置地图</h3><button class="preview-btn danger-outline" data-command="clear-map">清空当前地图</button></div>
+          </section>
+          <section class="mapping-pane" id="pane-deploy" hidden>
+            <label class="field"><span>配置对象</span><select id="object-type"><option value="poi">停留点</option><option value="dock">充电桩</option><option value="wall">虚拟墙</option><option value="track">虚拟轨道</option><option value="forbidden">禁行区域</option><option value="danger">危险限速区</option><option value="maintenance">运维更新区</option><option value="pose">机器人位姿</option><option value="origin">地图原点</option></select></label>
+            <div class="tool-strip"><button class="preview-btn primary" id="add-object"><span class="icon icon-edit"></span>地图选点</button><button class="preview-btn secondary" id="add-current">当前位置</button></div>
+            <div class="section-heading section-divider"><h3 id="object-list-title">停留点</h3><span class="quiet" id="object-count">2 项</span></div>
+            <div class="object-list" id="object-list"></div>
+          </section>
+        </div>
+        <div class="utility-pane" id="utility-connection" hidden><div class="drawer-heading"><h2>底盘连接</h2></div><div class="number-fields"><label class="field"><span>IP</span><input value="192.168.11.1" inputmode="decimal" aria-label="底盘 IP"></label><label class="field"><span>端口</span><input value="1448" type="number" min="1" max="65535" aria-label="底盘端口"></label></div><button class="preview-btn primary primary-cta" data-command="connection"><span class="icon icon-plug"></span>连接</button><div class="utility-state">未连接底盘</div></div>
+        <div class="utility-pane" id="utility-chassis" hidden><div class="drawer-heading"><h2>底盘操作</h2></div><label class="field"><span>巡逻最高速度</span><span class="input-unit"><input value="0.40" type="number" min="0.01" step="0.01"><span>m/s</span></span></label><div class="action-grid section-divider"><button class="preview-btn secondary" data-command="home">回桩充电</button><button class="preview-btn secondary" data-command="relocate">重定位</button></div></div>
+        <div class="utility-pane" id="utility-poi" hidden><div class="drawer-heading"><h2>停留点</h2></div><div id="utility-poi-list"></div></div>
+        <div class="utility-pane" id="utility-patrol" hidden><div class="drawer-heading"><h2>巡逻任务</h2></div><div class="preview-queue">1. 入口停留点 <span>2. 货架通道</span></div><label class="toggle-line"><span>循环巡逻</span><input type="checkbox" checked></label><label class="toggle-line"><span>轨道优先</span><input type="checkbox"></label><div class="action-grid"><button class="preview-btn secondary" data-command="plan-patrol">规划路线</button><button class="preview-btn primary" data-command="start-patrol">开始巡逻</button></div></div>
+      </div>
+      <nav class="preview-rail" aria-label="地图功能分类">
+        <button class="rail-tab" data-section="connection" aria-expanded="false" aria-controls="utility-connection"><span>底盘连接</span></button>
+        <button class="rail-tab" data-section="chassis" aria-expanded="false" aria-controls="utility-chassis"><span>底盘操作</span></button>
+        <button class="rail-tab is-selected" data-section="mapping" aria-expanded="true" aria-controls="mapping-content"><span>建图</span></button>
+        <button class="rail-tab" data-section="poi" aria-expanded="false" aria-controls="utility-poi"><span>停留点</span></button>
+        <button class="rail-tab" data-section="patrol" aria-expanded="false" aria-controls="utility-patrol"><span>巡逻任务</span></button>
+      </nav>
+    </aside>
+  </main>
+  <dialog class="preview-dialog" id="preview-dialog" aria-labelledby="dialog-title"><form id="dialog-form"><div class="dialog-header"><h2 id="dialog-title"></h2><button type="button" class="preview-btn icon-btn" id="dialog-close" aria-label="关闭" title="关闭"><span class="icon icon-x"></span></button></div><p id="dialog-message" hidden></p><div class="dialog-fields" id="dialog-fields"></div><div class="dialog-actions"><button type="button" class="preview-btn secondary" id="dialog-cancel">取消</button><button class="preview-btn primary" type="submit" id="dialog-confirm">确定</button></div></form></dialog>
+  <img id="map-source" src="mapping-reference.png" alt="" hidden>
+</body>
+</html>

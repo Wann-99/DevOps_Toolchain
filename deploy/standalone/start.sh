@@ -17,6 +17,7 @@ set -euo pipefail
 
 CALLER_DIRECTORY="$(pwd)"
 cd "$(dirname "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(pwd)"
 
 ACTION="${1:-start}"
 RUNTIME_IMAGE="${RUNTIME_IMAGE:-hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime:v1.1.1}"
@@ -96,7 +97,7 @@ compose_cli() {
 }
 
 ensure_files() {
-    mkdir -p config bin logs
+    mkdir -p config bin logs data
     # 各文件写入正确的初始值（而非统一 {}）
     # test_order_state.json → {}（_load_state_file 缺失/空回退 _empty_state）
     _init_file "config/test_order_state.json" '{}'
@@ -233,6 +234,7 @@ show_version() {
 }
 
 restart_container() {
+    bash "${SCRIPT_DIR}/host-files.sh" start "${APP_BIN}" "${SCRIPT_DIR}/host-files"
     if docker container inspect knowledge_shelf_query >/dev/null 2>&1; then
         echo "[INFO] 检测到旧容器 knowledge_shelf_query，正在停止并替换"
         docker stop knowledge_shelf_query >/dev/null
@@ -344,6 +346,14 @@ case "${ACTION}" in
     stop)
         ensure_docker
         compose_cli down
+        bash "${SCRIPT_DIR}/host-files.sh" stop "${APP_BIN}" "${SCRIPT_DIR}/host-files"
+        ;;
+    host-files)
+        bash "${SCRIPT_DIR}/host-files.sh" "${2:-status}" "${APP_BIN}" "${SCRIPT_DIR}/host-files"
+        ;;
+    desktop)
+        [[ "${2:-}" == install ]] || die "用法: bash start.sh desktop install"
+        bash "${SCRIPT_DIR}/host-files.sh" install-desktop
         ;;
     logs)
         ensure_docker
@@ -362,6 +372,6 @@ case "${ACTION}" in
         docker pull "${RUNTIME_IMAGE}"
         ;;
     *)
-        die "用法: bash start.sh {start|restart|update <应用包.bin>|rollback|version|stop|logs|runtime-logs|pull-runtime|reset-state}"
+        die "用法: bash start.sh {start|restart|update <应用包.bin>|rollback|version|stop|host-files [start|stop|status|serve]|desktop install|logs|runtime-logs|pull-runtime|reset-state}"
         ;;
 esac

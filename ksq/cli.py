@@ -25,7 +25,7 @@ from ksq.package_io import save_package
 from ksq.state_reset import reset_state_if_version_changed
 from ksq.runtime_logging import configure as configure_runtime_logging
 from ksq.runtime_logging import get_logger
-from ksq.web import dashboard_api, state
+from ksq.web import dashboard_api, data_storage, files_api, state
 from ksq.web.handlers import QueryHandler
 from ksq.web.loader import existing_optional_path, resolve_knowledge_path
 
@@ -138,12 +138,15 @@ def serve(arguments: Optional[List[str]] = None) -> None:
     server = ThreadingHTTPServer((parsed.host, parsed.port), QueryHandler)
     LOGGER.info("服务已监听：http://%s:%s", parsed.host, parsed.port)
     try:
+        data_storage.start_data_cleanup()
         dashboard_api.start_dashboard_monitor()
         server.serve_forever()
     except KeyboardInterrupt:
         LOGGER.info("收到退出信号，服务停止")
     finally:
+        files_api.close_terminals()
         dashboard_api.stop_dashboard_monitor()
+        data_storage.stop_data_cleanup()
         server.server_close()
 
 

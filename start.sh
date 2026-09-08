@@ -35,6 +35,8 @@ fi
 # PICK_STRATEGY_FILE="${PICK_STRATEGY_FILE:-../PNPApp_deploy/config_pnp/pick_strategy_obj.json}"
 
 exec python3 app.py \
+  --host "${KSQ_HOST:-127.0.0.1}" \
+  --port "${KSQ_PORT:-8765}" \
   --knowledge-root "$KNOWLEDGE_DIR" \
   --knowledge "$KNOWLEDGE_DIR/knowledge" \
   --config-pnp "$CONFIG_PNP_DIR"

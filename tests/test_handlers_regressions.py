@@ -6,10 +6,12 @@ import io
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from ksq.web import auth, dashboard_api, edit_workspace, pages, state
+from ksq.web import auth, dashboard_api, data_storage, edit_workspace, pages, state
 from ksq.web import handlers
 
 try:
@@ -361,6 +363,8 @@ class HandlerRegressionTests(unittest.TestCase):
         control_routes = (
             ("/api/map/navigate", b'{"x": 1, "y": 2}'),
             ("/api/map/patrol", b'{"targets": [{"x": 1, "y": 2}], "speed_mps": 0.2}'),
+            ("/api/map/patrol/plan", b'{"targets": [{"x": 1, "y": 2}]}'),
+            ("/api/map/tracks/delete", b'{"tracks": [{"id": 1}]}'),
             ("/api/map/actions/cancel", b"{}"),
             ("/api/map/gohome", b"{}"),
             ("/api/map/relocate", b"{}"),
@@ -373,6 +377,10 @@ class HandlerRegressionTests(unittest.TestCase):
             ) as move_to, patch.object(
                 handlers.robot_map_api, "series_move_to"
             ) as series_move_to, patch.object(
+                handlers.robot_map_api, "plan_patrol"
+            ) as plan_patrol, patch.object(
+                handlers.robot_map_api, "delete_tracks"
+            ) as delete_tracks, patch.object(
                 handlers.robot_map_api, "cancel_current_action"
             ) as cancel, patch.object(
                 handlers.robot_map_api, "go_home"
@@ -391,6 +399,8 @@ class HandlerRegressionTests(unittest.TestCase):
             self.assertEqual(handler.rfile.read(), b"")
             move_to.assert_not_called()
             series_move_to.assert_not_called()
+            plan_patrol.assert_not_called()
+            delete_tracks.assert_not_called()
             cancel.assert_not_called()
             go_home.assert_not_called()
             relocate.assert_not_called()
@@ -469,6 +479,9 @@ class HandlerRegressionTests(unittest.TestCase):
                 payload={
                     "targets": [{"x": 1, "y": 2}, {"x": 3, "y": 4}],
                     "speed_mps": 0.4,
+                    "loop": True,
+                    "track_priority": True,
+                    "plan_id": "planned-route",
                     "expected_robot_base_url": base_url,
                 },
             )
@@ -478,8 +491,54 @@ class HandlerRegressionTests(unittest.TestCase):
         series_move_to.assert_called_once_with(
             [{"x": 1.0, "y": 2.0}, {"x": 3.0, "y": 4.0}],
             speed_mps=0.4,
+            loop=True,
+            track_priority=True,
+            plan_id="planned-route",
             expected_base_url=base_url,
         )
+
+    def test_map_patrol_plan_does_not_require_speed_or_start_motion(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        with (
+            patch.object(handlers.robot_map_api, "plan_patrol", return_value={
+                "plan_id": "planned-route", "patrol_tracks": [],
+            }) as plan_patrol,
+            patch.object(handlers.robot_map_api, "series_move_to") as series_move_to,
+        ):
+            _handler, status, data = self._request(
+                "POST", "/api/map/patrol/plan", role=auth.ROLE_ADMIN,
+                payload={
+                    "targets": [{"x": 1, "y": 2}, {"x": 3, "y": 4}],
+                    "loop": True, "expected_robot_base_url": base_url,
+                },
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["plan_id"], "planned-route")
+        plan_patrol.assert_called_once_with(
+            [{"x": 1, "y": 2}, {"x": 3, "y": 4}], loop=True,
+            track_priority=False, expected_base_url=base_url,
+        )
+        series_move_to.assert_not_called()
+
+    def test_map_track_delete_forwards_selection_and_reports_errors(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        tracks = [{"id": 12, "start": {"x": 1, "y": 0}, "end": {"x": 2, "y": 0}}]
+        for error, expected_status in ((None, 200), (ValueError("invalid"), 400),
+                                       (handlers.RobotApiError("changed"), 502)):
+            with self.subTest(status=expected_status), patch.object(
+                handlers.robot_map_api, "delete_tracks", side_effect=error,
+                return_value={"deleted_ids": [12], "patrol_tracks": []},
+            ) as delete_tracks:
+                _handler, status, data = self._request(
+                    "POST", "/api/map/tracks/delete", role=auth.ROLE_ADMIN,
+                    payload={"tracks": tracks, "expected_robot_base_url": base_url},
+                )
+                self.assertEqual(status, expected_status)
+                if error is None:
+                    self.assertEqual(data["deleted_ids"], [12])
+                else:
+                    self.assertEqual(data["error"], str(error))
+                delete_tracks.assert_called_once_with(tracks, expected_base_url=base_url)
 
     def test_map_navigate_rejects_a_stale_robot_endpoint(self) -> None:
         payload = {
@@ -529,6 +588,16 @@ class HandlerRegressionTests(unittest.TestCase):
 @unittest.skipIf(QueryHandler is None, "HTTP handlers require Python 3.12 or older")
 class LoadPathsRollbackTests(unittest.TestCase):
     def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.data = Path(temporary.name) / "data"
+        storage_paths = patch.multiple(
+            data_storage, DATA_DIRECTORY=self.data,
+            CURRENT_DIRECTORY=self.data / "current",
+            BACKUP_DIRECTORY=self.data / "backups",
+        )
+        storage_paths.start()
+        self.addCleanup(storage_paths.stop)
         state_fields = (
             *handlers._LOAD_PATH_STATE_FIELDS,
             "configured_config_pnp",
@@ -582,6 +651,7 @@ class LoadPathsRollbackTests(unittest.TestCase):
             "configured_pick_strategy": Path("/old/pick.json"),
             "_explicit_config_keys": frozenset({"old"}),
             "loaded_dataset": object(),
+            "loaded_paths": {},
             "loaded_tool_mapping": {"old": "tool"},
             "loaded_closed_loop_ids": frozenset({"old"}),
             "loaded_unavailable_ids": frozenset({"old"}),
@@ -603,7 +673,7 @@ class LoadPathsRollbackTests(unittest.TestCase):
             json.dumps({"id": "SKU-1", "name": "test"}), encoding="utf-8"
         )
         shelves = root / "shelves.csv"
-        shelves.write_text("商品编码,库位\nSKU-1,01-01-01\n", encoding="utf-8")
+        shelves.write_text("sku_id,name,shelf_number,level,bin_unit\nSKU-1,test,01,01,01\n", encoding="utf-8")
         return temp, {"knowledge": str(knowledge), "shelves": str(shelves)}
 
     def _assert_state_matches(self, markers: dict[str, object]) -> None:
@@ -667,6 +737,8 @@ class LoadPathsRollbackTests(unittest.TestCase):
             patch.object(state, "reload_config_pnp_paths"),
             patch.object(cli.dashboard_api, "start_dashboard_monitor") as start_monitor,
             patch.object(cli.dashboard_api, "stop_dashboard_monitor") as stop_monitor,
+            patch.object(cli.data_storage, "start_data_cleanup") as start_cleanup,
+            patch.object(cli.data_storage, "stop_data_cleanup") as stop_cleanup,
         ):
             cli.serve(
                 [
@@ -679,6 +751,8 @@ class LoadPathsRollbackTests(unittest.TestCase):
 
         start_monitor.assert_called_once_with()
         stop_monitor.assert_called_once_with()
+        start_cleanup.assert_called_once_with()
+        stop_cleanup.assert_called_once_with()
 
         self.assertEqual(state.configured_knowledge_root, root.resolve())
         self.assertEqual(state.configured_knowledge, knowledge.resolve())
@@ -914,13 +988,7 @@ class LoadPathsRollbackTests(unittest.TestCase):
         markers = self._seed_state()
         temp, payload = self._valid_paths()
         self.addCleanup(temp.cleanup)
-        loaded = object()
         with (
-            patch.object(
-                handlers,
-                "load_from_configured_paths",
-                return_value=(loaded, None, None, [], 0.01),
-            ),
             patch.object(
                 edit_workspace,
                 "init_workspace_from_loaded",
@@ -931,6 +999,84 @@ class LoadPathsRollbackTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("workspace failed", data["error"])
         self._assert_state_matches(markers)
+        self.assertFalse((self.data / "current").exists())
+
+    def test_reload_copies_sources_and_rolls_back_invalid_replacement(self) -> None:
+        self._seed_state()
+        temporary, payload = self._valid_paths()
+        self.addCleanup(temporary.cleanup)
+        shelves = Path(payload["shelves"])
+        source_bytes = shelves.read_bytes()
+        status, result = self._request(payload)
+        self.assertEqual(status, 200, result)
+        working = state.loaded_paths["shelves"]
+        self.assertEqual(working.parent, self.data / "current" / "config_pnp")
+        self.assertEqual(state.configured_shelves, shelves)
+        working.write_text("sku_id,name,shelf_number,level,bin_unit\nSKU-1,test,02,02,02\n", encoding="utf-8")
+        self.assertEqual(shelves.read_bytes(), source_bytes)
+        status, result = self._request(payload)
+        self.assertEqual(status, 200, result)
+        self.assertEqual(working.read_bytes(), source_bytes)
+        backups = list((self.data / "backups").iterdir())
+        self.assertEqual(len(backups), 1)
+        self.assertIn("02,02,02", (backups[0] / "config_pnp" / working.name).read_text())
+        dataset = state.loaded_dataset
+        revision = state.data_revision
+        with patch.object(edit_workspace, "init_workspace_from_loaded", side_effect=ValueError("index failed")):
+            status, result = self._request(payload)
+        self.assertEqual(status, 400)
+        self.assertIn("index failed", result["error"])
+        self.assertIs(state.loaded_dataset, dataset)
+        self.assertEqual(state.data_revision, revision)
+        self.assertEqual(working.read_bytes(), source_bytes)
+        self.assertEqual(list((self.data / "backups").iterdir()), backups)
+        self.assertEqual(list(self.data.glob(".staging-*")), [])
+
+    def test_zip_load_uses_private_copy_and_keeps_source_settings(self) -> None:
+        from ksq.web import loader
+
+        self._seed_state()
+        temporary, payload = self._valid_paths()
+        self.addCleanup(temporary.cleanup)
+        status, result = self._request(payload)
+        self.assertEqual(status, 200, result)
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("knowledge/SKU-2.json", '{"id":"SKU-2","name":"zip"}')
+            archive.writestr("sku-shelves.csv", "sku_id,name,shelf_number,level,bin_unit\nSKU-2,zip,02,01,01\n")
+        form = {"bundle_zip": SimpleNamespace(filename="sample.zip", file=io.BytesIO(archive_bytes.getvalue()))}
+        with patch.object(loader, "RUNTIME_UPLOAD_DIRECTORY", self.data.parent / ".runtime_upload"):
+            with state.DATASET_LOCK:
+                loader.load_uploaded_zip(form)
+        self.assertEqual(state.configured_knowledge, Path(payload["knowledge"]))
+        self.assertEqual(state.configured_shelves, Path(payload["shelves"]))
+        self.assertEqual(state.data_load_method, "bundle")
+        self.assertIsNone(state.edit_workspace)
+        self.assertEqual(set(state.loaded_dataset.shelf_entries), {"SKU-2"})
+        self.assertTrue((state.loaded_paths["knowledge"] / "SKU-2.json").is_file())
+        self.assertEqual(len(list((self.data / "backups").iterdir())), 1)
+        self.assertEqual(list(self.data.parent.glob(".ksq-upload-*")), [])
+
+    def test_auto_response_failure_does_not_undo_published_data(self) -> None:
+        markers = self._seed_state()
+        temporary, payload = self._valid_paths()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        (root / "config.py").write_text("# test\n", encoding="utf-8")
+        state.configured_config_pnp = root
+        state._cli_knowledge_root = root
+        state._cli_knowledge_path = Path(payload["knowledge"])
+        state._cli_config_paths = {
+            "shelves": Path(payload["shelves"]), "unavailable": None,
+            "tool_mapping": None, "pick_strategy": None,
+        }
+        with patch.object(handlers, "format_status_html", side_effect=ValueError("response failed")):
+            status, result = self._request({}, "/load-auto")
+        self.assertEqual(status, 400)
+        self.assertIn("response failed", result["error"])
+        self.assertIsNot(state.loaded_dataset, markers["loaded_dataset"])
+        self.assertTrue(state.loaded_paths["shelves"].is_file())
+        self.assertEqual(set(state.loaded_dataset.shelf_entries), {"SKU-1"})
 
     def test_auto_load_failure_restores_state(self) -> None:
         markers = self._seed_state()

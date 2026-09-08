@@ -50,10 +50,11 @@ DEFAULT_USERS_JSON='{
 
 echo "════════ 组装部署包 ${PKG_NAME} ════════"
 rm -rf "${STAGE}"
-mkdir -p "${STAGE}/config" "${STAGE}/bin"
+mkdir -p "${STAGE}/config" "${STAGE}/bin" "${STAGE}/data"
 
 # 1. 启动脚本与 compose
 cp "${SCRIPT_DIR}/standalone/start.sh" "${STAGE}/start.sh"
+cp "${SCRIPT_DIR}/standalone/host-files.sh" "${STAGE}/host-files.sh"
 cp "${SCRIPT_DIR}/standalone/docker-compose.yml" "${STAGE}/docker-compose.yml"
 chmod +x "${STAGE}/start.sh"
 

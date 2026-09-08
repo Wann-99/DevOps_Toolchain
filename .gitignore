@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .runtime_upload/
+data/
 .Python
 .venv/
 venv/
@@ -29,7 +30,9 @@ venv/
 /test_order_state.json
 /robot_map_settings.json
 /robot_map_pois_cache.json
+/robot_mapping_backups/
 /devOps/robot_keyboard.env
+host-files/
 *.bak*
 .backup/
 .DS_Store

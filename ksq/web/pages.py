@@ -78,6 +78,7 @@ def shell_page_html() -> str:
     return (
         _read_template("shell.html")
         .replace("__APP_VERSION__", html.escape(APP_VERSION))
+        .replace("__SHELVES_SOURCE__", html.escape(state.shelves_source))
         .replace("__KNOWLEDGE__", html.escape(paths["knowledge"]))
         .replace("__SHELVES__", html.escape(paths["shelves"]))
         .replace("__UNAVAILABLE__", html.escape(paths["unavailable"]))

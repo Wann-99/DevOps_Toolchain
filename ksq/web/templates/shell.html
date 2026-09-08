@@ -6,6 +6,9 @@
   <title>DevOps Toolchain</title>
   <link rel="icon" type="image/png" href="/static/logo.png?v=__APP_VERSION__">
   <link rel="stylesheet" href="/static/app.css?v=__APP_VERSION__">
+  <link rel="stylesheet" href="/static/vendor/xterm/css/xterm.css?v=__APP_VERSION__">
+  <link rel="stylesheet" href="/static/files.css?v=__APP_VERSION__">
+  <link rel="stylesheet" href="/static/mapping.css?v=__APP_VERSION__">
 </head>
 <body class="app-body">
 <div class="app-shell">
@@ -45,6 +48,10 @@
       <button type="button" class="nav-item" data-view="logs" title="日志查询">
         <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 3.5h-7v17h11v-13z"/><path d="M13.5 3.5v4h4"/><path d="M9.5 12.5h5m-5 3.5h5"/></svg>
         <span class="nav-label">日志查询</span>
+      </button>
+      <button type="button" class="nav-item" data-view="files" title="文件管理">
+        <span class="nav-icon fm-icon fm-folder" aria-hidden="true"></span>
+        <span class="nav-label">文件管理</span>
       </button>
       <button type="button" class="nav-item" data-view="settings" title="设置">
         <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 3.5v2.6m0 11.8v2.6M3.5 12h2.6m11.8 0h2.6M6 6l1.8 1.8m8.4 8.4L18 18m0-12-1.8 1.8M7.8 16.2 6 18"/></svg>
@@ -367,14 +374,19 @@
     <section id="view-load" class="view" hidden>
       <h1>数据加载</h1>
       <div class="card">
-        <div class="tabs">
-          <button class="tab active" type="button" data-panel="path-panel" data-load-method="path">本机路径</button>
-          <button class="tab" type="button" data-panel="bundle-panel" data-load-method="bundle">包加载</button>
-          <button class="tab" type="button" data-panel="import-panel" data-load-method="import">导入</button>
+        <div class="load-toolbar">
+          <div class="tabs">
+            <button class="tab active" type="button" data-panel="path-panel" data-load-method="path">本机路径</button>
+            <button class="tab" type="button" data-panel="bundle-panel" data-load-method="bundle">包加载</button>
+            <button class="tab" type="button" data-panel="import-panel" data-load-method="import">导入</button>
+          </div>
+          <div id="load-source" class="load-source" role="group" aria-label="SKU 库位来源" data-source="__SHELVES_SOURCE__">
+            <label><input type="radio" name="shelves-source" value="local" checked><span>本地</span></label>
+            <label><input type="radio" name="shelves-source" value="cloud"><span>云</span></label>
+          </div>
         </div>
         <div id="path-panel" class="panel active" data-load-method="path">
           <form id="path-form">
-            <p class="meta compact">从本机路径加载后可使用全部功能（查询、编辑、下单等）。</p>
             <div class="path-fields">
               <label class="path-field"><span>Knowledge 目录</span><input id="knowledge-path" value="__KNOWLEDGE__" required></label>
               <label class="path-field"><span>库位表（sku-shelves* / etm_sku_locations_cache*）</span><input id="shelves-path" value="__SHELVES__" required></label>
@@ -395,7 +407,7 @@
         <div id="bundle-panel" class="panel" data-load-method="bundle">
           <form id="bundle-form">
             <p class="meta compact">
-              上传配置压缩包仅用于查看与数据查询，不会写入本机路径；编辑、下单等需改用「本机路径」加载。
+              当前为包加载（仅查看）。
             </p>
             <div class="upload-grid">
               <label class="file-pick" data-file-pick>
@@ -418,7 +430,7 @@
         <div id="import-panel" class="panel" data-load-method="import">
           <form id="import-form">
             <p class="meta compact">
-              导入文件到当前配置路径（库位表、knowledge、工具/闭环/不可处理、order_config）。同名文件会先备份再覆盖；若已具备本机路径数据源，导入后会自动重新加载。
+              导入到 data，保留上一份备份。
             </p>
             <div class="upload-grid">
               <label class="file-pick" data-file-pick>
@@ -500,8 +512,8 @@
           <div class="toolbar-right">
             <label class="scan-box"><span>扫码</span><input data-role="scan-input" type="text" autocomplete="off" placeholder="69码 / 货位"></label>
             <div class="edit-action-card">
-              <button data-role="btn-toggle-edit" class="secondary edit-toggle-btn" type="button" aria-pressed="false" title="点击后可编辑单元格">
-                <span data-role="edit-toggle-label">编辑</span>
+              <button data-role="btn-toggle-edit" class="secondary edit-toggle-btn" type="button" aria-pressed="false" title="编辑库位">
+                <span data-role="edit-toggle-label">编辑库位</span>
               </button>
               <button data-role="btn-save-edit" class="primary save-edit-btn" type="button" disabled>
                 保存<span data-role="save-edit-badge" class="save-badge" hidden></span>
@@ -978,6 +990,22 @@
           </div>
         </div>
 
+        <dialog id="map-poi-dialog" class="ksq-dialog-panel map-poi-dialog" aria-labelledby="map-poi-title">
+          <form id="map-poi-form">
+            <h2 id="map-poi-title">保存停留点</h2>
+            <p class="meta" id="map-poi-coord"></p>
+            <label class="ksq-dialog-field" for="map-poi-name">
+              <span>停留点名称</span>
+              <input id="map-poi-name" type="text" autocomplete="off" required autofocus>
+            </label>
+            <p id="map-poi-error" class="map-poi-error" role="alert" hidden></p>
+            <div class="actions">
+              <button type="button" class="secondary" id="map-btn-poi-cancel">取消</button>
+              <button type="submit" class="primary" id="map-btn-poi-save">保存</button>
+            </div>
+          </form>
+        </dialog>
+
         <div class="map-column-resizer" data-resize-target="center" role="separator" tabindex="0"
              aria-orientation="vertical" aria-valuemin="260" aria-valuemax="1200" aria-valuenow="260"
              aria-label="调整地图区域宽度" title="拖动调整地图与功能区宽度"></div>
@@ -991,6 +1019,10 @@
             <button type="button" class="map-drawer-tab" data-drawer-target="map-chassis-card"
                     aria-controls="map-chassis-card" aria-expanded="false" title="底盘操作">
               <span>底盘操作</span>
+            </button>
+            <button type="button" class="map-drawer-tab" data-drawer-target="map-build-card"
+                    aria-controls="map-build-card" aria-expanded="false" title="建图">
+              <span>建图</span>
             </button>
             <button type="button" class="map-drawer-tab" data-drawer-target="map-poi-card"
                     aria-controls="map-poi-card" aria-expanded="false" title="停留点">
@@ -1025,18 +1057,87 @@
             <summary class="map-side-summary">
               <span class="section-title">底盘操作</span>
             </summary>
-            <div class="map-side-body">
-              <label class="map-patrol-speed-control" for="map-patrol-speed">
-                <span>巡逻最高速度</span>
-                <span class="map-patrol-speed-field">
-                  <input id="map-patrol-speed" type="number" inputmode="decimal" min="0.01" step="0.01" placeholder="--" required disabled>
-                  <span>m/s</span>
-                </span>
-              </label>
+            <div class="map-side-body" id="map-chassis-body">
+              <section class="map-build-drive-section" aria-label="移动控制">
+                <div class="map-build-section-heading"><h3>移动控制</h3><span class="map-build-chip" id="map-build-drive-state">--</span></div>
+                <h3>遥控速度上限</h3>
+                <div class="map-build-number-fields">
+                  <label class="map-build-field" for="map-build-linear-speed"><span>线速度上限</span><span class="map-build-input-unit"><input id="map-build-linear-speed" type="number" inputmode="decimal" min="0.01" max="0.4" step="0.01" value="0.20" required disabled><span>m/s</span></span></label>
+                  <label class="map-build-field" for="map-build-angular-speed"><span>角速度上限</span><span class="map-build-input-unit"><input id="map-build-angular-speed" type="number" inputmode="decimal" min="0.01" max="0.6" step="0.01" value="0.30" required disabled><span>rad/s</span></span></label>
+                </div>
+                <p class="map-build-safety">遥控无自动避障</p>
+                <p class="map-build-status map-build-teleop-note" id="map-build-teleop-note" role="status" hidden></p>
+                <div class="map-build-drive-layout">
+                  <div class="map-build-drive-pad" role="group" aria-label="按住方向移动">
+                    <button type="button" class="map-build-button map-build-drive-key map-build-forward" data-build-drive="forward" aria-label="按住前进" title="按住前进" disabled><span class="map-build-icon map-build-icon-up" aria-hidden="true"></span></button>
+                    <button type="button" class="map-build-button map-build-drive-key map-build-left" data-build-drive="left" aria-label="按住左转" title="按住左转" disabled><span class="map-build-icon map-build-icon-up" aria-hidden="true"></span></button>
+                    <button type="button" class="map-build-button map-build-drive-key map-build-stop" id="map-build-stop" aria-label="停止移动" title="停止移动" disabled><span class="map-build-stop-symbol" aria-hidden="true"></span></button>
+                    <button type="button" class="map-build-button map-build-drive-key map-build-right" data-build-drive="right" aria-label="按住右转" title="按住右转" disabled><span class="map-build-icon map-build-icon-up" aria-hidden="true"></span></button>
+                    <button type="button" class="map-build-button map-build-drive-key map-build-backward" data-build-drive="backward" aria-label="按住后退" title="按住后退" disabled><span class="map-build-icon map-build-icon-up" aria-hidden="true"></span></button>
+                  </div>
+                  <div class="map-build-drive-info"><div><span>移动状态</span><strong id="map-build-drive-action">--</strong></div><div><span>定位质量</span><strong id="map-build-quality">--</strong></div></div>
+                </div>
+                <p class="map-build-status" id="map-build-drive-status" role="status" aria-live="polite" hidden></p>
+              </section>
+              <hr class="sep">
               <div class="map-status-actions">
                 <button class="secondary" id="map-btn-gohome">回桩充电</button>
                 <button class="secondary" id="map-btn-relocate" title="定位丢失或漂移时，让机器人原地旋转重新确认自己在地图上的位置">重定位</button>
               </div>
+            </div>
+          </details>
+
+          <details class="card map-control-card map-side-section" id="map-build-card">
+            <summary class="map-side-summary"><span class="section-title">建图</span></summary>
+            <div class="map-side-body" id="map-build-body">
+              <div class="map-build-heading"><h2>建图</h2><span class="map-build-chip" id="map-build-state">--</span></div>
+              <nav class="map-build-tabs" aria-label="建图功能">
+                <button type="button" class="map-build-tab is-selected" data-build-pane="capture" aria-current="page" aria-controls="map-build-pane-capture">采集</button>
+                <button type="button" class="map-build-tab" data-build-pane="maps" aria-controls="map-build-pane-maps">地图</button>
+                <button type="button" class="map-build-tab" data-build-pane="deploy" aria-controls="map-build-pane-deploy">部署</button>
+              </nav>
+              <section class="map-build-pane" id="map-build-pane-capture" aria-label="采集">
+                <div class="map-build-identity">
+                  <div><span class="map-build-label">当前地图</span><strong data-build-map-name>--</strong></div>
+                  <button type="button" class="map-build-button map-build-icon-button" data-build-command="rename" aria-label="重命名地图" title="重命名地图" disabled><span class="map-build-icon map-build-icon-edit" aria-hidden="true"></span></button>
+                </div>
+                <div class="map-build-actions">
+                  <button type="button" class="map-build-button secondary" data-build-command="new" disabled>新建地图</button>
+                  <button type="button" class="map-build-button secondary" data-build-command="continue" disabled>继续当前地图</button>
+                </div>
+                <div class="map-build-state-row"><span id="map-build-capture-caption">--</span><span id="map-build-capture-time">--</span></div>
+                <button type="button" class="map-build-button primary map-build-wide" data-build-command="start" disabled>开始建图</button>
+                <div class="map-build-actions">
+                  <button type="button" class="map-build-button secondary" data-build-command="pause" disabled>暂停</button>
+                  <button type="button" class="map-build-button secondary" data-build-command="finish" disabled>结束建图</button>
+                </div>
+                <label class="map-build-toggle" for="map-build-loop-closure"><span>自动闭环</span><input id="map-build-loop-closure" type="checkbox" role="switch" disabled></label>
+                <div class="map-build-footer"><span class="map-build-muted" id="map-build-save-state">--</span><button type="button" class="map-build-button primary" data-build-command="upload" disabled><span class="map-build-icon map-build-icon-upload" aria-hidden="true"></span>上传到固件</button></div>
+              </section>
+              <section class="map-build-pane" id="map-build-pane-maps" aria-label="地图" hidden>
+                <div class="map-build-identity"><div><span class="map-build-label">当前地图</span><strong data-build-map-name>--</strong><span class="map-build-muted">STCM</span></div></div>
+                <div class="map-build-actions">
+                  <button type="button" class="map-build-button primary" data-build-command="upload" disabled><span class="map-build-icon map-build-icon-upload" aria-hidden="true"></span>上传到固件</button>
+                  <button type="button" class="map-build-button secondary" data-build-command="export" disabled><span class="map-build-icon map-build-icon-download" aria-hidden="true"></span>导出 STCM</button>
+                  <button type="button" class="map-build-button secondary" data-build-command="import" disabled><span class="map-build-icon map-build-icon-upload" aria-hidden="true"></span>导入地图</button>
+                  <button type="button" class="map-build-button secondary" data-build-command="backup" disabled>创建备份</button>
+                </div>
+                <input id="map-build-import-file" type="file" accept=".stcm" aria-label="导入 STCM 地图" hidden disabled>
+                <div class="map-build-section-heading"><h3>地图备份</h3><span class="map-build-muted" id="map-build-backup-count">--</span></div>
+                <div class="map-build-list" id="map-build-backup-list" aria-label="地图备份列表"></div>
+                <div class="map-build-danger-zone"><h3>重置地图</h3><button type="button" class="map-build-button map-build-danger map-build-wide" data-build-command="clear" disabled>清空当前地图</button></div>
+              </section>
+              <section class="map-build-pane" id="map-build-pane-deploy" aria-label="部署" hidden>
+                <label class="map-build-field" for="map-build-object-type"><span>配置对象</span><select id="map-build-object-type" disabled><option value="poi">停留点</option><option value="dock">充电桩</option><option value="wall">虚拟墙</option><option value="track">虚拟轨道</option><option value="forbidden">禁行区域</option><option value="danger">危险限速区</option><option value="maintenance">运维更新区</option><option value="pose">机器人位姿</option><option value="origin">地图原点</option></select></label>
+                <div class="map-build-actions">
+                  <button type="button" class="map-build-button primary" id="map-build-add-object" disabled><span class="map-build-icon map-build-icon-edit" aria-hidden="true"></span>地图选点</button>
+                  <button type="button" class="map-build-button secondary" id="map-build-add-current" disabled>当前位置</button>
+                </div>
+                <p class="map-build-status" id="map-build-selection-status" role="status" aria-live="polite" hidden></p>
+                <div class="map-build-section-heading"><h3 id="map-build-object-list-title">停留点</h3><span class="map-build-muted" id="map-build-object-count">--</span></div>
+                <div class="map-build-list" id="map-build-object-list" aria-label="配置对象列表"></div>
+              </section>
+              <p class="map-build-status" id="map-build-status" role="status" aria-live="polite" hidden></p>
             </div>
           </details>
 
@@ -1054,24 +1155,116 @@
               <span class="section-title">巡逻任务</span>
             </summary>
             <div class="map-side-body">
+              <label class="map-patrol-speed-control" for="map-patrol-speed">
+                <span>巡逻最高速度</span>
+                <span class="map-patrol-speed-field">
+                  <input id="map-patrol-speed" type="number" inputmode="decimal" min="0.01" step="0.01" placeholder="--" required disabled>
+                  <span>m/s</span>
+                </span>
+              </label>
               <div class="patrol-queue" id="map-patrol-queue"></div>
               <div class="switch-row">
                 <input type="checkbox" id="map-loop-toggle" checked>
                 <label for="map-loop-toggle">循环巡逻</label>
               </div>
+              <div class="switch-row">
+                <input type="checkbox" id="map-track-priority-toggle">
+                <label for="map-track-priority-toggle">轨道优先</label>
+              </div>
               <div class="patrol-controls">
-                <button class="primary" id="map-btn-patrol-start">开始巡逻</button>
+                <button class="secondary" id="map-btn-patrol-plan" disabled>规划路线</button>
+                <button class="primary" id="map-btn-patrol-start" disabled>开始巡逻</button>
                 <button class="secondary" id="map-btn-patrol-pause" disabled>暂停</button>
                 <button class="danger" id="map-btn-patrol-stop" disabled>停止</button>
               </div>
               <hr class="sep">
               <p class="meta compact" id="map-patrol-status">尚未开始巡逻</p>
+              <hr class="sep">
+              <h3 class="map-track-heading">虚拟轨道</h3>
+              <div class="map-track-tools">
+                <label><input type="checkbox" id="map-track-select-toggle">地图选线</label>
+                <label><input type="checkbox" id="map-track-select-all" disabled>全选</label>
+                <button class="danger" type="button" id="map-btn-tracks-delete" disabled>删除选中</button>
+              </div>
+              <div id="map-track-list" class="map-track-list" aria-label="虚拟轨道列表"></div>
+              <p class="meta compact" id="map-track-status" role="status" aria-live="polite"></p>
             </div>
           </details>
         </aside>
       </div>
+      <dialog class="map-build-dialog" id="map-build-dialog" aria-labelledby="map-build-dialog-title">
+        <form id="map-build-dialog-form">
+          <div class="map-build-dialog-heading"><h2 id="map-build-dialog-title"></h2><button type="button" class="map-build-button map-build-icon-button" id="map-build-dialog-close" aria-label="关闭" title="关闭"><span class="map-build-icon map-build-icon-x" aria-hidden="true"></span></button></div>
+          <p class="map-build-muted" id="map-build-dialog-message" hidden></p>
+          <div class="map-build-dialog-fields" id="map-build-dialog-fields"></div>
+          <p class="map-build-error" id="map-build-dialog-error" role="alert" hidden></p>
+          <div class="map-build-dialog-actions"><button type="button" class="map-build-button secondary" id="map-build-dialog-cancel">取消</button><button type="submit" class="map-build-button primary" id="map-build-dialog-confirm" disabled>确定</button></div>
+        </form>
+      </dialog>
     </section>
 
+    <section id="view-files" class="view" hidden>
+      <div class="fm-layout">
+        <div id="files-browser" class="fm-browser" aria-label="文件浏览器">
+          <div class="fm-panel-header">
+            <h2><span class="fm-icon fm-folder" aria-hidden="true"></span>文件目录</h2>
+          </div>
+          <div class="fm-toolbar">
+            <button id="files-up" class="fm-tool" type="button" title="上一级" aria-label="上一级" data-files-navigation><span class="fm-icon fm-up" aria-hidden="true"></span></button>
+            <button id="files-home" class="fm-tool" type="button" title="主目录" aria-label="主目录" data-files-navigation><span class="fm-icon fm-folder" aria-hidden="true"></span></button>
+            <button id="files-refresh" class="fm-tool" type="button" title="刷新目录" aria-label="刷新目录"><span class="fm-icon fm-refresh" aria-hidden="true"></span></button>
+            <form id="files-path-form" class="fm-path-form">
+              <input id="files-path" type="text" aria-label="本机目录路径" autocomplete="off" spellcheck="false">
+              <button class="fm-tool" type="submit" title="打开目录" aria-label="打开目录" data-files-navigation><span class="fm-icon fm-folder" aria-hidden="true"></span></button>
+            </form>
+          </div>
+          <div class="fm-toolbar">
+            <button id="files-upload" class="secondary fm-action" type="button"><span class="fm-icon fm-upload" aria-hidden="true"></span>上传文件</button>
+            <button id="files-upload-folder" class="secondary fm-action" type="button"><span class="fm-icon fm-folder-up" aria-hidden="true"></span>上传文件夹</button>
+            <input id="files-file-input" type="file" multiple hidden>
+            <input id="files-folder-input" type="file" webkitdirectory multiple hidden>
+          </div>
+          <div class="fm-filter">
+            <input id="files-filter" type="search" aria-label="筛选文件" placeholder="搜索当前目录">
+            <label><input id="files-hidden" type="checkbox">隐藏文件</label>
+            <span id="files-count">0 项</span>
+          </div>
+          <div class="fm-list-wrap">
+            <table class="fm-list" aria-label="文件列表">
+              <thead><tr><th scope="col">名称</th><th scope="col">大小</th><th class="fm-modified" scope="col">修改时间</th><th scope="col">操作</th></tr></thead>
+              <tbody id="files-list"></tbody>
+            </table>
+            <p id="files-empty" class="fm-empty" hidden>文件夹为空</p>
+          </div>
+          <progress id="files-progress" class="fm-progress" max="1" value="0" aria-label="文件上传进度" hidden></progress>
+        </div>
+        <div class="fm-console">
+          <div class="fm-panel-header fm-terminal-header">
+            <h2><span class="fm-icon fm-terminal" aria-hidden="true"></span>终端</h2>
+            <small id="files-terminal-status" role="status">未连接</small>
+            <button id="files-connect" class="secondary fm-action" type="button"><span class="fm-icon fm-plug" aria-hidden="true"></span>连接终端</button>
+            <button id="files-disconnect" class="fm-tool" type="button" title="结束终端会话" aria-label="结束终端会话" disabled><span class="fm-icon fm-unplug" aria-hidden="true"></span></button>
+          </div>
+          <div class="fm-terminal-location">
+            <span id="files-terminal-path" class="fm-terminal-path" aria-label="终端当前目录">-</span>
+            <a id="files-desktop" class="fm-action fm-desktop" href="#" target="_blank" rel="noopener noreferrer" hidden><span class="fm-icon fm-monitor" aria-hidden="true"></span>远程桌面</a>
+          </div>
+          <div class="fm-terminal-surface">
+            <div id="files-terminal-empty" class="fm-terminal-empty"><span class="fm-icon fm-terminal" aria-hidden="true"></span><span>未连接</span></div>
+            <div id="files-terminal" aria-label="本机交互终端" hidden></div>
+          </div>
+        </div>
+      </div>
+      <p id="files-status" class="fm-status" role="status" aria-live="polite"></p>
+      <dialog id="files-preview" class="fm-preview" aria-labelledby="files-preview-name">
+        <div class="fm-preview-head">
+          <h2 id="files-preview-name"></h2>
+          <a id="files-preview-download" class="fm-tool" href="#" target="_blank" rel="noopener" title="下载文件" aria-label="下载文件"><span class="fm-icon fm-download" aria-hidden="true"></span></a>
+          <button id="files-preview-close" class="fm-tool" type="button" title="关闭预览" aria-label="关闭预览"><span class="fm-icon fm-x" aria-hidden="true"></span></button>
+        </div>
+        <div id="files-preview-content" class="fm-preview-content"></div>
+      </dialog>
+    </section>
     <section id="view-logs" class="view" hidden>
       <h1>日志查询</h1>
       <div class="card">
@@ -1125,6 +1318,10 @@
 <script src="/static/status.js?v=__APP_VERSION__"></script>
 <script src="/static/auth.js?v=__APP_VERSION__"></script>
 <script src="/static/shell.js?v=__APP_VERSION__"></script>
+<script src="/static/vendor/xterm/lib/xterm.js?v=__APP_VERSION__"></script>
+<script src="/static/vendor/xterm/lib/addon-fit.js?v=__APP_VERSION__"></script>
+<script src="/static/files.js?v=__APP_VERSION__"></script>
+<script src="/static/load-progress.js?v=__APP_VERSION__"></script>
 <script src="/static/load.js?v=__APP_VERSION__"></script>
 <script src="/static/item-identity.js?v=__APP_VERSION__"></script>
 <script src="/static/catalog.js?v=__APP_VERSION__"></script>
@@ -1132,6 +1329,7 @@
 <script src="/static/logs.js?v=__APP_VERSION__"></script>
 <script src="/static/dashboard.js?v=__APP_VERSION__"></script>
 <script src="/static/map.js?v=__APP_VERSION__"></script>
+<script src="/static/mapping.js?v=__APP_VERSION__"></script>
 <script src="/static/order-ops.js?v=__APP_VERSION__"></script>
 <script src="/static/settings.js?v=__APP_VERSION__"></script>
 <script src="/static/app-init.js?v=__APP_VERSION__"></script>

@@ -148,14 +148,14 @@ def _parse_bool(source: Dict[str, object], key: str, default: bool) -> bool:
 
 def _load_packaging_choices() -> List[str]:
     try:
-        unavailable = load_unavailable(state.configured_unavailable)
-        tools = load_tool_mapping(state.configured_tool_mapping)
-        small_skus = load_small_skus(state.configured_pick_strategy)
-        packaging = load_packaging(state.configured_knowledge)
-        if state.configured_shelves is None:
+        unavailable = load_unavailable(state.loaded_path("unavailable"))
+        tools = load_tool_mapping(state.loaded_path("tool_mapping"))
+        small_skus = load_small_skus(state.loaded_path("pick_strategy"))
+        packaging = load_packaging(state.loaded_path("knowledge"))
+        if state.loaded_path("shelves") is None:
             return packaging_choices([])
         candidates = load_candidates(
-            state.configured_shelves, unavailable, tools, small_skus, packaging
+            state.loaded_path("shelves"), unavailable, tools, small_skus, packaging
         )
         return packaging_choices(candidates)
     except (OSError, ValueError, FileNotFoundError, TypeError):
@@ -506,12 +506,12 @@ def generate(payload: Dict[str, object]) -> Dict[str, object]:
     if seed is not None:
         random.seed(int(seed))
 
-    unavailable = load_unavailable(state.configured_unavailable)
-    tools = load_tool_mapping(state.configured_tool_mapping)
-    small_skus = load_small_skus(state.configured_pick_strategy)
-    packaging = load_packaging(state.configured_knowledge)
+    unavailable = load_unavailable(state.loaded_path("unavailable"))
+    tools = load_tool_mapping(state.loaded_path("tool_mapping"))
+    small_skus = load_small_skus(state.loaded_path("pick_strategy"))
+    packaging = load_packaging(state.loaded_path("knowledge"))
     candidates = load_candidates(
-        state.configured_shelves, unavailable, tools, small_skus, packaging
+        state.loaded_path("shelves"), unavailable, tools, small_skus, packaging
     )
 
     current = _load_state_file()
@@ -591,13 +591,13 @@ def import_csv(payload: Dict[str, object]) -> Dict[str, object]:
     if group_mode == "group" and not group_field:
         raise ValueError("组合模式需要指定组合字段。")
 
-    unavailable = load_unavailable(state.configured_unavailable)
-    tools = load_tool_mapping(state.configured_tool_mapping)
-    small_skus = load_small_skus(state.configured_pick_strategy)
-    packaging = load_packaging(state.configured_knowledge)
+    unavailable = load_unavailable(state.loaded_path("unavailable"))
+    tools = load_tool_mapping(state.loaded_path("tool_mapping"))
+    small_skus = load_small_skus(state.loaded_path("pick_strategy"))
+    packaging = load_packaging(state.loaded_path("knowledge"))
     try:
         candidates = load_candidates(
-            state.configured_shelves, unavailable, tools, small_skus, packaging
+            state.loaded_path("shelves"), unavailable, tools, small_skus, packaging
         )
     except OSError:
         # 候选数据只用来补全属性，缺失时仍按原文件导入（商品是否存在由下单接口报错）

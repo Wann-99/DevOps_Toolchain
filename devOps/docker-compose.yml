@@ -26,7 +26,10 @@ services:
       # 容器默认 UTC，会导致备份文件名/订单时间比现场慢 8 小时。
       TZ: ${TZ:-Asia/Shanghai}
       KSQ_APP_DIRECTORY: /app
+      KSQ_HOST_FILES_SOCKET: /run/ksq-host/host.sock
+      KSQ_DESKTOP_URL: ${KSQ_DESKTOP_URL:-}
     volumes:
+      - ./host-files:/run/ksq-host:ro
       - /etc/localtime:/etc/localtime:ro
       - ../deploy/standalone/bin/knowledge_shelf_query.bin:/opt/ksq/knowledge_shelf_query.bin:ro
       # 状态/配置（up.sh 会自动初始化缺失文件到 ./config/）
