@@ -96,6 +96,13 @@
   let mapImageUrl = null; // 上一次 blob URL，加载新图前需要 revoke 避免泄漏
   const DEFAULT_MAP_BACKGROUND = "rgb(128, 128, 128)";
   let mapBackgroundColor = DEFAULT_MAP_BACKGROUND;
+  // Hermes 48V: local X is the 545 mm long side, Y is 465 mm; pose is centered.
+  const robotFootprint = Object.freeze({ front: 0.2725, rear: 0.2725, left: 0.2325, right: 0.2325 });
+
+  function robotRotationRadius(footprint) {
+    return Math.hypot(Math.max(footprint.front, footprint.rear),
+      Math.max(footprint.left, footprint.right));
+  }
 
   function pxToWorld(px, py) {
     if (mapMeta) {
@@ -258,6 +265,7 @@
   let connectionSwitching = false;
   let mapHasBeenFitted = false;
   let pendingClick = null;
+  let mappingSelection = [];
   let patrolQueue = []; // stable POI ids in the order selected by the operator
   let patrolIndex = 0;
   let patrolRunning = false;
@@ -290,7 +298,7 @@
 
   function readPatrolSpeedMps() {
     if (!patrolSpeedInput || !patrolSpeedLimitReady) {
-      alert("尚未取得底盘速度范围，请检查底盘连接。");
+      global.KsqDialog.notice({ message: "尚未取得底盘速度范围，请检查底盘连接。" });
       return null;
     }
     if (!patrolSpeedInput.checkValidity()) {
@@ -633,10 +641,9 @@
     ctx.fillStyle = telemetry.stale ? "rgba(239,68,68,0.05)" : "rgba(239,68,68,0.14)";
     ctx.fill();
     ctx.strokeStyle = telemetry.stale ? "rgba(220,38,38,0.3)" : "rgba(220,38,38,0.82)";
-    ctx.lineWidth = screenPx(1.25);
-    ctx.setLineDash([screenPx(6), screenPx(5)]);
-    ctx.stroke();
+    ctx.lineWidth = screenPx(1);
     ctx.setLineDash([]);
+    ctx.stroke();
     ctx.restore();
   }
 
@@ -672,20 +679,21 @@
     // but its lower opacity makes it impossible to mistake for fresh hits.
     drawScanPoints(
       telemetry.points,
-      "#000000",
+      "#0099ff",
       telemetry.stale ? 0.32 : 0.98,
       1.35
     );
   }
 
-  function drawPatrolPath() {
-    if (patrolPath.length < 2) return;
+  function drawRoutePath(points) {
+    if (!points || points.length < 2) return;
     ctx.save();
+    ctx.setLineDash([]);
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     const trace = () => {
       ctx.beginPath();
-      patrolPath.forEach((point, index) => {
+      points.forEach((point, index) => {
         const pixel = worldToPx(point.x, point.y);
         if (index === 0) ctx.moveTo(pixel.x, pixel.y);
         else ctx.lineTo(pixel.x, pixel.y);
@@ -695,9 +703,35 @@
     ctx.strokeStyle = "rgba(255,255,255,.9)";
     ctx.lineWidth = screenPx(6);
     trace();
-    ctx.strokeStyle = "#0891b2";
+    ctx.strokeStyle = "#e02424";
     ctx.lineWidth = screenPx(3);
     trace();
+    ctx.restore();
+  }
+
+  function drawNavigationTarget() {
+    if (!robot.target) return;
+    const point = worldToPx(robot.target.x, robot.target.y);
+    ctx.save();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, screenPx(9), 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,.9)";
+    ctx.fill();
+    ctx.strokeStyle = "#e02424";
+    ctx.lineWidth = screenPx(2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, screenPx(3), 0, Math.PI * 2);
+    ctx.fillStyle = "#e02424";
+    ctx.fill();
+    ctx.font = `bold ${screenPx(12)}px sans-serif`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.lineWidth = screenPx(3);
+    ctx.strokeStyle = "#fff";
+    ctx.strokeText("导航目标", point.x + screenPx(14), point.y);
+    ctx.fillText("导航目标", point.x + screenPx(14), point.y);
     ctx.restore();
   }
 
@@ -804,7 +838,7 @@
     drawRadarOverlay();
     drawTelemetryTrail();
     drawZones();
-    drawPatrolPath();
+    drawRoutePath(robot.target ? robot.target.path : patrolPath);
     drawLiveScan();
     drawHomePose();
 
@@ -830,27 +864,23 @@
       ctx.fillText(p.name, pt.x + screenPx(12), pt.y + screenPx(4));
     });
 
-    if (pendingClick) {
-      const pt = worldToPx(pendingClick.x, pendingClick.y);
-      ctx.strokeStyle = "#ffd166";
+    for (const point of [pendingClick, ...mappingSelection].filter(Boolean)) {
+      const pt = worldToPx(point.x, point.y);
+      ctx.setLineDash([]);
+      ctx.fillStyle = "rgba(255,255,255,.9)";
+      ctx.strokeStyle = "#d97706";
       ctx.lineWidth = screenPx(2);
       ctx.beginPath();
       ctx.arc(pt.x, pt.y, screenPx(10), 0, Math.PI * 2);
+      ctx.fill();
       ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, screenPx(3), 0, Math.PI * 2);
+      ctx.fillStyle = "#d97706";
+      ctx.fill();
     }
 
-    if (robot.target) {
-      const from = worldToPx(robot.x, robot.y);
-      const to = worldToPx(robot.target.x, robot.target.y);
-      ctx.setLineDash([screenPx(5), screenPx(5)]);
-      ctx.strokeStyle = "#57d9a3";
-      ctx.lineWidth = screenPx(2);
-      ctx.beginPath();
-      ctx.moveTo(from.x, from.y);
-      ctx.lineTo(to.x, to.y);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
+    drawNavigationTarget();
 
     if (robot.hasFix) {
       drawRobotIcon(worldToPx(robot.x, robot.y), robot.yaw || 0, robot.moving);
@@ -877,11 +907,37 @@
     }
   }
 
-  // 参照 RoboStudio 里底盘图标的构图重画：蓝色车身圆 + 淡色安全圈 +
-  // 红色朝向三角 + 对称的 X/Y 局部坐标轴，比之前的纯圆点直观得多，一眼能看出
-  // 机器人当前朝向和车体坐标方向。
+  function drawRobotFootprint(rp, yaw) {
+    if (!mapMeta) return;
+    const f = robotFootprint;
+    const resolution = mapMeta.resolution;
+    ctx.save();
+    ctx.translate(rp.x, rp.y);
+    ctx.rotate(-yaw);
+    ctx.beginPath();
+    ctx.arc(0, 0, robotRotationRadius(f) / resolution, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(255,255,255,.95)";
+    ctx.lineWidth = screenPx(3.5);
+    ctx.stroke();
+    ctx.strokeStyle = "#495ed1";
+    ctx.lineWidth = screenPx(1.5);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.rect(-f.rear / resolution, -f.left / resolution,
+      (f.front + f.rear) / resolution, (f.left + f.right) / resolution);
+    ctx.fillStyle = "rgba(65,86,211,.12)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,.95)";
+    ctx.lineWidth = screenPx(4);
+    ctx.stroke();
+    ctx.strokeStyle = "#263aab";
+    ctx.lineWidth = screenPx(2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
   function drawRobotIcon(rp, yaw, moving) {
-    const BODY_R = 11;
+    drawRobotFootprint(rp, yaw);
     ctx.save();
     ctx.translate(rp.x, rp.y);
     ctx.scale(screenPx(1), screenPx(1));
@@ -930,38 +986,22 @@
       ctx.textBaseline = "alphabetic";
     }
 
-    // 安全圈光晕
-    ctx.fillStyle = "rgba(91,111,214,0.22)";
-    ctx.beginPath();
-    ctx.arc(0, 0, BODY_R + 7, 0, Math.PI * 2);
-    ctx.fill();
-
-    // 两条轴先绘制，随后由车身覆盖中心部分；这样箭头、标签和长度完全一致，
-    // 车身内部仍保持干净，红色 X 轴同时继续表达底盘朝向。
     drawAxisArrow(axisLen, 0, "#d92626", "X", 5, 0);
     drawAxisArrow(0, -axisLen, "#0891b2", "Y", 4, -1);
 
-    // 车身
-    ctx.fillStyle = moving ? "#4a63d6" : "#5b6fd6";
+    const heading = mapMeta
+      ? Math.min(...Object.values(robotFootprint)) * 0.7 / mapMeta.resolution / screenPx(1)
+      : 6;
+    ctx.fillStyle = moving ? "#d92626" : "#b92323";
     ctx.beginPath();
-    ctx.arc(0, 0, BODY_R, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = "#1c2b6e";
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-
-    // 车身一侧的小凸块（呼应实体底盘上传感器/接口的不对称外形）
-    ctx.fillStyle = "#8b93a6";
-    ctx.fillRect(-BODY_R - 5, -4, 6, 8);
-
-    // 朝向三角
-    ctx.fillStyle = "#d92626";
-    ctx.beginPath();
-    ctx.moveTo(BODY_R - 1, 0);
-    ctx.lineTo(-4, -6.5);
-    ctx.lineTo(-4, 6.5);
+    ctx.moveTo(heading, 0);
+    ctx.lineTo(-heading * 0.65, -heading * 0.65);
+    ctx.lineTo(-heading * 0.65, heading * 0.65);
     ctx.closePath();
     ctx.fill();
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 1;
+    ctx.stroke();
 
     ctx.restore();
   }
@@ -996,11 +1036,14 @@
   function trackPath(line) {
     if (!line.start || !line.end) return null;
     const points = [line.start, line.end];
-    const metadata = line.metadata || {};
-    if (metadata.control_point1 && metadata.control_point2) {
-      points.push(metadata.control_point1, metadata.control_point2);
+    const metadata = line.metadata ?? {};
+    if (typeof metadata !== "object" || Array.isArray(metadata)) return null;
+    if ("control_point1" in metadata || "control_point2" in metadata) {
+      try {
+        points.push(...[metadata.control_point1, metadata.control_point2].map((value) => typeof value === "string" ? JSON.parse(value) : value));
+      } catch (_) { return null; }
     }
-    if (points.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y))) return null;
+    if (points.some((point) => !point || !Number.isFinite(point.x) || !Number.isFinite(point.y))) return null;
     const [start, end, control1, control2] = points.map((point) => worldToPx(point.x, point.y));
     const path = new Path2D();
     path.moveTo(start.x, start.y);
@@ -1128,6 +1171,24 @@
     }).filter(Boolean);
   }
 
+  async function refreshNavigationPath(actionId) {
+    const target = robot.target;
+    if (!target || target.pathPending || currentActionId !== actionId) return;
+    const generation = connectionGeneration;
+    target.pathPending = true;
+    try {
+      const payload = await apiGet(pinnedRobotReadPath("/api/map/path"));
+      if (generation !== connectionGeneration || currentActionId !== actionId || robot.target !== target) return;
+      target.path = normalizePathPoints(payload);
+    } catch (error) {
+      if (generation !== connectionGeneration || currentActionId !== actionId || robot.target !== target) return;
+      target.path = [];
+    } finally {
+      target.pathPending = false;
+    }
+    drawMap();
+  }
+
   async function refreshPatrolPlan(actionId, targetCount, startIndex) {
     const now = Date.now();
     if (
@@ -1147,7 +1208,7 @@
         generation !== connectionGeneration || !patrolRunning || patrolPaused ||
         currentActionId !== actionId
       ) return;
-      if (pathPayload) patrolPath = normalizePathPoints(pathPayload);
+      patrolPath = normalizePathPoints(pathPayload);
       if (milestonePayload) {
         const remaining = normalizePathPoints(milestonePayload).length;
         // The chassis returns an empty list while milestones are not ready and
@@ -1176,8 +1237,8 @@
   // ---------------------------------------------------------------------
   // 后端 API 封装
   // ---------------------------------------------------------------------
-  async function apiGet(path) {
-    const response = await fetch(path, { cache: "no-store" });
+  async function apiGet(path, options = {}) {
+    const response = await fetch(path, Object.assign({}, options, { cache: "no-store" }));
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error || `请求失败：${path}`);
     return body;
@@ -1404,7 +1465,9 @@
     }
     const generation = connectionGeneration;
     if (!isPatrolRoute) invalidatePatrolRoute();
-    robot.target = isPatrolRoute ? null : target;
+    else patrolPath = [];
+    robot.target = isPatrolRoute ? null : { x: target.x, y: target.y, path: [] };
+    const navigationTarget = robot.target;
     robot.moving = true;
     setAction(isPatrolRoute ? "启动巡逻" : "执行中 → MoveToAction");
     const dockEl = mapStatusElement("map-dock-text");
@@ -1482,10 +1545,16 @@
       maxAttempts: isPatrolRoute ? Infinity : 240,
       onTick: isPatrolRoute
         ? () => refreshPatrolPlan(actionId, routeTargets.length, routeStartIndex)
-        : undefined,
+        : () => refreshNavigationPath(actionId),
     });
     if (generation !== connectionGeneration) return outcome;
-    if (outcome.aborted) return outcome;
+    if (outcome.aborted) {
+      if (navigationTarget && robot.target === navigationTarget) {
+        navigationTarget.path = [];
+        drawMap();
+      }
+      return outcome;
+    }
     robot.moving = false;
     robot.target = null;
     if (outcome.done) serverActionActive = false;
@@ -1684,7 +1753,7 @@
   const mapAutoRefreshToggle = document.getElementById("map-auto-refresh-toggle");
   function startMapAutoRefresh() {
     if (!mapAutoRefreshToggle || !mapAutoRefreshToggle.checked || mapAutoRefreshTimer) return;
-    mapAutoRefreshTimer = global.setInterval(loadMapImage, 5000);
+    mapAutoRefreshTimer = global.setInterval(() => loadMapImage(connectionGeneration, true), 5000);
   }
   function stopMapAutoRefresh() {
     if (!mapAutoRefreshTimer) return;
@@ -2212,7 +2281,7 @@
             logEvent(`删除停留点「${poi.name}」`);
             await refreshPois();
           } catch (error) {
-            alert("删除失败：" + error.message);
+            global.KsqDialog.notice({ title: "删除失败", message: error.message, tone: "error" });
           }
         }
       };
@@ -2270,7 +2339,7 @@
   async function deleteSelectedTracks() {
     if (tracksDeleting || patrolRunning || patrolPlanning || patrolControlPending || !selectedTracks.size) return;
     if (actionCommandPending || currentActionId || serverActionActive) {
-      alert("已有底盘动作正在执行，请先停止后再删除轨道。");
+      global.KsqDialog.notice({ message: "已有底盘动作正在执行，请先停止后再删除轨道。" });
       return;
     }
     const generation = connectionGeneration;
@@ -2282,9 +2351,7 @@
     const status = document.getElementById("map-track-status");
     try {
       const message = `删除选中的 ${tracks.length} 条虚拟轨道？此操作会修改底盘地图，不能撤销。`;
-      const confirmed = global.KsqDialog
-        ? await global.KsqDialog.confirm({ title: "删除虚拟轨道", message, confirmText: "删除" })
-        : global.confirm(message);
+      const confirmed = await global.KsqDialog.confirm({ title: "删除虚拟轨道", message, confirmText: "删除" });
       if (!confirmed || generation !== connectionGeneration) return;
       invalidatePatrolRoute();
       const response = await apiSend("POST", "/api/map/tracks/delete", { tracks });
@@ -2367,12 +2434,12 @@
   async function planPatrolRoute() {
     if (patrolPlanning || patrolRunning || patrolControlPending || tracksDeleting) return;
     if (actionCommandPending || currentActionId || serverActionActive) {
-      alert("已有底盘动作正在执行，请先停止后再规划路线。");
+      global.KsqDialog.notice({ message: "已有底盘动作正在执行，请先停止后再规划路线。" });
       return;
     }
     const routePois = patrolQueue.map(findPoiById);
     if (!routePois.length || routePois.some((poi) => !poi)) {
-      alert("请先加入有效的巡逻点。");
+      global.KsqDialog.notice({ message: "请先加入有效的巡逻点。" });
       return;
     }
     const generation = connectionGeneration;
@@ -2413,6 +2480,7 @@
       if (generation !== connectionGeneration) return;
       status.textContent = "规划失败：" + error.message;
       logEvent("巡逻路线规划失败：" + error.message);
+      await loadZones(generation);
     } finally {
       if (generation === connectionGeneration) {
         patrolPlanning = false;
@@ -2515,16 +2583,16 @@
   function startPatrol() {
     if (patrolRunning || patrolPlanning || tracksDeleting) return;
     if (patrolControlPending || actionCommandPending || currentActionId || serverActionActive) {
-      alert("已有底盘动作正在执行，请先停止后再开始巡逻。");
+      global.KsqDialog.notice({ message: "已有底盘动作正在执行，请先停止后再开始巡逻。" });
       return;
     }
     if (!patrolQueue.length) {
-      alert("请先加入至少一个巡逻点");
+      global.KsqDialog.notice({ message: "请先加入至少一个巡逻点。" });
       return;
     }
     syncPatrolControls();
     if (!patrolRoutePlan) {
-      alert("请先规划路线，再开始巡逻。");
+      global.KsqDialog.notice({ message: "请先规划路线，再开始巡逻。" });
       return;
     }
     activePatrolSpeedMps = readPatrolSpeedMps();
@@ -2702,7 +2770,7 @@
   // ---------------------------------------------------------------------
   // 真实地图图片
   // ---------------------------------------------------------------------
-  async function loadMapImage(generation = connectionGeneration) {
+  async function loadMapImage(generation = connectionGeneration, automatic = false) {
     if (mapImageRequestGeneration === generation) return false;
     mapImageRequestGeneration = generation;
     try {
@@ -2768,7 +2836,7 @@
           centerViewOnRobot();
           setZoomLabel();
         }
-        logEvent(`地图已加载：${meta.width}×${meta.height} 格`);
+        if (!automatic || !previousMeta) logEvent(`地图已加载：${meta.width}×${meta.height} 格`);
       } catch (error) {
         URL.revokeObjectURL(url);
         logEvent("地图图片解码失败：" + error.message);
@@ -3008,9 +3076,177 @@
   const robotIpInput = document.getElementById("map-robot-ip");
   const robotPortInput = document.getElementById("map-robot-port");
   const connectButton = document.getElementById("map-btn-connect");
+  const getPoseButton = document.getElementById("map-btn-get-pose");
+  const healthDialog = document.getElementById("map-health-dialog");
+  const healthRefreshButton = document.getElementById("map-health-refresh");
+  const healthClearButton = document.getElementById("map-health-clear");
+  let healthRequestGeneration = null;
+  let healthClearGeneration = null;
+  let currentHealth = null;
+  let manualPoseRequestGeneration = null;
   connectButton.disabled = true;
   robotIpInput.disabled = true;
   robotPortInput.disabled = true;
+
+  function updateChassisReadControls() {
+    const unavailable = !configuredBaseUrl || connectionSwitching;
+    if (getPoseButton) getPoseButton.disabled = unavailable || manualPoseRequestGeneration === connectionGeneration;
+    const healthBusy = healthRequestGeneration === connectionGeneration || healthClearGeneration === connectionGeneration;
+    if (healthRefreshButton) healthRefreshButton.disabled = unavailable || healthBusy;
+    if (healthClearButton) {
+      healthClearButton.disabled = unavailable || healthBusy || !currentHealth || !currentHealth.baseError.length;
+      healthClearButton.textContent = healthClearGeneration === connectionGeneration ? "清除中…" : "清除错误";
+    }
+  }
+
+  function renderRobotHealth(health, error = "") {
+    if (health && (!Array.isArray(health.baseError) ||
+        health.baseError.some((item) => !item || typeof item !== "object" || Array.isArray(item)) ||
+        ["hasWarning", "hasError", "hasFatal"].some((key) => typeof health[key] !== "boolean"))) {
+      throw new Error("底盘返回的健康信息格式无效。");
+    }
+    currentHealth = health;
+    const summary = document.getElementById("map-chassis-health");
+    const reasons = document.getElementById("map-chassis-health-reasons");
+    const rows = document.getElementById("map-health-errors");
+    const status = document.getElementById("map-health-status");
+    if (!summary || !reasons || !rows || !status) return;
+    reasons.replaceChildren();
+    rows.replaceChildren();
+    const errors = health ? health.baseError : [];
+    const flags = {
+      hasSystemEmergencyStop: "系统急停已触发",
+      hasLidarDisconnected: "激光雷达断开",
+      hasDepthCameraDisconnected: "深度相机断开",
+      hasSdpDisconnected: "底盘通信断开",
+    };
+    const messages = health ? Object.entries(flags).filter(([key]) => health[key] === true).map(([, label]) => label) : [];
+    errors.forEach((item) => {
+      const description = item.message || "固件未提供异常描述";
+      messages.push(description === "motor brake released" ? "电机制动已释放（motor brake released）" : description);
+      const row = document.createElement("tr");
+      const level = { 0: "Healthy", 1: "Warn", 2: "Error", 4: "Fatal", 255: "Unknown" }[item.level] ?? item.level;
+      const component = { 0: "User", 1: "System", 2: "Power", 3: "Motion", 4: "Sensor", 255: "Unknown" }[item.component] ?? item.component;
+      [item.id, description, item.errorCode, level, component, item.componentErrorCode, item.componentErrorType, item.componentErrorDeviceId].forEach((value) => {
+        const cell = document.createElement("td");
+        cell.textContent = value == null ? "--" : String(value);
+        row.append(cell);
+      });
+      rows.append(row);
+    });
+    const fatal = health && (health.hasFatal || errors.some((item) => item.level === 4));
+    const fault = health && (health.hasError || errors.some((item) => item.level === 2) || Object.keys(flags).some((key) => health[key] === true));
+    const warning = health && (health.hasWarning || errors.length > 0);
+    const abnormal = !!(fatal || fault || warning);
+    summary.textContent = !health ? error ? "健康信息不可用" : "未连接" : fatal ? "严重异常" : fault ? "异常" : warning ? "告警" : "正常";
+    summary.classList.toggle("is-error", !!error || !!fatal || !!fault);
+    summary.classList.toggle("is-warning", !fault && !fatal && !!warning);
+    if (error) messages.push(error);
+    if (abnormal && !messages.length) messages.push("底盘上报异常，未提供详细原因。");
+    [...new Set(messages)].forEach((text) => {
+      const item = document.createElement("li");
+      item.textContent = text;
+      reasons.append(item);
+    });
+    reasons.hidden = !messages.length;
+    status.textContent = !health ? error || "尚未获取健康信息" : abnormal
+      ? `健康告警 ${errors.length} 条` + (messages.length ? "：" + [...new Set(messages)].join("；") : "")
+      : "未检测到健康告警";
+    updateChassisReadControls();
+  }
+
+  async function refreshRobotHealth() {
+    if (!configuredBaseUrl || connectionSwitching || healthRequestGeneration === connectionGeneration || healthClearGeneration === connectionGeneration) return;
+    const generation = connectionGeneration;
+    healthRequestGeneration = generation;
+    updateChassisReadControls();
+    try {
+      const health = await apiGet(pinnedRobotReadPath("/api/map/health"));
+      if (generation !== connectionGeneration) return;
+      if (!health) throw new Error("底盘返回的健康信息格式无效。");
+      renderRobotHealth(health);
+    } catch (error) {
+      if (generation === connectionGeneration) renderRobotHealth(null, error.message);
+    } finally {
+      if (generation === connectionGeneration) {
+        healthRequestGeneration = null;
+        updateChassisReadControls();
+      }
+    }
+  }
+
+  async function clearRobotHealth() {
+    if (!configuredBaseUrl || connectionSwitching || healthRequestGeneration === connectionGeneration ||
+        healthClearGeneration === connectionGeneration || !currentHealth || !currentHealth.baseError.length) return;
+    const generation = connectionGeneration;
+    const expected = configuredBaseUrl;
+    healthClearGeneration = generation;
+    updateChassisReadControls();
+    try {
+      const confirmed = await global.KsqDialog.confirm({
+        title: "清除错误", confirmText: "清除错误",
+        message: "清除当前底盘的健康错误？请先确认异常原因已排除。清除告警不会修复硬件故障，持续存在的异常会再次上报。",
+      });
+      if (!confirmed || generation !== connectionGeneration || expected !== configuredBaseUrl || connectionSwitching) return;
+      const health = await apiSend("POST", "/api/map/health/clear", { confirm: true, expected_robot_base_url: expected });
+      if (generation !== connectionGeneration) return;
+      if (!health) throw new Error("底盘返回的健康信息格式无效。");
+      renderRobotHealth(health);
+      logEvent("清除错误请求完成，健康状态已重新读取");
+    } catch (error) {
+      if (generation === connectionGeneration) {
+        renderRobotHealth(null, "清除错误失败：" + error.message);
+        logEvent("清除错误失败：" + error.message);
+      }
+    } finally {
+      if (generation === connectionGeneration) {
+        healthClearGeneration = null;
+        updateChassisReadControls();
+      }
+    }
+  }
+
+  function renderChassisPose(pose, status) {
+    ["x", "y", "yaw"].forEach((key) => {
+      const value = document.getElementById("map-chassis-pose-" + key);
+      if (value) value.textContent = pose ? (key === "yaw" ? pose.yaw * 180 / Math.PI : pose[key]).toFixed(3) : "--";
+    });
+    const message = document.getElementById("map-chassis-pose-status");
+    if (message) message.textContent = status;
+  }
+
+  async function fetchChassisPose() {
+    if (!configuredBaseUrl || connectionSwitching || manualPoseRequestGeneration === connectionGeneration) return;
+    const generation = connectionGeneration;
+    manualPoseRequestGeneration = generation;
+    updateChassisReadControls();
+    renderChassisPose(null, "正在读取位姿…");
+    try {
+      const payload = await apiGet(pinnedRobotReadPath("/api/map/pose"));
+      if (generation !== connectionGeneration) return;
+      if (!payload || ["x", "y", "yaw"].some((key) => typeof payload[key] !== "number" || !Number.isFinite(payload[key]))) {
+        throw new Error("底盘未返回有效的 X、Y 和朝向。");
+      }
+      const pose = extractPose(payload);
+      renderChassisPose(pose, "获取时间 " + new Date().toLocaleTimeString("zh-CN", { hour12: false }));
+    } catch (error) {
+      if (generation === connectionGeneration) renderChassisPose(null, "获取失败：" + error.message);
+    } finally {
+      if (generation === connectionGeneration) {
+        manualPoseRequestGeneration = null;
+        updateChassisReadControls();
+      }
+    }
+  }
+
+  if (getPoseButton) getPoseButton.onclick = fetchChassisPose;
+  if (healthRefreshButton) healthRefreshButton.onclick = refreshRobotHealth;
+  if (healthClearButton) healthClearButton.onclick = clearRobotHealth;
+  const healthDetailsButton = document.getElementById("map-btn-health-details");
+  if (healthDialog && healthDetailsButton) {
+    healthDetailsButton.onclick = () => { healthDialog.showModal(); refreshRobotHealth(); };
+    document.getElementById("map-health-close").onclick = () => healthDialog.close();
+  }
 
   function fillRobotEndpoint(baseUrl) {
     const parsed = new URL(String(baseUrl || "http://192.168.11.1:1448"));
@@ -3080,6 +3316,7 @@
     }
     lastTrailFrameKey = null;
     pendingClick = null;
+    mappingSelection = [];
     popover.hidden = true;
     if (poiDialog.open) poiDialog.close();
     poiDialogTarget = null;
@@ -3106,6 +3343,12 @@
     robot.hasFix = false;
     robot.target = null;
     robot.moving = false;
+    healthRequestGeneration = null;
+    healthClearGeneration = null;
+    manualPoseRequestGeneration = null;
+    renderRobotHealth(null);
+    renderChassisPose(null, "");
+    updateChassisReadControls();
     setConnected(false, "连接中");
     const resetStatus = {
       "map-battery-text": "—",
@@ -3134,6 +3377,7 @@
       const settings = await apiGet("/api/map/settings");
       if (generation !== connectionGeneration) return false;
       configuredBaseUrl = String(settings.robot_base_url || "");
+      updateChassisReadControls();
       fillRobotEndpoint(settings.robot_base_url);
       return true;
     } catch (error) {
@@ -3194,6 +3438,7 @@
     statusEl.textContent = "正在连接…";
     let settingsSaved = false;
     connectionSwitching = true;
+    updateChassisReadControls();
     try {
       const url = robotBaseUrlFromFields();
       const changingRobot = configuredBaseUrl !== url;
@@ -3213,9 +3458,10 @@
         settings = await apiSend("PUT", "/api/map/settings", { robot_base_url: url });
       } catch (error) {
         if (error.code !== "force_switch_required") throw error;
-        const confirmed = global.confirm(
-          "无法确认旧底盘已停止。仅在现场确认旧底盘安全后强制切换，是否继续？"
-        );
+        const confirmed = await global.KsqDialog.confirm({
+          title: "确认切换机器人", confirmText: "强制切换",
+          message: "无法确认旧底盘已停止。仅在现场确认旧底盘安全后强制切换，是否继续？",
+        });
         if (!confirmed) {
           statusEl.textContent = "已取消切换。";
           return;
@@ -3253,6 +3499,8 @@
       statusEl.textContent = "连接失败：" + error.message;
     } finally {
       connectionSwitching = false;
+      updateChassisReadControls();
+      refreshRobotHealth();
       connectButton.disabled = false;
       robotIpInput.disabled = false;
       robotPortInput.disabled = false;
@@ -3266,6 +3514,7 @@
       const info = await apiGet("/api/map/robot-info");
       if (generation !== connectionGeneration) return false;
       setConnected(true, "已连接" + (info && info.model ? ` · ${info.model}` : ""));
+      refreshRobotHealth();
       if (verbose) statusEl.textContent = "连接正常。";
       refreshPower(generation);
       await refreshPatrolSpeedLimit(generation);
@@ -3357,8 +3606,10 @@
           }
           return;
         }
-        if (!configuredBaseUrl && nextBaseUrl) configuredBaseUrl = nextBaseUrl;
+      if (!configuredBaseUrl && nextBaseUrl) configuredBaseUrl = nextBaseUrl;
       }
+      updateChassisReadControls();
+      refreshRobotHealth();
       // 电源和当前动作是独立状态源，单项超时不应阻塞另一项更新。
       const statusEpoch = actionStatusEpoch;
       const [powerResult, actionResult] = await Promise.all([
@@ -3412,11 +3663,33 @@
     }
   }
 
+  async function refreshCurrentActionStatus(expectedBase) {
+    if (connectionSwitching || expectedBase !== configuredBaseUrl || actionCommandPending) return false;
+    const generation = connectionGeneration;
+    const epoch = ++actionStatusEpoch;
+    try {
+      const action = await apiGet(pinnedRobotReadPath("/api/map/current-action"), { signal: global.AbortSignal.timeout(4000) });
+      if (generation !== connectionGeneration || epoch !== actionStatusEpoch || expectedBase !== configuredBaseUrl || connectionSwitching) return false;
+      if (!action || typeof action.active !== "boolean" || action.active && (!action.action || typeof action.action !== "object")) throw new Error("底盘动作状态未确认。");
+      applyCurrentActionStatus(action);
+      return true;
+    } finally {
+      if (generation === connectionGeneration && epoch === actionStatusEpoch) actionStatusEpoch += 1;
+    }
+  }
+
   global.KsqMap = {
     activate: activateTelemetry,
     deactivate: deactivateTelemetry,
     refreshTelemetry,
+    refreshCurrentActionStatus,
     logEvent,
+    setMappingSelection(points) {
+      if (!points.length && !mappingSelection.length) return;
+      mappingSelection = points;
+      if (points.length) { pendingClick = null; popover.hidden = true; }
+      drawMap();
+    },
     mappingContext: () => ({
       robotBaseUrl: configuredBaseUrl,
       switching: connectionSwitching,
@@ -3436,7 +3709,7 @@
       await Promise.all([loadMapImage(), loadZones(), refreshPois(), refreshHomePose(), refreshPower()]);
       if (reset) refreshTelemetry();
     },
-    refreshMappingImage: () => loadMapImage(),
+    refreshMappingImage: () => loadMapImage(connectionGeneration, true),
   };
 
   // ---------------------------------------------------------------------

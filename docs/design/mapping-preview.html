@@ -69,19 +69,19 @@
             <div class="danger-zone"><h3>重置地图</h3><button class="preview-btn danger-outline" data-command="clear-map">清空当前地图</button></div>
           </section>
           <section class="mapping-pane" id="pane-deploy" hidden>
-            <label class="field"><span>配置对象</span><select id="object-type"><option value="poi">停留点</option><option value="dock">充电桩</option><option value="wall">虚拟墙</option><option value="track">虚拟轨道</option><option value="forbidden">禁行区域</option><option value="danger">危险限速区</option><option value="maintenance">运维更新区</option><option value="pose">机器人位姿</option><option value="origin">地图原点</option></select></label>
+            <label class="field"><span>配置对象</span><select id="object-type"><option value="poi">停留点</option><option value="dock">充电桩</option><option value="wall">虚拟墙</option><option value="track">虚拟轨道</option><option value="forbidden">禁行区域</option><option value="danger">危险区域</option><option value="maintenance">运维区域</option><option value="pose">机器人位姿</option><option value="origin">地图原点</option></select></label>
             <div class="tool-strip"><button class="preview-btn primary" id="add-object"><span class="icon icon-edit"></span>地图选点</button><button class="preview-btn secondary" id="add-current">当前位置</button></div>
             <div class="section-heading section-divider"><h3 id="object-list-title">停留点</h3><span class="quiet" id="object-count">2 项</span></div>
             <div class="object-list" id="object-list"></div>
           </section>
         </div>
-        <div class="utility-pane" id="utility-connection" hidden><div class="drawer-heading"><h2>底盘连接</h2></div><div class="number-fields"><label class="field"><span>IP</span><input value="192.168.11.1" inputmode="decimal" aria-label="底盘 IP"></label><label class="field"><span>端口</span><input value="1448" type="number" min="1" max="65535" aria-label="底盘端口"></label></div><button class="preview-btn primary primary-cta" data-command="connection"><span class="icon icon-plug"></span>连接</button><div class="utility-state">未连接底盘</div></div>
+        <div class="utility-pane" id="utility-connection" hidden><div class="drawer-heading"><h2>机器人</h2></div><div class="number-fields"><label class="field"><span>IP</span><input value="192.168.11.1" inputmode="decimal" aria-label="底盘 IP"></label><label class="field"><span>端口</span><input value="1448" type="number" min="1" max="65535" aria-label="底盘端口"></label></div><button class="preview-btn primary primary-cta" data-command="connection"><span class="icon icon-plug"></span>连接</button><div class="utility-state">未连接底盘</div></div>
         <div class="utility-pane" id="utility-chassis" hidden><div class="drawer-heading"><h2>底盘操作</h2></div><label class="field"><span>巡逻最高速度</span><span class="input-unit"><input value="0.40" type="number" min="0.01" step="0.01"><span>m/s</span></span></label><div class="action-grid section-divider"><button class="preview-btn secondary" data-command="home">回桩充电</button><button class="preview-btn secondary" data-command="relocate">重定位</button></div></div>
         <div class="utility-pane" id="utility-poi" hidden><div class="drawer-heading"><h2>停留点</h2></div><div id="utility-poi-list"></div></div>
         <div class="utility-pane" id="utility-patrol" hidden><div class="drawer-heading"><h2>巡逻任务</h2></div><div class="preview-queue">1. 入口停留点 <span>2. 货架通道</span></div><label class="toggle-line"><span>循环巡逻</span><input type="checkbox" checked></label><label class="toggle-line"><span>轨道优先</span><input type="checkbox"></label><div class="action-grid"><button class="preview-btn secondary" data-command="plan-patrol">规划路线</button><button class="preview-btn primary" data-command="start-patrol">开始巡逻</button></div></div>
       </div>
       <nav class="preview-rail" aria-label="地图功能分类">
-        <button class="rail-tab" data-section="connection" aria-expanded="false" aria-controls="utility-connection"><span>底盘连接</span></button>
+        <button class="rail-tab" data-section="connection" aria-expanded="false" aria-controls="utility-connection"><span>机器人</span></button>
         <button class="rail-tab" data-section="chassis" aria-expanded="false" aria-controls="utility-chassis"><span>底盘操作</span></button>
         <button class="rail-tab is-selected" data-section="mapping" aria-expanded="true" aria-controls="mapping-content"><span>建图</span></button>
         <button class="rail-tab" data-section="poi" aria-expanded="false" aria-controls="utility-poi"><span>停留点</span></button>

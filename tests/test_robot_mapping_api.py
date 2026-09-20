@@ -105,6 +105,9 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(mapping._load_state(self.base)["drive_speed_restore"],
                          {"base.max_moving_speed": 0.8, "base.max_angular_speed": 1.5})
         self.assertFalse(any(method == "POST" for method, *_ in self.calls))
+        for param in self.speeds:
+            reads = [call for call in self.calls if call[:2] == ("GET", f"/api/core/system/v1/parameter?param={param}")]
+            self.assertEqual(len(reads), 2, "Read the original and verify the write, without a duplicate pre-read")
         self.calls.clear()
         with (
             patch.object(mapping, "_load_state", side_effect=AssertionError("pulse read state")),
@@ -335,7 +338,7 @@ class MappingTests(unittest.TestCase):
         self.mapping_enabled = True
         with self.assertRaises(robot.RobotApiError):
             self.execute("drive-start", linear_speed=0.2, angular_speed=0.3)
-        for linear, angular in ((0, 0.3), (0.41, 0.3), (0.2, 0.61), (float("nan"), 0.3)):
+        for linear, angular in ((0, 0.3), (0.2, 0), (float("nan"), 0.3)):
             with self.assertRaises(ValueError):
                 self.execute("drive-start", linear_speed=linear, angular_speed=angular)
         self.speeds["base.max_moving_speed"] = 0.1
@@ -611,6 +614,17 @@ class MappingTests(unittest.TestCase):
             self.assertEqual(save.call_args.args[1], self.base)
             self.assertEqual(save.call_args.args[0]["type"], "poi")
             self.assertNotIn(self.base, robot._PATROL_TRACK_PLANS)
+
+    def test_accepted_deployment_readback_warning_reaches_client_without_retry(self):
+        from ksq.web import robot_mapping_objects
+
+        warning = "Configuration accepted; readback failed. Do not submit again."
+        with patch.object(robot_mapping_objects, "save_object", return_value={"object": None, "warning": warning}) as save:
+            result = self.execute("deploy", type="maintenance", name="Area", x=0, y=0, width=2, height=1)
+        save.assert_called_once()
+        self.assertEqual(result["warning"], warning)
+        self.assertTrue(result["dirty"])
+        self.assertNotIn("warning", self.execute("rename", name="Map"))
 
     def test_delete_backup_removes_only_selected_map_files(self):
         first = self.execute("backup")["backups"][0]

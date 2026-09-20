@@ -8,6 +8,7 @@ import hashlib
 import http.client
 import json
 import math
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -22,6 +23,7 @@ MAX_STCM_BYTES = 32 * 1024 * 1024
 _MAPPING_PATH = "/api/core/slam/v1/mapping/:enable"
 _LOOP_PATH = "/api/core/slam/v1/loopclosure/:enable"
 _STCM_PATH = "/api/core/slam/v1/maps/stcm"
+_PERSISTENT_STCM_PATH = "/api/multi-floor/map/v1/stcm"
 _MOVE_ACTION = "slamtec.agent.actions.MoveByAction"
 _SPEED_PARAMS = {"linear_speed": "base.max_moving_speed", "angular_speed": "base.max_angular_speed"}
 _DIRECTIONS = {"forward": 0, "backward": 1, "right": 2, "left": 3}
@@ -32,6 +34,41 @@ _TELEOP_CAPABILITIES: dict[str, dict] = {}
 # ponytail: share the existing process-wide connection lock; use per-robot locks
 # only if the application supports simultaneous connections in the future.
 _KNOWN_MAPPING: dict[str, bool | None] = {}
+# ponytail: keep only the latest in-process upload; persist history if restart recovery is needed.
+_UPLOAD_PROGRESS: dict = {}
+_UPLOAD_PROGRESS_LOCK = threading.Lock()
+
+
+def _upload_id(value: object) -> str:
+    if not isinstance(value, str) or len(value) > 36:
+        raise ValueError("上传编号无效。")
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as error:
+        raise ValueError("上传编号无效。") from error
+
+
+def _set_upload_progress(upload_id: str, **changes) -> None:
+    with _UPLOAD_PROGRESS_LOCK:
+        if _UPLOAD_PROGRESS.get("upload_id") == upload_id:
+            _UPLOAD_PROGRESS.update(changes)
+
+
+def get_upload_progress(expected_base_url: object, upload_id: object) -> dict:
+    identifier = _upload_id(upload_id)
+    if not isinstance(expected_base_url, str) or not expected_base_url.strip():
+        raise ValueError("上传进度必须指定当前底盘地址。")
+    expected = expected_base_url.strip().rstrip("/")
+    # Reading the atomic settings file avoids the connection lock held throughout upload.
+    if expected != robot._base_url():
+        raise ValueError("底盘连接已变更，请刷新地图后重试。")
+    with _UPLOAD_PROGRESS_LOCK:
+        result = dict(_UPLOAD_PROGRESS)
+    if expected != robot._base_url():
+        raise ValueError("底盘连接已变更，请刷新地图后重试。")
+    if result.get("robot_base_url") != expected or result.get("upload_id") != identifier:
+        raise robot.RobotApiError("未找到本次上传进度，请等待请求开始或重新确认上传结果。", 404)
+    return result
 
 
 def _directory(base_url: str) -> Path:
@@ -125,8 +162,10 @@ def _list_backups(base_url: str) -> list[dict]:
 
 
 def _stcm_request(method: str, base_url: str, payload: bytes | None = None) -> bytes:
+    # POST uploads the persistent file; GET/PUT export/import the runtime map.
+    path = _PERSISTENT_STCM_PATH if method == "POST" else _STCM_PATH
     request = urllib.request.Request(
-        f"{base_url}{_STCM_PATH}",
+        f"{base_url}{path}",
         data=payload,
         headers={"Accept": "application/octet-stream", "Content-Type": "application/octet-stream"},
         method=method,
@@ -243,8 +282,10 @@ def _read_speed(param: str, base_url: str) -> float:
     return value
 
 
-def _set_speed(param: str, value: float, base_url: str) -> None:
-    if math.isclose(_read_speed(param, base_url), value, rel_tol=1e-6, abs_tol=1e-9):
+def _set_speed(param: str, value: float, base_url: str, *, observed: float | None = None) -> None:
+    if observed is None:
+        observed = _read_speed(param, base_url)
+    if math.isclose(observed, value, rel_tol=1e-6, abs_tol=1e-9):
         return
     _, accepted = robot._request(
         "PUT", "/api/core/system/v1/parameter", {"param": param, "value": str(value)},
@@ -293,8 +334,8 @@ def restore_drive_speeds(base_url: str) -> bool:
 
 def _drive_start(payload: dict, base_url: str) -> dict:
     speeds = {name: robot._finite_motion_value(payload.get(name), name) for name in _SPEED_PARAMS}
-    if not 0 < speeds["linear_speed"] <= 0.4 or not 0 < speeds["angular_speed"] <= 0.6:
-        raise ValueError("遥控线速度须大于 0 且不超过 0.4 m/s，角速度须大于 0 且不超过 0.6 rad/s。")
+    if not speeds["linear_speed"] > 0 or not speeds["angular_speed"] > 0:
+        raise ValueError("遥控线速度和角速度须大于 0。")
     if base_url in _DRIVE_LEASES:
         raise robot.RobotApiError("已有遥控会话，请先释放控制或停止。", 409)
     snapshot = _status(base_url)
@@ -320,7 +361,7 @@ def _drive_start(payload: dict, base_url: str) -> dict:
     _save_state(base_url, state)
     try:
         for name, param in _SPEED_PARAMS.items():
-            _set_speed(param, speeds[name], base_url)
+            _set_speed(param, speeds[name], base_url, observed=originals[param])
     except Exception:
         restore_drive_speeds(base_url)
         raise
@@ -499,6 +540,38 @@ def _require_single_floor(base_url: str) -> None:
 
 
 def execute(payload: dict) -> dict:
+    if not isinstance(payload, dict) or payload.get("command") != "upload":
+        return _execute(payload)
+    expected = payload.get("expected_robot_base_url")
+    if not isinstance(expected, str) or not expected.strip():
+        raise ValueError("建图操作必须指定当前底盘地址。")
+    expected = expected.strip().rstrip("/")
+    identifier = _upload_id(payload.get("upload_id", str(uuid.uuid4())))
+    _confirmed(payload)
+    if expected != robot._base_url():
+        raise ValueError("底盘连接已变更，请刷新地图后重试。")
+    with _UPLOAD_PROGRESS_LOCK:
+        if _UPLOAD_PROGRESS.get("status") == "running":
+            raise robot.RobotApiError("已有地图正在上传，请等待完成。", 409)
+        if _UPLOAD_PROGRESS.get("upload_id") == identifier:
+            raise robot.RobotApiError("此上传编号已使用，请先确认上次结果。", 409)
+        _UPLOAD_PROGRESS.clear()
+        _UPLOAD_PROGRESS.update(
+            robot_base_url=expected, upload_id=identifier, status="running",
+            stage="preparing", completed_steps=0, error="",
+        )
+    try:
+        result = _execute({**payload, "upload_id": identifier})
+    except Exception as error:
+        _set_upload_progress(identifier, status="failed", error=str(error))
+        raise
+    with _UPLOAD_PROGRESS_LOCK:
+        _UPLOAD_PROGRESS.update(status="succeeded", completed_steps=3)
+        result["upload_progress"] = dict(_UPLOAD_PROGRESS)
+    return result
+
+
+def _execute(payload: dict) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("建图请求必须为对象。")
     expected = payload.get("expected_robot_base_url")
@@ -511,6 +584,7 @@ def execute(payload: dict) -> dict:
         "stop", "drive-start", "drive-stop", "move", "deploy", "delete-object",
     }:
         raise ValueError("未知建图操作。")
+    operation_result = {}
     with robot._ROBOT_CONNECTION_LOCK:
         # The lease is pinned at acquisition and revoked by save_settings.
         # Pulses never read disk or poll firmware flags between 200 ms actions.
@@ -625,11 +699,36 @@ def execute(payload: dict) -> dict:
                     state["name"] = _name(payload["name"])
                 state.update(phase="finished", dirty=True)
                 _save_state(base_url, state)
-                # PUT core/maps/stcm is only a runtime import. This separate
-                # official endpoint is the operation that actually persists it.
-                _, result = robot._request("POST", "/api/multi-floor/map/v1/stcm/:save", base_url=base_url)
-                if result is False:
-                    raise robot.RobotApiError("固件拒绝保存地图，当前地图仍待上传。")
+                stage = "读取当前地图"
+                try:
+                    raw = _stcm_request("GET", base_url)
+                    stage = "第 1/3 步：上传地图"
+                    _set_upload_progress(payload["upload_id"], stage="upload")
+                    if _stcm_request("POST", base_url, raw).strip() == b"false":
+                        raise robot.RobotApiError("固件拒绝上传地图。")
+                    stage = "第 2/3 步：同步（重载）地图"
+                    _set_upload_progress(payload["upload_id"], stage="reload", completed_steps=1)
+                    # Follow the manual's upload -> reload -> save sequence.
+                    # A lost reload response must not silently unlock navigation.
+                    state["map_write_uncertain"] = True
+                    _save_state(base_url, state)
+                    _invalidate(base_url)
+                    _, result = robot._request("POST", f"{_PERSISTENT_STCM_PATH}/:reload", base_url=base_url, timeout=20)
+                    if result is False:
+                        raise robot.RobotApiError("固件拒绝重载地图。")
+                    state["map_write_uncertain"] = False
+                    _save_state(base_url, state)
+                    stage = "第 3/3 步：持久化保存"
+                    _set_upload_progress(payload["upload_id"], stage="save", completed_steps=2)
+                    _require_single_floor(base_url)
+                    _, result = robot._request("POST", f"{_PERSISTENT_STCM_PATH}/:save", base_url=base_url, timeout=20)
+                    if result is False:
+                        raise robot.RobotApiError("固件拒绝保存地图。")
+                    _set_upload_progress(payload["upload_id"], completed_steps=3)
+                except robot.RobotApiError as error:
+                    raise robot.RobotApiError(
+                        f"{stage}未确认完成，已停止后续操作：{error}", error.status_code,
+                    ) from error
                 state.update(phase="saved", dirty=False)
             elif command in {"deploy", "delete-object"}:
                 from ksq.web import robot_mapping_objects
@@ -641,6 +740,9 @@ def execute(payload: dict) -> dict:
                 state.update(phase="finished", dirty=True)
                 _save_state(base_url, state)
                 _invalidate(base_url)
-                operation(payload, base_url)
+                operation_result = operation(payload, base_url)
         _save_state(base_url, state)
-        return _status(base_url)
+        result = _status(base_url)
+        if operation_result.get("warning"):
+            result["warning"] = operation_result["warning"]
+        return result

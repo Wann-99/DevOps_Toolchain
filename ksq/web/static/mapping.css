@@ -10,12 +10,9 @@
 .map-build-dialog-heading { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:14px; }
 .map-build-heading h2,
 .map-build-dialog-heading h2 { margin:0; min-width:0; font-size:16px; overflow-wrap:anywhere; }
-.map-build-tabs { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:2px; margin-bottom:16px; padding:3px; border:1px solid #dce5e0; border-radius:6px; background:#f2f6f3; }
-.map-build-tab { height:34px; min-width:0; padding:0 6px; border:0; border-radius:4px; background:transparent; color:var(--muted); font-size:14px; box-shadow:none; }
-.map-build-tab.is-selected { background:#fff; color:var(--accent); box-shadow:0 1px 3px #1c43241a; }
-.map-build-tab:hover { transform:none; }
 .map-build-pane,
-.map-build-drive-section { min-width:0; margin:0; padding:0; border:0; background:transparent; }
+.map-build-drive-section,
+.map-chassis-info { min-width:0; margin:0; padding:0; border:0; background:transparent; }
 .map-build-identity { display:flex; align-items:center; justify-content:space-between; gap:8px; padding-bottom:14px; border-bottom:1px solid var(--line); }
 .map-build-identity > div { display:flex; flex-direction:column; gap:3px; min-width:0; }
 .map-build-identity strong { font-size:15px; overflow-wrap:anywhere; }
@@ -30,7 +27,6 @@
 .map-build-button { min-height:40px; min-width:0; padding:8px 10px; border-radius:6px; font-size:14px; line-height:1.3; overflow-wrap:anywhere; box-shadow:none; }
 .map-build-button:hover { transform:none; box-shadow:none; }
 .map-build-button:focus-visible,
-.map-build-tab:focus-visible,
 .map-build-field :is(input,select):focus-visible,
 .map-build-toggle input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 .map-build-button.map-build-danger { color:#b04835; background:#fff; border-color:#e7c8c0; }
@@ -50,6 +46,17 @@
 .map-build-drive-section > .map-build-section-heading { margin-top:0; padding-top:0; border-top:0; }
 .map-build-drive-section > h3 { margin:16px 0 10px; font-size:14px; }
 .map-build-drive-section .map-build-number-fields { margin-bottom:16px; }
+.map-chassis-health-reasons { margin:0 0 12px; padding-left:18px; color:var(--muted); line-height:1.6; overflow-wrap:anywhere; }
+.map-chassis-health-reasons li + li { margin-top:4px; }
+#map-chassis-health.is-error { color:var(--danger); background:#fff0ed; }
+#map-chassis-health.is-warning { color:#94601b; background:#fff2db; }
+.map-chassis-pose { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin:0 0 12px; }
+.map-chassis-pose > div { min-width:0; }
+.map-chassis-pose dt { color:var(--muted); }
+.map-chassis-pose dd { display:flex; align-items:baseline; flex-wrap:wrap; gap:4px; margin:4px 0 0; overflow-wrap:anywhere; }
+.map-chassis-pose strong { min-width:0; font-size:15px; font-variant-numeric:tabular-nums; }
+.map-chassis-pose dd > span { color:var(--muted); }
+#map-chassis-pose-status:empty { display:none; }
 .map-build-number-fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
 .map-build-field { display:flex; flex-direction:column; gap:6px; min-width:0; margin:0; color:var(--muted); font-size:14px; }
 .map-build-field :is(input,select) { min-width:0; max-width:100%; min-height:40px; padding:8px; border-radius:6px; color:var(--ink); font-size:15px; }
@@ -81,6 +88,16 @@
 .map-build-toggle { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:14px 0; color:var(--ink); font-size:14px; }
 .map-build-toggle input { width:18px; height:18px; margin:0; padding:0; accent-color:var(--accent); }
 .map-build-footer { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-top:18px; padding-top:14px; border-top:1px solid var(--line); }
+.map-build-upload-progress { margin-top:14px; font-size:14px; }
+.map-build-upload-progress > p { margin:0 0 8px; overflow-wrap:anywhere; }
+.map-build-upload-progress progress { display:block; width:100%; height:6px; margin-bottom:10px; accent-color:var(--accent); }
+.map-build-upload-progress ol { display:grid; gap:8px; margin:0; padding:0; list-style:none; }
+.map-build-upload-progress li { display:flex; align-items:baseline; justify-content:space-between; gap:8px; color:var(--muted); }
+.map-build-upload-progress li > span { min-width:0; overflow-wrap:anywhere; }
+.map-build-upload-progress li > strong { flex:0 0 auto; font-size:13px; font-weight:500; }
+.map-build-upload-progress .is-current { color:var(--accent); font-weight:600; }
+.map-build-upload-progress .is-complete { color:#247346; }
+.map-build-upload-progress .is-failed { color:var(--danger); }
 .map-build-list { margin:0; padding:0; list-style:none; }
 .map-build-list-item { display:flex; align-items:center; gap:8px; padding:11px 0; border-bottom:1px solid #e3ebe5; font-size:14px; }
 .map-build-item-info { flex:1; min-width:0; overflow-wrap:anywhere; }
@@ -107,6 +124,17 @@
 .map-build-dialog-fields input[type=checkbox] { flex:0 0 18px; width:18px; height:18px; margin:0; padding:0; accent-color:var(--accent); }
 .map-build-dialog-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:20px; padding-top:16px; border-top:1px solid var(--line); }
 .map-build-dialog-actions .map-build-button { min-width:78px; }
+.map-health-dialog { width:960px; }
+.map-health-toolbar { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:14px; }
+.map-health-toolbar .map-build-status { flex:1 1 160px; min-width:0; margin:0; }
+.map-health-toolbar .map-build-button { flex:0 0 auto; }
+.map-health-actions { display:flex; flex:0 0 auto; gap:10px; margin-left:auto; }
+.map-health-table-wrap { max-width:100%; overflow:auto; }
+.map-health-table-wrap:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.map-health-table { width:100%; min-width:800px; border-collapse:collapse; font-size:14px; }
+.map-health-table :is(th,td) { padding:10px 12px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; overflow-wrap:anywhere; }
+.map-health-table th { background:#f2f6f3; color:var(--muted); white-space:nowrap; font-weight:600; }
+.map-health-table td:nth-child(2) { min-width:200px; max-width:320px; }
 @container map-build (max-width:260px) {
   .map-build-actions,
   .map-build-number-fields { grid-template-columns:minmax(0,1fr); }

@@ -27,6 +27,14 @@ def _scan() -> dict[str, object]:
     }
 
 
+def _patrol_line(start: dict, end: dict, track_id: int) -> dict:
+    line = {"id": track_id, "start": start, "end": end}
+    line["metadata"] = {
+        "ksq_patrol_edge": "v1:" + json.dumps(api._track_key(line), separators=(",", ":"))
+    }
+    return line
+
+
 class RobotMapImageTests(unittest.TestCase):
     def test_signed_grid_cells_use_official_slamware_palette_and_flip_y(self) -> None:
         cells = bytes([0, 128, 127, 255])
@@ -573,9 +581,13 @@ class RobotMapTelemetryTests(unittest.TestCase):
             if path.endswith("lines/tracks"):
                 if method == "POST":
                     self.assertEqual(len(searched), 2)
-                    tracks.extend(payload)
+                    first_id = max((line["id"] for line in tracks), default=0) + 1
+                    tracks.extend({**line, "id": first_id + i} for i, line in enumerate(payload))
                     return 200, True
                 return 200, tracks.copy()
+            if method == "DELETE" and "/lines/tracks/" in path:
+                tracks[:] = [line for line in tracks if line["id"] != int(path.rsplit("/", 1)[1])]
+                return 200, True
             self.fail(f"Unexpected request {method} {path}")
 
         with (
@@ -595,22 +607,19 @@ class RobotMapTelemetryTests(unittest.TestCase):
             self.assertEqual(result["action_id"], 9)
             self.assertEqual(result["patrol_tracks"], tracks)
             self.assertEqual(tracks[0], existing)
-            self.assertEqual(len(tracks), 4)
+            self.assertEqual(len(tracks), 2)
             self.assertIn(
-                {"start": {"x": 1, "y": 0}, "end": {"x": 2, "y": 0}},
+                _patrol_line({"x": 1, "y": 0}, {"x": 2, "y": 0}, 2),
                 tracks,
             )
-            self.assertNotIn(
-                {"start": {"x": 2, "y": 1}, "end": {"x": 2, "y": 0}},
-                tracks,
-            )
+            self.assertTrue(all(line["start"] != {"x": 2, "y": 1} for line in tracks))
             self.assertEqual(searched, [{"x": 1, "y": 0}, {"x": 2, "y": 0}])
             create_action.assert_called_once_with(
                 "SeriesMoveToAction",
                 {
                     "targets": [{"x": 1.0, "y": 0.0, "z": 0}, {"x": 2.0, "y": 0.0, "z": 0}],
                     "move_options": {
-                        "mode": 2, "flags": [], "acceptable_precision": 0.3,
+                        "mode": 2, "flags": ["with_directed_virtual_track"], "acceptable_precision": 0.3,
                         "speed_ratio": 0.5,
                     },
                 },
@@ -627,7 +636,7 @@ class RobotMapTelemetryTests(unittest.TestCase):
             plan = api.plan_patrol(targets, loop=True, track_priority=True)
             api.series_move_to(targets, speed_mps=0.4, loop=True, plan_id=plan["plan_id"], track_priority=True)
             self.assertIn(
-                {"start": {"x": 2, "y": 0}, "end": {"x": 1, "y": 0}},
+                _patrol_line({"x": 2, "y": 0}, {"x": 1, "y": 0}, 3),
                 tracks,
             )
             self.assertEqual(len(searched), 2)
@@ -642,9 +651,11 @@ class RobotMapTelemetryTests(unittest.TestCase):
                 api.series_move_to(targets[::-1], speed_mps=0.4, plan_id=plan["plan_id"], track_priority=True)
             plan = api.plan_patrol(targets, track_priority=True)
             result = api.series_move_to(targets, speed_mps=0.4, plan_id=plan["plan_id"], track_priority=True)
-            self.assertEqual(len(result["patrol_tracks"]), 4)
+            self.assertEqual(len(result["patrol_tracks"]), 1)
             self.assertEqual(len(searched), 2)
-            self.assertEqual(create_action.call_args.args[1]["move_options"]["mode"], 2)
+            for call in create_action.call_args_list:
+                self.assertEqual(call.args[1]["move_options"]["mode"], 2)
+                self.assertEqual(call.args[1]["move_options"]["flags"], ["with_directed_virtual_track"])
 
     def test_patrol_joins_adjacent_stops_in_order_and_only_closes_when_looping(self) -> None:
         targets = [{"x": 1, "y": 1}, {"x": 3, "y": 1},
@@ -663,7 +674,7 @@ class RobotMapTelemetryTests(unittest.TestCase):
                         return 200, {"path_points": [[0.02, 0], [target["x"], target["y"]]]}
                     if path.endswith("lines/tracks"):
                         if method == "POST":
-                            tracks.extend(payload)
+                            tracks.extend({**line, "id": i + 1} for i, line in enumerate(payload))
                             return 200, True
                         return 200, tracks.copy()
                     self.fail(f"Unexpected request {method} {path}")
@@ -680,9 +691,8 @@ class RobotMapTelemetryTests(unittest.TestCase):
 
                 ordered = targets + [targets[0]] if loop else targets
                 self.assertEqual(tracks, [
-                    {"start": {"x": 0, "y": 0}, "end": {"x": 0.02, "y": 0}},
-                    {"start": {"x": 0.02, "y": 0}, "end": targets[0]},
-                    *({"start": start, "end": end} for start, end in zip(ordered, ordered[1:])),
+                    _patrol_line(start, end, i + 1)
+                    for i, (start, end) in enumerate(zip(ordered, ordered[1:]))
                 ])
                 self.assertEqual(action.call_args.args[1]["targets"], [
                     {**target, "z": 0} for target in targets
@@ -741,7 +751,7 @@ class RobotMapTelemetryTests(unittest.TestCase):
     def test_patrol_requires_matching_plan_and_checks_initial_pose(self) -> None:
         base_url = "http://192.168.5.9:1448"
         targets = [{"x": 1, "y": 0}, {"x": 2, "y": 0}]
-        line = {"start": targets[0], "end": targets[1]}
+        line = {"id": 1, "start": targets[0], "end": targets[1]}
         failures = (
             "missing", "unknown", "reordered", "changed_loop", "premature_suffix",
             "changed_tracks", "changed_mode", "moved", "busy", "stale_connection",
@@ -795,10 +805,14 @@ class RobotMapTelemetryTests(unittest.TestCase):
             if path.endswith("localization/pose"):
                 return 200, pose.copy()
             if path.endswith(":search_path"):
-                return 200, {"path_points": [[pose["x"], pose["y"]], [payload["target"]["x"], 0]]}
+                return 200, {"path_points": [
+                    [pose["x"], pose["y"]], [pose["x"], 0.03], [pose["x"] + 0.02, 0.03],
+                    [pose["x"] + 0.02, 0.1], [payload["target"]["x"], 0],
+                ]}
             if path.endswith("lines/tracks"):
                 if method == "POST":
-                    tracks.extend(payload)
+                    first_id = max((line["id"] for line in tracks), default=0) + 1
+                    tracks.extend({**line, "id": first_id + i} for i, line in enumerate(payload))
                     return 200, True
                 return 200, tracks.copy()
             self.fail(f"Unexpected request {method} {path}")
@@ -810,8 +824,16 @@ class RobotMapTelemetryTests(unittest.TestCase):
             patch.object(api, "_create_action", return_value={"action_id": 9}) as action,
         ):
             first = api.plan_patrol(targets, loop=True, track_priority=True)
+            pose["x"] = 0.05
             second = api.plan_patrol(targets, loop=True, track_priority=True)
             self.assertNotEqual(first["plan_id"], second["plan_id"])
+            self.assertNotEqual(first["patrol_path"], second["patrol_path"])
+            self.assertEqual(tracks, [
+                _patrol_line(targets[0], targets[1], 1),
+                _patrol_line(targets[1], targets[0], 2),
+            ], "Dense entry paths are previews, not permanent track segments")
+            self.assertEqual(sum(call.args[0] == "POST" and call.args[1].endswith("lines/tracks")
+                                 for call in requests.call_args_list), 1)
             action.assert_not_called()
             with self.assertRaisesRegex(ValueError, "先规划"):
                 api.series_move_to(targets, loop=True, plan_id=first["plan_id"], track_priority=True)
@@ -826,6 +848,9 @@ class RobotMapTelemetryTests(unittest.TestCase):
             api.series_move_to(targets[1:], plan_id=second["plan_id"], track_priority=True)
             api.series_move_to(targets, loop=True, plan_id=second["plan_id"], track_priority=True)
             self.assertEqual(action.call_count, 3)
+            for call in action.call_args_list:
+                self.assertEqual(call.args[1]["move_options"]["mode"], 2)
+                self.assertEqual(call.args[1]["move_options"]["flags"], ["with_directed_virtual_track"])
             self.assertTrue(all(call.args[0] == "GET" for call in requests.call_args_list))
             with self.assertRaises(ValueError):
                 api.plan_patrol([])
@@ -851,6 +876,181 @@ class RobotMapTelemetryTests(unittest.TestCase):
                     api.plan_patrol(targets, loop=loop)
                 request.assert_not_called()
                 action.assert_not_called()
+
+    def test_replanning_replaces_only_unchanged_owned_tracks(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        points = [{"x": n, "y": 0} for n in range(1, 5)]
+        manual = {"id": 1, "start": {"x": 8, "y": 0}, "end": {"x": 9, "y": 0}}
+        historical = {"id": 2, "start": {"x": 9, "y": 0}, "end": {"x": 10, "y": 0}}
+        edited_metadata = _patrol_line({"x": 10, "y": 0}, {"x": 11, "y": 0}, 3)
+        edited_metadata["metadata"]["name"] = "manual edit"
+        edited_position = _patrol_line({"x": 11, "y": 0}, {"x": 12, "y": 0}, 4)
+        edited_position["end"] = {"x": 13, "y": 0}
+        preserved = [manual, historical, edited_metadata, edited_position]
+        tracks = preserved.copy()
+        writes = []
+        next_id = 100
+
+        def request(method, path, payload=None, **kwargs):
+            nonlocal next_id
+            self.assertEqual(kwargs["base_url"], base_url)
+            if path.endswith("actions/:current"):
+                return 200, {"state": {"status": 4}}
+            if path.endswith("localization/pose"):
+                return 200, {"x": 0, "y": 0}
+            if path.endswith(":search_path"):
+                return 200, {"path_points": [[0, 0], [payload["target"]["x"], 0]]}
+            if path.endswith("lines/tracks"):
+                if method == "POST":
+                    writes.append((method, [api._track_key(line) for line in payload]))
+                    for line in payload:
+                        tracks.append({**line, "id": next_id})
+                        next_id += 1
+                    return 200, True
+                return 200, tracks.copy()
+            if method == "DELETE" and "/lines/tracks/" in path:
+                track_id = int(path.rsplit("/", 1)[1])
+                writes.append((method, track_id))
+                tracks[:] = [line for line in tracks if line["id"] != track_id]
+                return 200, True
+            self.fail(f"Unexpected request {method} {path}")
+
+        with (
+            patch.dict(api._PATROL_TRACK_PLANS, {}, clear=True),
+            patch.object(api, "_base_url", return_value=base_url),
+            patch.object(api, "_request", side_effect=request),
+            patch.object(api, "_create_action") as action,
+        ):
+            first = api.plan_patrol(points[:3], loop=True, track_priority=True)
+            self.assertEqual(len(tracks), len(preserved) + 3)
+            tracks.append(_patrol_line(points[0], points[1], 30))
+            overlapping_manual = {"id": 31, "start": points[0], "end": points[1]}
+            tracks.append(overlapping_manual)
+            api.plan_patrol(points[:3], loop=True, track_priority=True)
+            self.assertEqual({item[1] for item in writes if item[0] == "DELETE"}, {100, 30})
+            self.assertIn(overlapping_manual, tracks)
+            api.plan_patrol(points[:3], loop=False, track_priority=True)
+            self.assertEqual({item[1] for item in writes if item[0] == "DELETE"}, {100, 30, 102})
+            # Ownership survives a server restart; unrelated or edited tracks do not become owned.
+            api._PATROL_TRACK_PLANS.clear()
+            last = api.plan_patrol([points[0], points[3]], track_priority=True)
+            self.assertEqual(tracks, [*preserved, overlapping_manual, _patrol_line(points[0], points[3], 103)])
+            self.assertEqual(last["patrol_tracks"], tracks)
+            self.assertNotEqual(first["plan_id"], last["plan_id"])
+            self.assertEqual([item[0] for item in writes[-2:]], ["POST", "DELETE"])
+            self.assertEqual(sum(item[0] == "POST" for item in writes), 2)
+            action.assert_not_called()
+
+    def test_patrol_unconfirmed_track_ownership_or_cleanup_never_yields_a_plan(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        points = [{"x": n, "y": 0} for n in range(1, 5)]
+        for failure in ("missing_marker", "wrong_marker", "partial_delete", "delete_readback"):
+            with self.subTest(failure=failure):
+                tracks = [_patrol_line(points[1], points[2], 10), _patrol_line(points[2], points[3], 11)]
+                deleted = []
+
+                def request(method, path, payload=None, **kwargs):
+                    if path.endswith("actions/:current"):
+                        return 200, {"state": {"status": 4}}
+                    if path.endswith("localization/pose"):
+                        return 200, {"x": 0, "y": 0}
+                    if path.endswith(":search_path"):
+                        return 200, {"path_points": [[0, 0], [payload["target"]["x"], 0]]}
+                    if path.endswith("lines/tracks"):
+                        if method == "POST":
+                            for i, line in enumerate(payload):
+                                added = {**line, "id": 20 + i}
+                                if failure == "missing_marker":
+                                    added.pop("metadata")
+                                elif failure == "wrong_marker":
+                                    added["metadata"] = {"ksq_patrol_edge": "v1:wrong"}
+                                tracks.append(added)
+                            return 200, True
+                        return 200, tracks.copy()
+                    if method == "DELETE" and "/lines/tracks/" in path:
+                        track_id = int(path.rsplit("/", 1)[1])
+                        if failure == "partial_delete" and deleted:
+                            return 200, False
+                        deleted.append(track_id)
+                        if failure != "delete_readback":
+                            tracks[:] = [line for line in tracks if line["id"] != track_id]
+                        return 200, True
+                    self.fail(f"Unexpected request {method} {path}")
+
+                with (
+                    patch.dict(api._PATROL_TRACK_PLANS, {base_url: {"plan_id": "old"}}, clear=True),
+                    patch.object(api, "_base_url", return_value=base_url),
+                    patch.object(api, "_request", side_effect=request),
+                    patch.object(api, "_create_action") as action,
+                ):
+                    with self.assertRaises(api.RobotApiError):
+                        api.plan_patrol(points[:2], track_priority=True)
+                    self.assertNotIn(base_url, api._PATROL_TRACK_PLANS)
+                    with self.assertRaisesRegex(ValueError, "先规划"):
+                        api.series_move_to(points[:2], plan_id="old", track_priority=True)
+                    action.assert_not_called()
+                    if failure in ("missing_marker", "wrong_marker"):
+                        self.assertEqual(deleted, [], "Never delete old tracks before confirming ownership of new ones")
+                    elif failure == "partial_delete":
+                        self.assertEqual(deleted, [10])
+
+    def test_patrol_rejects_invalid_or_duplicate_track_ids_on_every_read(self) -> None:
+        base_url = "http://192.168.5.9:1448"
+        points = [{"x": 1, "y": 0}, {"x": 2, "y": 0}]
+        line = _patrol_line(points[0], points[1], 1)
+        invalid = [[{**line, "id": value}] for value in (None, True, -1, 1.5, "1")]
+        invalid.extend([[line, line.copy()], [None]])
+        for stage in ("existing", "added", "deleted", "start"):
+            for malformed in invalid:
+                with self.subTest(stage=stage, malformed=malformed):
+                    added = False
+                    deleted = False
+
+                    def request(method, path, payload=None, **kwargs):
+                        nonlocal added, deleted
+                        if path.endswith("actions/:current"):
+                            return 200, {"state": {"status": 4}}
+                        if path.endswith("localization/pose"):
+                            return 200, {"x": 0, "y": 0}
+                        if path.endswith(":search_path"):
+                            return 200, {"path_points": [[0, 0], [payload["target"]["x"], 0]]}
+                        if method == "DELETE":
+                            self.assertEqual(stage, "deleted")
+                            self.assertTrue(path.endswith("lines/tracks/2"))
+                            deleted = True
+                            return 200, True
+                        if path.endswith("lines/tracks"):
+                            if method == "POST":
+                                self.assertEqual(stage, "added")
+                                added = True
+                                return 200, True
+                            if stage == "deleted" and not deleted:
+                                return 200, [line, _patrol_line(points[1], points[0], 2)]
+                            return 200, [] if stage == "added" and not added else malformed
+                        self.fail(f"Malformed track data must not permit {method} {path}")
+
+                    plan = {
+                        "plan_id": "ready", "targets": ((1, 0), (2, 0)),
+                        "loop": False, "track_priority": True,
+                        "lines": {api._track_key(line)}, "origin": {"x": 0, "y": 0},
+                        "started": False,
+                    }
+                    with (
+                        patch.dict(api._PATROL_TRACK_PLANS, {base_url: plan}, clear=True),
+                        patch.object(api, "_base_url", return_value=base_url),
+                        patch.object(api, "_request", side_effect=request),
+                        patch.object(api, "_create_action") as action,
+                    ):
+                        with self.assertRaises(api.RobotApiError):
+                            if stage == "start":
+                                api.series_move_to(points, plan_id="ready", track_priority=True)
+                            else:
+                                api.plan_patrol(points, track_priority=True)
+                        if stage != "start":
+                            self.assertNotIn(base_url, api._PATROL_TRACK_PLANS)
+                        self.assertEqual(added, stage == "added")
+                        self.assertEqual(deleted, stage == "deleted")
+                        action.assert_not_called()
 
     def test_free_patrol_never_uses_artifact_tracks_and_preserves_mode_on_resume(self) -> None:
         targets = [{"x": 1, "y": 0}, {"x": 2, "y": 0}]
@@ -891,6 +1091,7 @@ class RobotMapTelemetryTests(unittest.TestCase):
             self.assertEqual(action.call_count, 3)
             for call in action.call_args_list:
                 self.assertEqual(call.args[1]["move_options"]["mode"], 0)
+                self.assertEqual(call.args[1]["move_options"]["flags"], [])
             self.assertTrue(all(call.args[0] == "GET" for call in requests.call_args_list))
 
     def test_patrol_mode_requires_a_boolean(self) -> None:

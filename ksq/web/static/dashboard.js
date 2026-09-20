@@ -1160,6 +1160,13 @@
             "日志检测到人工确认播报。确认后将继续流程。";
     }
     if (line) line.textContent = data.await_line || current.await_line || "";
+    // 弹窗在仪表板视图之外也会显示；此时 render() 不一定执行，
+    // 不能沿用上一次轮询留下的禁用状态。
+    updateConfirmUi({
+      needs_confirm: true,
+      status: status,
+      service_running: data.service_running,
+    });
     // 报错弹窗一直保留到人工处理（确认/稍后处理），不自动关闭——
     // 自动关闭会把该提示的指纹同步为已忽略，之后同一报错永不再弹。
   }

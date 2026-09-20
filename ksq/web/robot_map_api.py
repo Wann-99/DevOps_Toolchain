@@ -77,6 +77,7 @@ _POI_CACHE_LOCK = threading.RLock()
 _ROBOT_CONNECTION_LOCK = threading.RLock()
 # Reuse the last generated network across patrol laps and pause/resume.
 _PATROL_TRACK_PLANS: Dict[str, dict] = {}
+_PATROL_TRACK_METADATA_KEY = "ksq_patrol_edge"
 
 
 class RobotApiError(RuntimeError):
@@ -275,6 +276,15 @@ def _request_bytes(
 # System / connectivity
 # --------------------------------------------------------------------------
 
+def _read_current_robot(path: str, expected_base_url: object = None) -> object:
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+    _, body = _request("GET", path, base_url=base_url)
+    with _ROBOT_CONNECTION_LOCK:
+        _require_current_base_url_unlocked(base_url)
+    return body
+
+
 def get_robot_info() -> Dict[str, object]:
     _, body = _request("GET", "/api/core/system/v1/robot/info")
     return body if isinstance(body, dict) else {}
@@ -285,13 +295,46 @@ def get_power_status() -> Dict[str, object]:
     return body if isinstance(body, dict) else {}
 
 
+def get_robot_health(*, expected_base_url: object = None) -> Dict[str, object]:
+    body = _read_current_robot("/api/core/system/v1/robot/health", expected_base_url)
+    if (
+        not isinstance(body, dict)
+        or any(type(body.get(flag)) is not bool for flag in ("hasError", "hasFatal", "hasWarning"))
+        or any(type(value) is not bool for key, value in body.items() if key.startswith("has"))
+        or not isinstance(body.get("baseError"), list)
+        or any(not isinstance(item, dict) for item in body["baseError"])
+    ):
+        raise RobotApiError("机器人返回的健康状态格式异常。", status_code=502)
+    return body
+
+
+def clear_robot_health(
+    *, expected_base_url: object, confirm: object = False
+) -> Dict[str, object]:
+    if confirm is not True:
+        raise ValueError("请确认现场故障已排除后再清除错误。")
+    if not isinstance(expected_base_url, str) or not expected_base_url.strip():
+        raise ValueError("底盘连接信息已过期，请刷新地图后重试。")
+    with _ROBOT_CONNECTION_LOCK:
+        base_url = _require_current_base_url_unlocked(expected_base_url)
+        current = get_robot_health(expected_base_url=base_url)
+        codes = [item.get("errorCode") for item in current["baseError"]]
+        if any(type(code) is not int or code <= 0 for code in codes):
+            raise RobotApiError("机器人返回的健康错误码无效，未清除错误。", status_code=502)
+        # The firmware clears by errorCode, not the table row's id; it has no bulk endpoint.
+        for code in dict.fromkeys(codes):
+            _require_current_base_url_unlocked(base_url)
+            _request("DELETE", f"/api/core/system/v1/robot/health/{code}", base_url=base_url)
+        return get_robot_health(expected_base_url=base_url)
+
+
 # --------------------------------------------------------------------------
 # Localization (live pose) and map image
 # --------------------------------------------------------------------------
 
-def get_current_pose() -> Dict[str, object]:
+def get_current_pose(*, expected_base_url: object = None) -> Dict[str, object]:
     """Live robot pose: {"x", "y", "z", "yaw", "pitch", "roll"} (meters/rad)."""
-    _, body = _request("GET", "/api/core/slam/v1/localization/pose")
+    body = _read_current_robot("/api/core/slam/v1/localization/pose", expected_base_url)
     return body if isinstance(body, dict) else {}
 
 
@@ -964,6 +1007,25 @@ def _track_key(line: object) -> Optional[tuple]:
     return tuple(points)
 
 
+def _patrol_track_metadata(line: dict) -> dict:
+    return {_PATROL_TRACK_METADATA_KEY: "v1:" + json.dumps(_track_key(line), separators=(",", ":"))}
+
+
+def _is_patrol_track(line: object) -> bool:
+    # Leave unmarked legacy tracks and externally edited tracks to explicit deletion.
+    return _track_key(line) is not None and line.get("metadata") == _patrol_track_metadata(line)
+
+
+def _read_patrol_tracks(base_url: str) -> list:
+    _, tracks = _request("GET", "/api/core/artifact/v1/lines/tracks", base_url=base_url)
+    if not isinstance(tracks, list) or any(
+        not isinstance(line, dict) or type(line.get("id")) is not int or line["id"] < 0
+        for line in tracks
+    ) or len({line["id"] for line in tracks}) != len(tracks):
+        raise RobotApiError("底盘虚拟轨道列表或编号无效，请刷新后重试。")
+    return tracks
+
+
 def _search_patrol_entry(targets: List[Dict[str, object]], base_url: str) -> tuple:
     _, raw_pose = _request("GET", "/api/core/slam/v1/localization/pose", base_url=base_url)
     pose = _normalize_pose_payload(raw_pose, required=True)
@@ -1005,14 +1067,11 @@ def _search_patrol_entry(targets: List[Dict[str, object]], base_url: str) -> tup
 
 
 def _prepare_patrol_tracks(
-    targets: List[Dict[str, object]], base_url: str, entry: list, *, loop: bool,
+    targets: List[Dict[str, object]], base_url: str, *, loop: bool,
 ) -> tuple:
-    _, tracks = _request("GET", "/api/core/artifact/v1/lines/tracks", base_url=base_url)
-    if not isinstance(tracks, list):
-        raise RobotApiError("无法读取底盘虚拟轨道，巡逻未启动。")
-    existing = {_track_key(line) for line in tracks} - {None}
-    # Guide segments express POI order; mode 2 still avoids obstacles.
-    points = entry + [{"x": target["x"], "y": target["y"]} for target in targets[1:]]
+    # Only POI edges are permanent. The pose-dependent approach path is a preview,
+    # not another track network to append on every replan.
+    points = [{"x": target["x"], "y": target["y"]} for target in targets]
     if loop and len(targets) > 1:
         points.append({"x": targets[0]["x"], "y": targets[0]["y"]})
     lines = {}
@@ -1020,9 +1079,12 @@ def _prepare_patrol_tracks(
         line = {"start": start, "end": end}
         key = _track_key(line)
         if key[0] != key[1]:
+            line["metadata"] = _patrol_track_metadata(line)
             lines[key] = line
     if not lines:
-        raise RobotApiError("停留点与当前位置重合，无法生成巡逻轨道。")
+        raise ValueError("轨道优先至少需要两个不同位置的停留点；单点导航请取消轨道优先。")
+    tracks = _read_patrol_tracks(base_url)
+    existing = {_track_key(line) for line in tracks} - {None}
     pending = {key: line for key, line in lines.items() if key not in existing}
     if pending:
         _, accepted = _request(
@@ -1031,11 +1093,26 @@ def _prepare_patrol_tracks(
         )
         if accepted is not True:
             raise RobotApiError("底盘未确认生成巡逻轨道，巡逻未启动。")
-        _, tracks = _request("GET", "/api/core/artifact/v1/lines/tracks", base_url=base_url)
-        if not isinstance(tracks, list) or not pending.keys() <= {
-            _track_key(line) for line in tracks
+        tracks = _read_patrol_tracks(base_url)
+        if not pending.keys() <= {
+            _track_key(line) for line in tracks if _is_patrol_track(line)
         }:
-            raise RobotApiError("巡逻轨道校验失败，巡逻未启动。")
+            raise RobotApiError("巡逻轨道及来源标记校验失败，巡逻未启动；请刷新轨道检查。")
+    # Confirm the new edges before removing only our obsolete/duplicate edges.
+    # Manual tracks take precedence when an identical directed edge already exists.
+    seen = {_track_key(line) for line in tracks if not _is_patrol_track(line)}
+    obsolete = []
+    for line in tracks:
+        if _is_patrol_track(line):
+            key = _track_key(line)
+            if key not in lines or key in seen:
+                obsolete.append(line)
+            else:
+                seen.add(key)
+    if obsolete:
+        tracks = delete_tracks(obsolete, expected_base_url=base_url)["patrol_tracks"]
+    if not lines.keys() <= {_track_key(line) for line in tracks}:
+        raise RobotApiError("底盘轨道已变化，请重新规划路线。")
     return tracks, set(lines)
 
 
@@ -1104,11 +1181,7 @@ def delete_tracks(tracks: object, *, expected_base_url: object = None) -> Dict[s
         base_url = _require_current_base_url_unlocked(expected_base_url)
         _require_patrol_idle(base_url)
         path = "/api/core/artifact/v1/lines/tracks"
-        _, current = _request("GET", path, base_url=base_url)
-        if not isinstance(current, list) or any(
-            not isinstance(line, dict) or type(line.get("id")) is not int for line in current
-        ):
-            raise RobotApiError("无法读取底盘虚拟轨道，未执行删除。")
+        current = _read_patrol_tracks(base_url)
         for track_id, track in selected.items():
             matching = [line for line in current if isinstance(line, dict) and line.get("id") == track_id]
             if len(matching) != 1 or any(
@@ -1124,13 +1197,11 @@ def delete_tracks(tracks: object, *, expected_base_url: object = None) -> Dict[s
                 if accepted is not True:
                     raise RobotApiError(f"底盘未确认删除轨道 {track_id}。")
                 deleted_ids.append(track_id)
-            _, remaining = _request("GET", path, base_url=base_url)
-            if not isinstance(remaining, list) or any(
-                not isinstance(line, dict) or type(line.get("id")) is not int
-                or line["id"] in selected for line in remaining
-            ) or not ({line["id"] for line in current} - selected.keys()) <= {
-                line["id"] for line in remaining
-            }:
+            remaining = _read_patrol_tracks(base_url)
+            remaining_ids = {line["id"] for line in remaining}
+            if selected.keys() & remaining_ids or not (
+                {line["id"] for line in current} - selected.keys()
+            ) <= remaining_ids:
                 raise RobotApiError("轨道删除校验失败。")
         except RobotApiError as error:
             raise RobotApiError(f"删除未全部确认（已确认 {len(deleted_ids)} 条），请刷新轨道后重试：{error}") from error
@@ -1161,7 +1232,7 @@ def plan_patrol(
         result = {"plan_id": plan_id, "track_priority": track_priority, "patrol_path": entry}
         if track_priority:
             result["patrol_tracks"], plan["lines"] = _prepare_patrol_tracks(
-                normalized_targets, base_url, entry, loop=loop,
+                normalized_targets, base_url, loop=loop,
             )
         _PATROL_TRACK_PLANS[base_url] = plan
         return result
@@ -1200,8 +1271,8 @@ def series_move_to(
         )
         _require_patrol_idle(base_url)
         if track_priority:
-            _, tracks = _request("GET", "/api/core/artifact/v1/lines/tracks", base_url=base_url)
-            if not isinstance(tracks, list) or not plan["lines"] <= {_track_key(line) for line in tracks}:
+            tracks = _read_patrol_tracks(base_url)
+            if not plan["lines"] <= {_track_key(line) for line in tracks}:
                 _PATROL_TRACK_PLANS.pop(base_url, None)
                 raise RobotApiError("底盘轨道已变化，请重新规划路线。")
         if not plan["started"]:
@@ -1215,8 +1286,10 @@ def series_move_to(
             {
                 "targets": normalized_targets,
                 "move_options": {
+                    # Native priority mode detours and rejoins; the flag enforces
+                    # track direction without disabling obstacle avoidance.
                     "mode": 2 if track_priority else 0,
-                    "flags": [],
+                    "flags": ["with_directed_virtual_track"] if track_priority else [],
                     "acceptable_precision": 0.3,
                     "speed_ratio": resolved_speed_ratio,
                 },

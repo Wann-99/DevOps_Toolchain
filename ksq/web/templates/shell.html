@@ -1013,8 +1013,8 @@
         <aside class="map-control-rail">
           <nav class="map-drawer-tabs" aria-label="地图功能分类">
             <button type="button" class="map-drawer-tab" data-drawer-target="map-connection-card"
-                    aria-controls="map-connection-card" aria-expanded="true" title="底盘连接">
-              <span>底盘连接</span>
+                    aria-controls="map-connection-card" aria-expanded="true" title="机器人">
+              <span>机器人</span>
             </button>
             <button type="button" class="map-drawer-tab" data-drawer-target="map-chassis-card"
                     aria-controls="map-chassis-card" aria-expanded="false" title="底盘操作">
@@ -1035,7 +1035,7 @@
           </nav>
           <details class="card map-control-card map-side-section map-connection-section" id="map-connection-card" open>
             <summary class="map-side-summary">
-              <span class="section-title">底盘连接</span>
+              <span class="section-title">机器人</span>
             </summary>
             <div class="map-side-body">
               <form class="map-connection-form" id="map-connection-form">
@@ -1058,12 +1058,32 @@
               <span class="section-title">底盘操作</span>
             </summary>
             <div class="map-side-body" id="map-chassis-body">
+              <div class="map-status-actions">
+                <button class="secondary" id="map-btn-gohome">回桩充电</button>
+                <button class="secondary" id="map-btn-relocate" title="定位丢失或漂移时，让机器人原地旋转重新确认自己在地图上的位置">重定位</button>
+              </div>
+              <section class="map-chassis-info" aria-label="底盘健康">
+                <div class="map-build-section-heading"><h3>底盘健康</h3><span class="map-build-chip" id="map-chassis-health" role="status" aria-live="polite">未连接</span></div>
+                <ul class="map-chassis-health-reasons" id="map-chassis-health-reasons" hidden></ul>
+                <button type="button" class="map-build-button secondary map-build-wide" id="map-btn-health-details">健康信息</button>
+              </section>
+              <section class="map-chassis-info" aria-label="底盘位姿">
+                <div class="map-build-section-heading"><h3>底盘位姿</h3></div>
+                <dl class="map-chassis-pose">
+                  <div><dt>X</dt><dd><strong id="map-chassis-pose-x">--</strong><span>m</span></dd></div>
+                  <div><dt>Y</dt><dd><strong id="map-chassis-pose-y">--</strong><span>m</span></dd></div>
+                  <div><dt>航向</dt><dd><strong id="map-chassis-pose-yaw">--</strong><span>&deg;</span></dd></div>
+                </dl>
+                <button type="button" class="map-build-button secondary map-build-wide" id="map-btn-get-pose" disabled><span class="map-build-icon map-build-icon-refresh" aria-hidden="true"></span>获取底盘位姿</button>
+                <p class="map-build-status" id="map-chassis-pose-status" role="status" aria-live="polite"></p>
+              </section>
+              <hr class="sep">
               <section class="map-build-drive-section" aria-label="移动控制">
                 <div class="map-build-section-heading"><h3>移动控制</h3><span class="map-build-chip" id="map-build-drive-state">--</span></div>
                 <h3>遥控速度上限</h3>
                 <div class="map-build-number-fields">
-                  <label class="map-build-field" for="map-build-linear-speed"><span>线速度上限</span><span class="map-build-input-unit"><input id="map-build-linear-speed" type="number" inputmode="decimal" min="0.01" max="0.4" step="0.01" value="0.20" required disabled><span>m/s</span></span></label>
-                  <label class="map-build-field" for="map-build-angular-speed"><span>角速度上限</span><span class="map-build-input-unit"><input id="map-build-angular-speed" type="number" inputmode="decimal" min="0.01" max="0.6" step="0.01" value="0.30" required disabled><span>rad/s</span></span></label>
+                  <label class="map-build-field" for="map-build-linear-speed"><span>线速度上限</span><span class="map-build-input-unit"><input id="map-build-linear-speed" type="number" inputmode="decimal" min="0.01" step="0.01" value="0.20" required disabled><span>m/s</span></span></label>
+                  <label class="map-build-field" for="map-build-angular-speed"><span>角速度上限</span><span class="map-build-input-unit"><input id="map-build-angular-speed" type="number" inputmode="decimal" min="0.01" step="0.01" value="0.30" required disabled><span>rad/s</span></span></label>
                 </div>
                 <p class="map-build-safety">遥控无自动避障</p>
                 <p class="map-build-status map-build-teleop-note" id="map-build-teleop-note" role="status" hidden></p>
@@ -1079,11 +1099,6 @@
                 </div>
                 <p class="map-build-status" id="map-build-drive-status" role="status" aria-live="polite" hidden></p>
               </section>
-              <hr class="sep">
-              <div class="map-status-actions">
-                <button class="secondary" id="map-btn-gohome">回桩充电</button>
-                <button class="secondary" id="map-btn-relocate" title="定位丢失或漂移时，让机器人原地旋转重新确认自己在地图上的位置">重定位</button>
-              </div>
             </div>
           </details>
 
@@ -1091,44 +1106,37 @@
             <summary class="map-side-summary"><span class="section-title">建图</span></summary>
             <div class="map-side-body" id="map-build-body">
               <div class="map-build-heading"><h2>建图</h2><span class="map-build-chip" id="map-build-state">--</span></div>
-              <nav class="map-build-tabs" aria-label="建图功能">
-                <button type="button" class="map-build-tab is-selected" data-build-pane="capture" aria-current="page" aria-controls="map-build-pane-capture">采集</button>
-                <button type="button" class="map-build-tab" data-build-pane="maps" aria-controls="map-build-pane-maps">地图</button>
-                <button type="button" class="map-build-tab" data-build-pane="deploy" aria-controls="map-build-pane-deploy">部署</button>
-              </nav>
               <section class="map-build-pane" id="map-build-pane-capture" aria-label="采集">
                 <div class="map-build-identity">
                   <div><span class="map-build-label">当前地图</span><strong data-build-map-name>--</strong></div>
                   <button type="button" class="map-build-button map-build-icon-button" data-build-command="rename" aria-label="重命名地图" title="重命名地图" disabled><span class="map-build-icon map-build-icon-edit" aria-hidden="true"></span></button>
                 </div>
+                <div class="map-build-state-row"><span id="map-build-capture-caption">--</span><span id="map-build-capture-time">--</span></div>
                 <div class="map-build-actions">
                   <button type="button" class="map-build-button secondary" data-build-command="new" disabled>新建地图</button>
-                  <button type="button" class="map-build-button secondary" data-build-command="continue" disabled>继续当前地图</button>
+                  <button type="button" class="map-build-button primary" data-build-command="start" disabled>开始建图</button>
                 </div>
-                <div class="map-build-state-row"><span id="map-build-capture-caption">--</span><span id="map-build-capture-time">--</span></div>
-                <button type="button" class="map-build-button primary map-build-wide" data-build-command="start" disabled>开始建图</button>
                 <div class="map-build-actions">
                   <button type="button" class="map-build-button secondary" data-build-command="pause" disabled>暂停</button>
                   <button type="button" class="map-build-button secondary" data-build-command="finish" disabled>结束建图</button>
                 </div>
                 <label class="map-build-toggle" for="map-build-loop-closure"><span>自动闭环</span><input id="map-build-loop-closure" type="checkbox" role="switch" disabled></label>
                 <div class="map-build-footer"><span class="map-build-muted" id="map-build-save-state">--</span><button type="button" class="map-build-button primary" data-build-command="upload" disabled><span class="map-build-icon map-build-icon-upload" aria-hidden="true"></span>上传到固件</button></div>
+                <div class="map-build-upload-progress" id="map-build-upload-progress" hidden></div>
               </section>
-              <section class="map-build-pane" id="map-build-pane-maps" aria-label="地图" hidden>
-                <div class="map-build-identity"><div><span class="map-build-label">当前地图</span><strong data-build-map-name>--</strong><span class="map-build-muted">STCM</span></div></div>
+              <section class="map-build-pane" id="map-build-pane-maps" aria-label="地图文件与备份">
+                <div class="map-build-section-heading"><h3>地图文件</h3><span class="map-build-muted">STCM</span></div>
                 <div class="map-build-actions">
-                  <button type="button" class="map-build-button primary" data-build-command="upload" disabled><span class="map-build-icon map-build-icon-upload" aria-hidden="true"></span>上传到固件</button>
-                  <button type="button" class="map-build-button secondary" data-build-command="export" disabled><span class="map-build-icon map-build-icon-download" aria-hidden="true"></span>导出 STCM</button>
                   <button type="button" class="map-build-button secondary" data-build-command="import" disabled><span class="map-build-icon map-build-icon-upload" aria-hidden="true"></span>导入地图</button>
-                  <button type="button" class="map-build-button secondary" data-build-command="backup" disabled>创建备份</button>
+                  <button type="button" class="map-build-button secondary" data-build-command="export" disabled><span class="map-build-icon map-build-icon-download" aria-hidden="true"></span>导出 STCM</button>
                 </div>
                 <input id="map-build-import-file" type="file" accept=".stcm" aria-label="导入 STCM 地图" hidden disabled>
-                <div class="map-build-section-heading"><h3>地图备份</h3><span class="map-build-muted" id="map-build-backup-count">--</span></div>
+                <div class="map-build-section-heading"><h3>地图备份</h3><span class="map-build-muted" id="map-build-backup-count">--</span><button type="button" class="map-build-button secondary" data-build-command="backup" disabled>创建备份</button></div>
                 <div class="map-build-list" id="map-build-backup-list" aria-label="地图备份列表"></div>
-                <div class="map-build-danger-zone"><h3>重置地图</h3><button type="button" class="map-build-button map-build-danger map-build-wide" data-build-command="clear" disabled>清空当前地图</button></div>
               </section>
-              <section class="map-build-pane" id="map-build-pane-deploy" aria-label="部署" hidden>
-                <label class="map-build-field" for="map-build-object-type"><span>配置对象</span><select id="map-build-object-type" disabled><option value="poi">停留点</option><option value="dock">充电桩</option><option value="wall">虚拟墙</option><option value="track">虚拟轨道</option><option value="forbidden">禁行区域</option><option value="danger">危险限速区</option><option value="maintenance">运维更新区</option><option value="pose">机器人位姿</option><option value="origin">地图原点</option></select></label>
+              <section class="map-build-pane" id="map-build-pane-deploy" aria-label="部署配置">
+                <div class="map-build-section-heading"><h3>部署配置</h3></div>
+                <label class="map-build-field" for="map-build-object-type"><span>配置对象</span><select id="map-build-object-type" disabled><option value="poi">停留点</option><option value="dock">充电桩</option><option value="wall">虚拟墙</option><option value="track">虚拟轨道</option><option value="forbidden">禁行区域</option><option value="danger">危险区域</option><option value="maintenance">运维区域</option><option value="sensor">传感器禁用区</option></select></label>
                 <div class="map-build-actions">
                   <button type="button" class="map-build-button primary" id="map-build-add-object" disabled><span class="map-build-icon map-build-icon-edit" aria-hidden="true"></span>地图选点</button>
                   <button type="button" class="map-build-button secondary" id="map-build-add-current" disabled>当前位置</button>
@@ -1137,6 +1145,7 @@
                 <div class="map-build-section-heading"><h3 id="map-build-object-list-title">停留点</h3><span class="map-build-muted" id="map-build-object-count">--</span></div>
                 <div class="map-build-list" id="map-build-object-list" aria-label="配置对象列表"></div>
               </section>
+              <div class="map-build-danger-zone"><h3>重置地图</h3><button type="button" class="map-build-button map-build-danger map-build-wide" data-build-command="clear" disabled>清空当前地图</button></div>
               <p class="map-build-status" id="map-build-status" role="status" aria-live="polite" hidden></p>
             </div>
           </details>
@@ -1197,9 +1206,29 @@
           <div class="map-build-dialog-heading"><h2 id="map-build-dialog-title"></h2><button type="button" class="map-build-button map-build-icon-button" id="map-build-dialog-close" aria-label="关闭" title="关闭"><span class="map-build-icon map-build-icon-x" aria-hidden="true"></span></button></div>
           <p class="map-build-muted" id="map-build-dialog-message" hidden></p>
           <div class="map-build-dialog-fields" id="map-build-dialog-fields"></div>
+          <div class="map-build-upload-progress" id="map-build-dialog-progress" hidden></div>
           <p class="map-build-error" id="map-build-dialog-error" role="alert" hidden></p>
           <div class="map-build-dialog-actions"><button type="button" class="map-build-button secondary" id="map-build-dialog-cancel">取消</button><button type="submit" class="map-build-button primary" id="map-build-dialog-confirm" disabled>确定</button></div>
         </form>
+      </dialog>
+      <dialog class="map-build-dialog map-health-dialog" id="map-health-dialog" aria-labelledby="map-health-dialog-title">
+        <div class="map-build-dialog-heading">
+          <h2 id="map-health-dialog-title">底盘健康信息</h2>
+          <button type="button" class="map-build-button map-build-icon-button" id="map-health-close" aria-label="关闭" title="关闭"><span class="map-build-icon map-build-icon-x" aria-hidden="true"></span></button>
+        </div>
+        <div class="map-health-toolbar">
+          <p class="map-build-status" id="map-health-status" role="status" aria-live="polite">未连接</p>
+          <div class="map-health-actions">
+            <button type="button" class="map-build-button secondary" id="map-health-refresh" disabled><span class="map-build-icon map-build-icon-refresh" aria-hidden="true"></span>刷新</button>
+            <button type="button" class="map-build-button secondary" id="map-health-clear" disabled>清除错误</button>
+          </div>
+        </div>
+        <div class="map-health-table-wrap" tabindex="0" role="region" aria-label="底盘健康信息列表">
+          <table class="map-health-table">
+            <thead><tr><th scope="col">ID</th><th scope="col">描述</th><th scope="col">错误码</th><th scope="col">等级</th><th scope="col">部件</th><th scope="col">部件故障</th><th scope="col">错误类型</th><th scope="col">设备 ID</th></tr></thead>
+            <tbody id="map-health-errors"></tbody>
+          </table>
+        </div>
       </dialog>
     </section>
 

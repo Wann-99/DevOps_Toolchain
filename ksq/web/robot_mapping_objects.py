@@ -23,11 +23,13 @@ _PATHS = {
     "forbidden": "/api/core/artifact/v1/rectangle-areas/forbidden_area",
     "danger": "/api/core/artifact/v1/rectangle-areas/dangerous_area",
     "maintenance": "/api/core/artifact/v1/rectangle-areas/maintenance_area",
+    "sensor": "/api/core/artifact/v1/rectangle-areas/sensor_disable_area",
     "pose": "/api/core/slam/v1/localization/pose",
     "origin": "/api/core/slam/v1/maps/origin",
 }
 _LINES = {"wall", "track"}
-_AREAS = {"forbidden", "danger", "maintenance"}
+_AREAS = {"forbidden", "danger", "maintenance", "sensor"}
+_SENSOR_TYPES = {0, 1, 2, 3, 6}  # Slamware SDK 5.1.1 SensorType: TofCliff = 6.
 _MAX_OBJECTS = 10000
 
 
@@ -67,9 +69,29 @@ def _name(value: object) -> str:
 
 def _metadata(raw: dict) -> dict:
     value = raw.get("metadata", {})
+    if value is None:
+        return {}
     if not isinstance(value, dict):
         raise api.RobotApiError("底盘返回的对象元数据格式无效。")
     return deepcopy(value)
+
+
+def _sensor_types(value: object, *, firmware: bool = False) -> list[int]:
+    error = api.RobotApiError if firmware else ValueError
+    message = "底盘返回的传感器类型格式无效。" if firmware else "传感器类型须为不重复的 0、1、2、3、6 整数列表。"
+    if firmware:
+        try:
+            if not isinstance(value, str):
+                raise ValueError
+            value = json.loads(value)
+        except (TypeError, ValueError) as cause:
+            raise error(message) from cause
+    if (not isinstance(value, list)
+            or any(type(item) is not int or item < 0 or (not firmware and item not in _SENSOR_TYPES)
+                   for item in value)
+            or len(value) != len(set(value))):
+        raise error(message)
+    return list(value)
 
 
 def _read(kind: str, base_url: str, *, timeout: float = api._REQUEST_TIMEOUT_SECONDS) -> list[dict]:
@@ -129,6 +151,8 @@ def _normal(kind: str, raw: dict) -> dict:
                 item["speed_mps"] = _number(metadata["max_line_speed"], "speed_mps")
         elif kind == "forbidden":
             item["escape_distance"] = _number(metadata.get("escape_distance", 0), "escape_distance")
+        elif kind == "sensor":
+            item["sensor_types"] = _sensor_types(metadata.get("sensor_type", "[]"), firmware=True)
     return item
 
 
@@ -212,6 +236,11 @@ def _validated(payload: dict, kind: str) -> dict:
         item["escape_distance"] = _number(payload.get("escape_distance", 0), "escape_distance")
         if item["escape_distance"] < 0:
             raise ValueError("禁行区域逃逸距离不能小于零。")
+    if kind == "sensor":
+        if "sensor_types" in payload:
+            item["sensor_types"] = _sensor_types(payload["sensor_types"])
+        if "id" not in item and not item.get("sensor_types"):
+            raise ValueError("请至少选择一种要禁用的传感器。")
     return item
 
 
@@ -236,10 +265,14 @@ def save_object(payload: dict, base_url: str) -> dict:
     metadata = _metadata(existing) if existing is not None else {}
     if existing is not None and kind not in _LINES:
         previous = _normal(kind, existing)
-        for key in ("yaw", "escape_distance", "dangerous_area_type"):
+        for key in ("yaw", "escape_distance", "dangerous_area_type", "sensor_types"):
             if key not in payload and key in previous:
                 item[key] = previous[key]
+        if kind == "sensor" and "sensor_types" in payload:
+            item["sensor_types"].extend(value for value in previous["sensor_types"] if value not in _SENSOR_TYPES)
     metadata["display_name"] = item["name"]
+    if kind == "track":
+        metadata.pop(api._PATROL_TRACK_METADATA_KEY, None)
     if kind in {"poi", "dock"}:
         item["id"] = item.get("id", str(uuid.uuid4()))
         pose = deepcopy(existing.get("pose", {})) if existing is not None else {}
@@ -274,6 +307,10 @@ def save_object(payload: dict, base_url: str) -> dict:
                 raise ValueError("新增危险限速区必须填写 speed_mps。")
         elif kind == "forbidden":
             metadata["escape_distance"] = str(item["escape_distance"])
+        elif kind == "sensor" and (existing is None or "sensor_types" in payload):
+            if not item.get("sensor_types"):
+                raise ValueError("请至少选择一种要禁用的传感器。")
+            metadata["sensor_type"] = json.dumps(item["sensor_types"])
     api._PATROL_TRACK_PLANS.pop(base_url, None)
     if existing is not None:
         if kind in _LINES:
@@ -284,12 +321,17 @@ def save_object(payload: dict, base_url: str) -> dict:
         return {"object": item}
 
     _write("POST", path, [body] if kind in _LINES else body, base_url)
-    current = _read(kind, base_url)
-    old_ids = {_raw_id(raw, kind) for raw in items}
-    added = [raw for raw in current if _raw_id(raw, kind) not in old_ids]
-    if len(added) != 1:
-        raise api.RobotApiError("底盘已接受变更，但新增对象编号尚未确认，请刷新后重试。")
-    return {"object": _normal(kind, added[0])}
+    try:
+        current = _read(kind, base_url)
+        old_ids = {_raw_id(raw, kind) for raw in items}
+        added = [raw for raw in current if _raw_id(raw, kind) not in old_ids]
+        if len(added) != 1:
+            raise api.RobotApiError("新增对象编号尚未确认。")
+        return {"object": _normal(kind, added[0])}
+    except (api.RobotApiError, ValueError) as error:
+        return {"object": None, "warning": (
+            f"底盘已接受新增配置，但回读校验失败：{error} 请刷新配置列表确认，请勿重复保存。"
+        )}
 
 
 def delete_object(payload: dict, base_url: str) -> dict:

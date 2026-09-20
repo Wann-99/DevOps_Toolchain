@@ -973,14 +973,11 @@
         "（" +
         count +
         " 条），仅影响本地测试列表，不会取消外部订单。确定继续？";
-      const confirmed =
-        global.KsqDialog && global.KsqDialog.confirm
-          ? await global.KsqDialog.confirm({
-              title: "确认清空列表",
-              message: message,
-              confirmText: "清空列表",
-            })
-          : global.confirm(message);
+      const confirmed = await global.KsqDialog.confirm({
+        title: "确认清空列表",
+        message: message,
+        confirmText: "清空列表",
+      });
       if (!confirmed) return;
       setStatus("清空" + listLabel + "...");
       const response = await fetch("/api/test-order/clear", {
@@ -1024,14 +1021,11 @@
         "将把选中的 " +
         keys.length +
         " 条记录移回本地待下单列表；不会取消或修改已经创建的外部订单。确定继续？";
-      const confirmed =
-        global.KsqDialog && global.KsqDialog.confirm
-          ? await global.KsqDialog.confirm({
-              title: "恢复到待下单",
-              message: message,
-              confirmText: "恢复",
-            })
-          : global.confirm(message);
+      const confirmed = await global.KsqDialog.confirm({
+        title: "恢复到待下单",
+        message: message,
+        confirmText: "恢复",
+      });
       if (!confirmed) return;
       setStatus("正在恢复到待下单...");
       const response = await fetch("/api/test-order/restore", {
@@ -1078,26 +1072,19 @@
     busy = true;
     try {
       if (existingPendingCount || checkedPendingCount) {
-        const confirmed =
-          global.KsqDialog && global.KsqDialog.confirm
-            ? await global.KsqDialog.confirm({
-                title: "确认重新生成",
-                message:
-                  "将替换当前待下单列表（" +
-                  existingPendingCount +
-                  " 条" +
-                  (checkedPendingCount
-                    ? "，其中已勾选 " + checkedPendingCount + " 条"
-                    : "") +
-                  "）。已下单列表和已经创建的外部订单不受影响。确定继续？",
-                confirmText: "替换并生成",
-                cancelText: "取消",
-              })
-            : global.confirm(
-                "将替换当前待下单列表（" +
-                  existingPendingCount +
-                  " 条），已下单列表和已经创建的外部订单不受影响。确定继续？"
-              );
+        const confirmed = await global.KsqDialog.confirm({
+          title: "确认重新生成",
+          message:
+            "将替换当前待下单列表（" +
+            existingPendingCount +
+            " 条" +
+            (checkedPendingCount
+              ? "，其中已勾选 " + checkedPendingCount + " 条"
+              : "") +
+            "）。已下单列表和已经创建的外部订单不受影响。确定继续？",
+          confirmText: "替换并生成",
+          cancelText: "取消",
+        });
         if (!confirmed) return;
       }
       setStatus("正在生成...");
@@ -1356,32 +1343,23 @@
         checkedPendingCount ||
         checkedOrderedCount
       ) {
-        const confirmed =
-          global.KsqDialog && global.KsqDialog.confirm
-            ? await global.KsqDialog.confirm({
-                title: "确认导入并替换列表",
-                message:
-                  "导入会替换待下单列表（" +
-                  existingPendingCount +
-                  " 条）并清空已下单列表（" +
-                  existingOrderedCount +
-                  " 条）" +
-                  (checkedPendingCount || checkedOrderedCount
-                    ? "，当前勾选 " +
-                      (checkedPendingCount + checkedOrderedCount) +
-                      " 条"
-                    : "") +
-                  "。这只改变本地测试列表，不会取消已经创建的外部订单。确定继续？",
-                confirmText: "替换并导入",
-                cancelText: "取消",
-              })
-            : global.confirm(
-                "导入会替换待下单列表（" +
-                  existingPendingCount +
-                  " 条）并清空已下单列表（" +
-                  existingOrderedCount +
-                  " 条），不会取消已经创建的外部订单。确定继续？"
-              );
+        const confirmed = await global.KsqDialog.confirm({
+          title: "确认导入并替换列表",
+          message:
+            "导入会替换待下单列表（" +
+            existingPendingCount +
+            " 条）并清空已下单列表（" +
+            existingOrderedCount +
+            " 条）" +
+            (checkedPendingCount || checkedOrderedCount
+              ? "，当前勾选 " +
+                (checkedPendingCount + checkedOrderedCount) +
+                " 条"
+              : "") +
+            "。这只改变本地测试列表，不会取消已经创建的外部订单。确定继续？",
+          confirmText: "替换并导入",
+          cancelText: "取消",
+        });
         if (!confirmed || importDialogContext !== importContext) return;
       }
       closeImportDialog();

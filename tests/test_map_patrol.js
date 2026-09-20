@@ -64,7 +64,7 @@ function page() {
     pendingClick: { x: 8, y: 9 }, popover: { hidden: false }, refreshCount: 0,
     alert: (message) => logs.push(message), logEvent: (message) => logs.push(message),
     drawMap() {}, setAction(message) { ctx.actionText = message; }, renderPoiList() {}, refreshPatrolPlan() {},
-    global: { confirm: () => true },
+    global: { KsqDialog: { confirm: async () => true, notice: ({ message }) => logs.push(message) } },
     loadZones: async () => { ctx.refreshCount += 1; },
     W: 1000, H: 800, RES: 0.05,
     mapMeta: { origin_x: 0, origin_y: 0, width: 100, height: 80, resolution: 0.05 },
@@ -182,6 +182,7 @@ async function check() {
   assert(failed.get("map-btn-patrol-start").disabled);
   assert(!failed.get("map-btn-patrol-plan").disabled);
   assert.match(failed.get("map-patrol-status").textContent, /unreachable/);
+  assert.equal(failed.ctx.refreshCount, 1, "Failed planning must re-read saved tracks in case the write partially succeeded");
 
   const track = (id, offset = 0) => ({ id, usage: "tracks", start: { x: offset, y: 0 }, end: { x: 1 + offset, y: 0 } });
   for (const trackPriority of [false, true]) {
@@ -198,6 +199,7 @@ async function check() {
     assert.deepEqual(plain(p.ctx.zones.lines), [{ usage: "virtual_wall" }, track(trackPriority ? 42 : 41)]);
     p.ctx.response = async () => ({ action_id: 10 });
     p.ctx.startPatrol();
+    assert.deepEqual(plain(p.ctx.patrolPath), [], "Starting movement clears the planning preview before any real path has arrived");
     await new Promise(setImmediate);
     assert.equal(p.requests.at(-1).payload.track_priority, trackPriority);
     assert.match(p.ctx.actionText, trackPriority ? /轨道优先/ : /自由导航/);
@@ -233,7 +235,17 @@ async function check() {
     ["moveTo", 0, 80], ["bezierCurveTo", 4, 60, 16, 60, 20, 80],
   ]);
   assert.equal(selected.ctx.trackPath({ ...track(14), start: { x: NaN, y: 0 } }), null);
-  selected.ctx.zones.lines = [curved];
+  const serializedCurve = { ...curved, metadata: {
+    control_point1: JSON.stringify(curved.metadata.control_point1),
+    control_point2: JSON.stringify(curved.metadata.control_point2),
+  } };
+  assert.deepEqual(plain(selected.ctx.trackPath(serializedCurve).commands), plain(selected.ctx.trackPath(curved).commands));
+  assert.equal(typeof serializedCurve.metadata.control_point1, "string", "Rendering must preserve raw metadata for guarded deletion");
+  for (const control of ["broken", "null", "42", '{"x":"1","y":0}', '{"x":1e999,"y":0}', undefined]) {
+    assert.equal(selected.ctx.trackPath({ ...curved, metadata: { ...curved.metadata, control_point1: control } }), null);
+  }
+  for (const metadata of ["broken", 42, [], true]) assert.equal(selected.ctx.trackPath({ ...curved, metadata }), null);
+  selected.ctx.zones.lines = [serializedCurve];
   selected.get("map-track-select-toggle").checked = true;
   selected.ctx.strokeHit = true;
   for (const scale of [0.25, 1, 8]) {
@@ -276,7 +288,7 @@ async function check() {
     p.ctx.zones.lines = [{ usage: "virtual_wall" }, chosen, untouched];
     p.ctx.selectedTracks.set("21", chosen);
     p.requests.length = 0;
-    p.ctx.global.KsqDialog = { confirm: async () => {
+    p.ctx.global.KsqDialog = { notice: ({ message }) => p.logs.push(message), confirm: async () => {
       if (outcome === "stale-confirm") { p.ctx.connectionGeneration++; p.ctx.tracksDeleting = false; }
       return outcome !== "cancel";
     } };
@@ -310,6 +322,31 @@ async function check() {
     p.ctx.apiGet = () => new Promise((resolve, reject) => pending.push({ resolve, reject }));
     vm.runInContext(declaration("loadZones"), p.ctx);
     return pending;
+  }
+  for (const outcome of ["partial write", "failed read", "robot changed"]) {
+    const p = page();
+    const originalZones = { lines: [{ usage: "virtual_wall" }, track(25)] };
+    p.ctx.zones = plain(originalZones);
+    p.ctx.patrolPath = [{ x: 0, y: 0 }, { x: 3, y: 4 }];
+    const pending = pendingZoneLoads(p);
+    p.ctx.response = async () => { throw new Error("planning response lost"); };
+    const planning = p.ctx.planPatrolRoute();
+    await new Promise(setImmediate);
+    assert.equal(pending.length, 1);
+    assert.deepEqual(plain(p.ctx.patrolPath), [], "Failed planning cannot retain its old preview");
+    assert.deepEqual(plain(p.ctx.zones), originalZones, "The UI must not invent deletion of stored tracks after a planning failure");
+    if (outcome === "robot changed") {
+      p.ctx.connectionGeneration++;
+      p.ctx.zones = { lines: [track(99)] };
+    }
+    if (outcome === "failed read") pending[0].reject(new Error("read unavailable"));
+    else pending[0].resolve({ lines: [{ usage: "virtual_wall" }, track(25), track(26)] });
+    await planning;
+    const expected = outcome === "partial write" ? { lines: [{ usage: "virtual_wall" }, track(25), track(26)] }
+      : outcome === "robot changed" ? { lines: [track(99)] } : originalZones;
+    assert.deepEqual(plain(p.ctx.zones), expected);
+    assert.equal(p.ctx.patrolRoutePlan, null);
+    assert(p.get("map-btn-patrol-start").disabled);
   }
   for (const operation of ["plan", "delete"]) {
     const p = page();
@@ -376,7 +413,44 @@ async function check() {
   saved.get("map-btn-poi-cancel").onclick();
   await submit();
   assert.equal(saved.requests.length, 2);
-  console.log("map patrol: modes, planning, track selection/deletion, stale responses and point dialog passed");
+  await checkLivePatrolPath();
+  console.log("map patrol: modes, planning, track selection/deletion, live paths, stale responses and point dialog passed");
+}
+
+async function checkLivePatrolPath() {
+  const actualPath = [{ x: 3, y: 4 }, { x: 3, y: 2 }, { x: 1, y: 2 }];
+  for (const outcome of ["success", "empty", "null", "path failure", "milestone failure", "robot changed", "action changed", "paused"]) {
+    const p = page(), reads = [];
+    p.ctx.patrolRunning = true;
+    p.ctx.currentActionId = 9;
+    p.ctx.patrolPlanRequestInFlight = false;
+    p.ctx.lastPatrolPlanRefreshAt = 0;
+    p.ctx.patrolPath = [{ x: 0, y: 0 }, { x: 1, y: 2 }];
+    const savedTracks = p.ctx.zones.lines;
+    p.ctx.pinnedRobotReadPath = (url) => url;
+    p.ctx.apiGet = (url) => new Promise((resolve, reject) => reads.push({ url, resolve, reject }));
+    vm.runInContext(declaration("refreshPatrolPlan"), p.ctx);
+    const refreshing = p.ctx.refreshPatrolPlan(9, 2, 0);
+    await p.ctx.refreshPatrolPlan(9, 2, 0);
+    assert.equal(reads.length, 2, "Only one paired path/milestone read may be in flight");
+    if (outcome === "robot changed") p.ctx.connectionGeneration++;
+    if (outcome === "action changed") p.ctx.currentActionId = 10;
+    if (outcome === "paused") p.ctx.patrolPaused = true;
+    const stale = ["robot changed", "action changed", "paused"].includes(outcome);
+    if (stale) p.ctx.patrolPath = [{ x: 7, y: 8 }, { x: 9, y: 10 }];
+    const retained = plain(p.ctx.patrolPath);
+    const pathRead = reads.find((read) => read.url === "/api/map/path");
+    if (outcome === "path failure") pathRead.reject(new Error("path unavailable"));
+    else pathRead.resolve(outcome === "null" ? null : { path_points: outcome === "empty" ? [] : actualPath });
+    const milestones = reads.find((read) => read.url === "/api/map/milestones");
+    if (outcome === "milestone failure") milestones.reject(new Error("milestones unavailable"));
+    else milestones.resolve({ path_points: [{ x: 1, y: 2 }] });
+    await refreshing;
+    assert.deepEqual(plain(p.ctx.patrolPath), stale ? retained : ["empty", "null", "path failure"].includes(outcome) ? [] : actualPath,
+      `${outcome}: only a current successful path may be displayed as the live route`);
+    assert.equal(p.ctx.zones.lines, savedTracks, "Live path failures must preserve all saved tracks");
+    assert.equal(p.ctx.patrolPlanRequestInFlight, false);
+  }
 }
 
 check().catch((error) => { console.error(error); process.exitCode = 1; });

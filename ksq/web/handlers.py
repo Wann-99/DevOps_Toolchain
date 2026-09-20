@@ -663,13 +663,17 @@ class QueryHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(HTTPStatus.OK, {"status": status, "data": data})
             return
-        if path in ("/api/map/mapping", "/api/map/mapping/objects", "/api/map/mapping/export"):
+        if path in ("/api/map/mapping", "/api/map/mapping/objects", "/api/map/mapping/export", "/api/map/mapping/upload-progress"):
             try:
                 query = parse_qs(urlparse(self.path).query)
                 expected = _expected_robot_base_url({
                     "expected_robot_base_url": query.get("expected_robot_base_url", [""])[0]
                 })
-                if path == "/api/map/mapping":
+                if path.endswith("/upload-progress"):
+                    self._send_json(HTTPStatus.OK, robot_mapping_api.get_upload_progress(
+                        expected, query.get("upload_id", [None])[0],
+                    ))
+                elif path == "/api/map/mapping":
                     self._send_json(HTTPStatus.OK, robot_mapping_api.get_status(expected))
                 elif path.endswith("/objects"):
                     with robot_map_api._ROBOT_CONNECTION_LOCK:
@@ -745,11 +749,27 @@ class QueryHandler(BaseHTTPRequestHandler):
             except RobotApiError as error:
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
             return
-        if path == "/api/map/pose":
+        if path in ("/api/map/pose", "/api/map/health"):
+            query = parse_qs(parsed.query)
+            expected_base_url = (query.get("expected_robot_base_url") or [None])[0]
+            reader = (
+                robot_map_api.get_current_pose
+                if path == "/api/map/pose"
+                else robot_map_api.get_robot_health
+            )
             try:
-                self._send_json(HTTPStatus.OK, robot_map_api.get_current_pose())
+                self._send_json(
+                    HTTPStatus.OK, reader(expected_base_url=expected_base_url)
+                )
+            except ValueError as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             except RobotApiError as error:
-                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+                self._send_json(
+                    HTTPStatus(error.status_code)
+                    if 400 <= error.status_code < 600
+                    else HTTPStatus.BAD_GATEWAY,
+                    {"error": str(error)},
+                )
             return
         if path == "/api/map/home-pose":
             try:
@@ -1019,6 +1039,9 @@ class QueryHandler(BaseHTTPRequestHandler):
         if path == "/api/dashboard/order" and session.get("role") != auth.ROLE_ADMIN:
             _drain_request_body(self)
             self._require_admin(session)
+            return
+        if path == "/api/map/health/clear" and not self._require_admin(session):
+            _drain_request_body(self)
             return
         # 普通用户仅拦截少数编辑类端点，其余操作一律放行。
         if (
@@ -1641,6 +1664,22 @@ class QueryHandler(BaseHTTPRequestHandler):
                         HTTPStatus(error.status_code),
                         {"error": str(error)},
                     )
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path == "/api/map/health/clear":
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                    _drain_request_body(self)
+                    self._send_json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "请求必须使用 application/json。"})
+                    return
+                payload = read_json_body(self)
+                try:
+                    result = robot_map_api.clear_robot_health(
+                        expected_base_url=_expected_robot_base_url(payload),
+                        confirm=payload.get("confirm"),
+                    )
+                except RobotApiError as error:
+                    self._send_json(HTTPStatus(error.status_code), {"error": str(error)})
                     return
                 self._send_json(HTTPStatus.OK, result)
                 return

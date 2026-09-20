@@ -1624,6 +1624,20 @@ table.data-table { width:max-content; min-width:100%; border-collapse:collapse; 
   animation: dash-fade .16s ease;
 }
 .ksq-dialog[hidden] { display: none !important; }
+dialog.ksq-dialog {
+  margin: 0;
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  max-height: none;
+  border: 0;
+  box-sizing: border-box;
+  color: var(--ink);
+  overflow: hidden;
+}
+dialog.ksq-dialog:not([open]) { display: none; }
+dialog.ksq-dialog::backdrop { background: transparent; }
+dialog.ksq-dialog > .ksq-dialog-panel { max-height: 100%; overflow: auto; }
 .ksq-dialog-panel {
   width: min(520px, 100%);
   background: var(--card);
@@ -2525,7 +2539,8 @@ body.map-columns-resizing { cursor:col-resize !important; }
     display:none;
   }
   .map-control-rail > .map-side-section[open] > .map-side-body {
-    flex:1 1 auto;
+    position:absolute;
+    inset:14px 16px;
     min-height:0;
     padding-top:0;
     overflow:auto;

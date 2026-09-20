@@ -15,15 +15,17 @@
   let detailsNode = null;
   let pending = null;
   let mode = "confirm";
+  let previousFocus = null;
 
   function ensureDom() {
     if (root) return root;
-    root = document.createElement("div");
+    root = document.createElement("dialog");
     root.id = "ksq-dialog";
     root.className = "ksq-dialog";
+    root.setAttribute("aria-labelledby", "ksq-dialog-title");
     root.hidden = true;
     root.innerHTML =
-      '<div class="ksq-dialog-panel" role="dialog" aria-modal="true" aria-labelledby="ksq-dialog-title">' +
+      '<div class="ksq-dialog-panel">' +
       '<h2 id="ksq-dialog-title"></h2>' +
       '<p class="ksq-dialog-body meta" id="ksq-dialog-body"></p>' +
       '<p class="ksq-dialog-meta" id="ksq-dialog-meta" hidden></p>' +
@@ -75,10 +77,14 @@
         close(true);
       }
     });
-    document.addEventListener("keydown", (event) => {
-      if (!root || root.hidden) return;
+    root.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      close(false);
+    });
+    root.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
         event.preventDefault();
+        event.stopPropagation();
         close(false);
       }
     });
@@ -100,7 +106,20 @@
             : String(inputNode.value || "")
           : null
         : !!accepted;
-    if (root) root.hidden = true;
+    root.close();
+    root.hidden = true;
+    const lowerDialog = Array.from(document.querySelectorAll("dialog[open]")).pop();
+    const available = (node) => node && node.isConnected && !node.matches(":disabled") && node.getClientRects().length;
+    const canRestore = available(previousFocus) && (!lowerDialog || lowerDialog.contains(previousFocus));
+    if (canRestore) previousFocus.focus();
+    if (!canRestore || document.activeElement !== previousFocus || root.contains(document.activeElement)) {
+      const target = lowerDialog && Array.from(lowerDialog.querySelectorAll(
+        'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])'
+      )).find(available);
+      if (target || lowerDialog) (target || lowerDialog).focus();
+      else if (root.contains(document.activeElement)) document.activeElement.blur();
+    }
+    previousFocus = null;
     resolver(value);
   }
 
@@ -111,10 +130,10 @@
       const previous = pending;
       pending = null;
       previous(mode === "prompt" ? null : false);
-    }
+    } else previousFocus = document.activeElement;
     mode = nextMode;
     panelNode.classList.toggle("is-error", opts.tone === "error");
-    panelNode.setAttribute("role", opts.tone === "error" ? "alertdialog" : "dialog");
+    root.setAttribute("role", opts.tone === "error" ? "alertdialog" : "dialog");
     titleNode.textContent =
       opts.title != null ? String(opts.title) : nextMode === "prompt" ? "请输入" : "请确认";
     titleNode.setAttribute("aria-label", titleNode.textContent);
@@ -167,13 +186,15 @@
       extraWrap.hidden = true;
       extraInputNode.value = "";
     }
-    root.hidden = false;
-    global.requestAnimationFrame(() => {
-      if (nextMode === "prompt") inputNode.focus();
-      else confirmButton.focus();
-    });
     return new Promise((resolve) => {
       pending = resolve;
+      root.hidden = false;
+      if (!root.open) root.showModal();
+      global.requestAnimationFrame(() => {
+        if (pending !== resolve) return;
+        if (nextMode === "prompt") inputNode.focus();
+        else confirmButton.focus();
+      });
     });
   }
 
