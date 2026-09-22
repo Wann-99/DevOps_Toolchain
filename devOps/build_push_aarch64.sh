@@ -12,7 +12,7 @@ APP_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PLATFORM="linux/arm64"
 DOCKER_REGISTRY="${DOCKER_REGISTRY:-hub.noematrix.cn}"
 IMAGE_NAME="${IMAGE_NAME:-hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime}"
-TAG="${1:-v1.1.0}"
+TAG="${1:-v1.2.0}"
 FULL_IMAGE="${IMAGE_NAME}:${TAG}"
 
 log()  { echo -e "\n\033[32m════════ $* ════════\033[0m"; }

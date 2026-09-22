@@ -23,6 +23,8 @@ body.app-body { min-height:100vh; }
 .sidebar-nav .nav-item.active { background:var(--accent); border-color:var(--accent); color:#fff; }
 .app-content { padding:28px 24px 48px; min-width:0; position:relative; min-height:calc(100vh - 0px); }
 .app-content .view > h1 { margin-bottom:16px; }
+.arm-toolbar { justify-content:flex-end; margin-bottom:12px; }
+#arm-frame { display:block; width:100%; height:calc(100vh - 190px); min-height:540px; border:1px solid var(--line); border-radius:12px; background:#fff; }
 .app-boot {
   position:absolute;
   inset:0;
@@ -271,6 +273,7 @@ button.danger:hover { background:#991b12; border-color:#991b12; }
 .panel { display:none; } .panel.active { display:block; }
 .path-fields,.upload-grid { display:grid; gap:12px; margin-bottom:14px; }
 .path-field { display:grid; gap:6px; } .path-field span { color:var(--muted); font-size:.92rem; }
+.path-field [data-source-path] { font-size:.8rem; overflow-wrap:anywhere; }
 .path-field input { background:#fbfffd; }
 .path-field input:disabled { background:#eef2f0; color:var(--muted); cursor:not-allowed; }
 /* 密钥输入框 + 右侧眼睛切换：按钮叠在框内右端，不影响输入框宽度。 */
@@ -1845,6 +1848,7 @@ body.sidebar-no-anim * { transition:none !important; }
 /* 普通用户：编辑类控件置灰并阻止点击 */
 .viewer-banner { padding:8px 12px; border:1px solid #f0c36d; background:#fdf6e3; border-radius:10px; color:#8a6116; }
 body.role-viewer [data-admin-only] { opacity:.55; pointer-events:none; cursor:not-allowed; }
+body.role-viewer #view-settings :is(input, select, textarea)[data-admin-only] { opacity:1; color:var(--ink); }
 /* viewer 下导入文件区整体置灰（原生 input 仅 data-admin-only，外层标签也需视觉禁用） */
 body.role-viewer #import-form .file-pick { opacity:.55; cursor:not-allowed; }
 body.role-viewer #import-form .file-pick:hover { border-color:#b9cdc5; box-shadow:none; }
@@ -2629,6 +2633,46 @@ hr.sep { border:0; border-top:1px solid var(--line); margin:14px 0; }
   .map-live-spacer { display:none; }
   .map-live-stats { width:100%; justify-content:flex-start; margin:2px 0 0; padding:5px 0 0; border-top:1px solid var(--line); border-left:0; }
   .map-telemetry-status, .map-telemetry-meta { font-size:.68rem; }
+}
+
+/* 日志与机械臂填满可视高度，仅内容区域滚动。 */
+body:has(:is(#view-logs, #view-arm):not([hidden])) {
+  height:100vh;
+  height:100dvh;
+  min-height:0;
+  overflow:hidden;
+}
+body:has(:is(#view-logs, #view-arm):not([hidden])) .app-shell {
+  height:100%;
+  min-height:0;
+  grid-template-rows:minmax(0, 1fr);
+}
+body:has(:is(#view-logs, #view-arm):not([hidden])) .sidebar {
+  min-height:0;
+  max-height:100%;
+  overflow-y:auto;
+}
+body:has(:is(#view-logs, #view-arm):not([hidden])) .app-content {
+  display:flex;
+  flex-direction:column;
+  min-height:0;
+  padding-bottom:16px;
+}
+body:has(:is(#view-logs, #view-arm):not([hidden])) .topbar,
+#view-arm .arm-toolbar, #view-logs .log-toolbar,
+#view-logs #log-status, #view-logs .term-titlebar { flex-shrink:0; }
+#view-arm, #view-logs, #view-logs > .card, #view-logs .term-window {
+  display:flex;
+  flex-direction:column;
+  flex:1;
+  min-height:0;
+}
+#view-logs > .card { margin-bottom:0; }
+#arm-frame, #view-logs .log-box { flex:1; height:0; min-height:0; }
+@media (max-width:900px) {
+  body:has(:is(#view-logs, #view-arm):not([hidden])) .app-shell {
+    grid-template-rows:auto minmax(0, 1fr);
+  }
 }
 
 /* 地图工作区：桌面固定在可视高度，内部列表/抽屉自行承载溢出。 */

@@ -2,22 +2,23 @@
 
 from __future__ import annotations
 
-import cgi
+from dataclasses import replace
+from pathlib import Path
+from typing import Dict, FrozenSet, List, Optional, Tuple
 import shutil
 import tempfile
 import time
 import urllib.error
 import urllib.request
-from dataclasses import replace
-from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional, Tuple
 
 from ksq.bundle import extract_bundle_from_zip
 from ksq.constants import DEFAULT_ETM_BASE_URL, RUNTIME_UPLOAD_DIRECTORY
+from ksq.data import progress as load_progress
+from ksq.data import state as state
+from ksq.data import storage as data_storage
 from ksq.dataset import build_dataset
 from ksq.models import BundlePaths, Dataset
-from ksq.side_data import load_closed_loop_ids, load_tool_mapping, load_unavailable_ids
-from ksq.web import data_storage, load_progress, state
+from ksq.side_data import load_closed_loop_ids, load_tool_mapping, load_unavailable_ids, unavailable_ids_from_config
 
 
 CLOUD_SHELVES_URL = DEFAULT_ETM_BASE_URL + "/api/v1/sku/locations"
@@ -173,14 +174,14 @@ def load_optional_side_data(
     return tool_mapping, closed_loop_ids, unavailable_ids
 
 
-def get_uploaded_files(form: cgi.FieldStorage, field_name: str) -> List[cgi.FieldStorage]:
+def get_uploaded_files(form, field_name: str):
     if field_name not in form:
         return []
     fields = form[field_name]
     return fields if isinstance(fields, list) else [fields]
 
 
-def save_uploaded_file(uploaded: cgi.FieldStorage, destination: Path) -> None:
+def save_uploaded_file(uploaded, destination: Path) -> None:
     if uploaded.filename is None or uploaded.file is None:
         raise ValueError(f"上传文件无效：{destination.name}")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -214,15 +215,32 @@ def install_staged_dataset(
     The caller holds DATASET_LOCK so readers cannot observe the rename window.
     Configured paths remain source paths; loaded_paths always describes data/current.
     """
-    from ksq.web import edit_workspace
+    from ksq.data import workspace as edit_workspace
 
     started = time.perf_counter()
     load_progress.update("parse", "解析 Knowledge 和库位表")
     dataset = build_dataset(bundle.knowledge_directory, bundle.shelves_file)
+    # Only remove unused files from our private copy, never the source directory.
+    bundle.knowledge_directory.resolve().relative_to(staging.resolve())
+    for name in dataset.report.ignored_knowledge_files:
+        ignored = bundle.knowledge_directory / name
+        if ignored.is_file():
+            ignored.unlink()
+    dataset = replace(dataset, report=replace(
+        dataset.report,
+        ignored_knowledge_files=tuple(dict.fromkeys(
+            (*bundle.ignored_knowledge_files, *dataset.report.ignored_knowledge_files)
+        )),
+    ))
     load_progress.update("validate", "校验工具、不可处理和闭环吸取配置")
     tool_mapping, closed_loop_ids, unavailable_ids = load_optional_side_data(
         bundle.unavailable_file, bundle.tool_mapping_file, bundle.pick_strategy_file,
     )
+    if method == "paths":
+        unavailable_ids = list(dict.fromkeys([
+            *unavailable_ids,
+            *sorted(unavailable_ids_from_config(state.configured_config_pnp, dataset.shelf_entries)),
+        ]))
     previous = {name: getattr(state, name) for name in (
         "loaded_dataset", "loaded_tool_mapping", "loaded_closed_loop_ids",
         "loaded_unavailable_ids", "loaded_paths", "data_source_ready",
@@ -239,7 +257,8 @@ def install_staged_dataset(
             state.loaded_tool_mapping = tool_mapping
             state.loaded_closed_loop_ids = closed_loop_ids
             state.loaded_unavailable_ids = (
-                frozenset(unavailable_ids) if bundle.unavailable_file is not None else None
+                frozenset(unavailable_ids)
+                if bundle.unavailable_file is not None or unavailable_ids else None
             )
             state.data_source_ready = True
             state.data_load_method = method
@@ -275,6 +294,9 @@ def load_bundle_paths(
                 "copy", f"复制加载文件 {done}/{total}", done, total,
             ),
         )
+        copied = replace(copied, ignored_knowledge_files=(
+            *bundle.ignored_knowledge_files, *copied.ignored_knowledge_files,
+        ))
         if shelves_source == "cloud":
             downloaded.unlink()
         dataset, tools, closed, unavailable, _elapsed = install_staged_dataset(
@@ -328,7 +350,7 @@ def apply_configured_paths_reload(
 
 
 def load_uploaded_zip(
-    form: cgi.FieldStorage,
+    form,
 ) -> Tuple[
     Dataset,
     Optional[Dict[str, str]],

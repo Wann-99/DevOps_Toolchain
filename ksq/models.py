@@ -14,6 +14,7 @@ class BundlePaths:
     unavailable_file: Path | None
     tool_mapping_file: Path | None
     pick_strategy_file: Path | None
+    ignored_knowledge_files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class ShelfEntry:
     baffle_height: str
     out_item_id: str
     sku_code: str = ""
+    customer_location_code: str = ""
 
 
 class ShelfParseResult(NamedTuple):

@@ -3,7 +3,23 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Collection
 from pathlib import Path
+
+from ksq.naming import is_auxiliary_knowledge_file
+
+
+def is_knowledge_record(
+    payload: object, source_name: str, expected_ids: Collection[str] = (),
+) -> bool:
+    """Recognize records before validating them; retain damaged SKU records."""
+    if Path(source_name).stem in expected_ids:
+        return True
+    # Size/weight alone also describe fixtures, so use product-specific fields.
+    return isinstance(payload, dict) and not payload.keys().isdisjoint({
+        "id", "sku_id", "sku_code", "商品条码", "商品编码", "药品名称",
+        "包装类型", "是否有商品码", "是否有溯源码", "条码位置", "溯源码位置",
+    })
 
 
 def normalize_item_id(raw_id: object, source: str) -> str:
@@ -26,7 +42,7 @@ def is_knowledge_json_filename(file_name: str) -> bool:
     if not name or name.startswith("."):
         return False
     lower = name.lower()
-    if not lower.endswith(".json"):
+    if not lower.endswith(".json") or is_auxiliary_knowledge_file(name):
         return False
     if ".bak" in lower:
         return False
@@ -113,6 +129,7 @@ def load_knowledge_from_mapping(
 
 def load_knowledge_records(
     knowledge_directory: Path,
+    *, expected_ids: Collection[str] = (),
 ) -> tuple[
     list[dict[str, object]], int, list[str], list[str], list[str], list[str]
 ]:
@@ -126,6 +143,9 @@ def load_knowledge_records(
             raise ValueError(f"JSON 文件编码错误：{knowledge_file}") from error
         except json.JSONDecodeError as error:
             raise ValueError(f"JSON 文件格式错误：{knowledge_file}") from error
+        if not is_knowledge_record(knowledge, knowledge_file.name, expected_ids):
+            ignored_files.append(knowledge_file.name)
+            continue
         if not isinstance(knowledge, dict):
             raise ValueError(f"JSON 根节点必须是对象：{knowledge_file}")
         payloads.append((knowledge_file.name, knowledge))
@@ -133,7 +153,7 @@ def load_knowledge_records(
     records, duplicates, mismatches, conflicts = load_knowledge_from_mapping(payloads)
     return (
         records,
-        len(knowledge_files),
+        len(payloads),
         duplicates,
         mismatches,
         conflicts,

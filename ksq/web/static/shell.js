@@ -7,6 +7,7 @@
     "order-ops",
     "test-order",
     "map",
+    "arm",
     "logs",
     "files",
     "settings",
@@ -36,6 +37,7 @@
       subtitle: "按比例生成测试 SKU 清单并提交测试订单",
     },
     map: { title: "地图导航", subtitle: "实时地图与底盘控制" },
+    arm: { title: "机械臂", subtitle: "机械臂示教器" },
     logs: { title: "日志查询", subtitle: "查看机器人相关服务的运行日志与状态" },
     files: { title: "文件管理", subtitle: "" },
     settings: {
@@ -59,6 +61,10 @@
       if (section) section.hidden = view !== name;
     });
     updateTopbar(name);
+    if (name === "arm") {
+      const frame = document.getElementById("arm-frame");
+      if (frame && !frame.getAttribute("src")) frame.src = "/arm/";
+    }
     document.querySelectorAll(".sidebar-nav .nav-item").forEach((button) => {
       const active =
         button.dataset.view === name ||
@@ -105,6 +111,11 @@
     button.addEventListener("click", () => {
       showView(button.dataset.gotoView);
     });
+  });
+
+  const armRefresh = document.getElementById("arm-refresh");
+  if (armRefresh) armRefresh.addEventListener("click", () => {
+    document.getElementById("arm-frame").src = "/arm/";
   });
 
   // 侧边栏折叠：展开为图标+文字，折叠为纯图标窄栏，状态本地持久化

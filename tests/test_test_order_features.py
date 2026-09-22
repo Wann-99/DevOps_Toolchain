@@ -11,7 +11,8 @@ from ksq.test_order_select import (
     parse_import_csv_full,
     public_item,
 )
-from ksq.web import logs_api, test_order_api
+from ksq.robot import logs as logs_api
+from ksq.order import test_service as test_order_api
 
 
 def candidate(out_id: str, location: str, barcode: str) -> dict[str, str]:

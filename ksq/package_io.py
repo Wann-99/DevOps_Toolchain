@@ -25,6 +25,7 @@ def save_package(dataset: Dataset, package_file: Path) -> None:
                     "baffle_height": entry.baffle_height,
                     "out_item_id": entry.out_item_id,
                     "sku_code": entry.sku_code,
+                    "customer_location_code": entry.customer_location_code,
                 }
                 for entry in entries
             ]
@@ -116,6 +117,9 @@ def load_package(package_file: Path) -> Dataset:
                             baffle_height=baffle_height,
                             out_item_id=out_item_id,
                             sku_code=sku_code,
+                            customer_location_code=str(
+                                item.get("customer_location_code") or ""
+                            ).strip(),
                         )
                     )
                 else:

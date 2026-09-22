@@ -8,14 +8,9 @@ from typing import Dict, FrozenSet, Optional
 
 from ksq import config_pnp
 from ksq import vfm_app
-from ksq.constants import (
-    DEFAULT_KNOWLEDGE,
-    DEFAULT_PICK_STRATEGY,
-    DEFAULT_SHELVES,
-    DEFAULT_TOOL_MAPPING,
-    DEFAULT_UNAVAILABLE,
-)
+from ksq.constants import DEFAULT_KNOWLEDGE, DEFAULT_PICK_STRATEGY, DEFAULT_SHELVES, DEFAULT_TOOL_MAPPING, DEFAULT_UNAVAILABLE
 from ksq.models import Dataset
+
 
 DATASET_LOCK = Lock()
 loaded_dataset: Optional[Dataset] = None
@@ -24,9 +19,6 @@ loaded_closed_loop_ids: Optional[FrozenSet[str]] = None
 loaded_unavailable_ids: Optional[FrozenSet[str]] = None
 loaded_paths: Dict[str, Optional[Path]] = {}
 edit_workspace: Optional[Dict[str, object]] = None
-order_access_token: Optional[str] = None
-order_access_token_key: str = ""
-order_access_tokens: Dict[str, str] = {}
 configured_knowledge: Path = DEFAULT_KNOWLEDGE
 # Optional root used to resolve/display source Knowledge paths. Runtime readers
 # use loaded_paths after the source files have been copied into data/current.

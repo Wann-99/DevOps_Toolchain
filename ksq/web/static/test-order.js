@@ -147,8 +147,12 @@
         order_source: orderSource,
         items: safeItems,
         source: "test-order",
-        queue_position: 0,
-        queued: false,
+        queue_position: session.queued
+          ? Number.isInteger(session.queue_position) && session.queue_position > 0
+            ? session.queue_position
+            : 1
+          : 0,
+        queued: Boolean(session.queued),
       },
     };
   }
@@ -1441,6 +1445,7 @@
       sku_id: item.sku_id || "",
       item_id: global.KsqItemIdentity.pickItemId(item),
       location_code: item.location_code,
+      customer_location_code: item.customer_location_code || "",
       barcode: item.sku_code,
       name: item.name,
       quantity: 1,
@@ -1578,6 +1583,9 @@
   }
 
   function openDashboardAfterOrder(data, items) {
+    if (data.order_session && data.order_session.queued) {
+      setStatus("下单成功，已排队；仪表板继续显示当前单。");
+    }
     if (global.KsqDashboard && global.KsqDashboard.openAfterOrder) {
       const requestBody = data.request_body || {};
       global.KsqDashboard.openAfterOrder(

@@ -4,7 +4,7 @@ import threading
 import unittest
 from uuid import uuid4
 
-from ksq.web import load_progress
+from ksq.data import progress as load_progress
 
 
 class LoadProgressTests(unittest.TestCase):

@@ -1,4 +1,4 @@
-"""Client for the Hermes chassis (SLAMTEC Slamware) RESTful API.
+"""Navigation and map services for the Hermes chassis (SLAMTEC Slamware).
 
 Endpoints and payload shapes here are taken directly from the robot's own
 live OpenAPI spec (``http://<robot_ip>:1448/js/spec.js``, firmware >= 4.6.0
@@ -25,6 +25,10 @@ RESTful API PDF manual in a few places):
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from copy import deepcopy
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 import io
 import ipaddress
 import json
@@ -32,20 +36,12 @@ import math
 import struct
 import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from copy import deepcopy
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlsplit
 
-from ksq.constants import (
-    DEFAULT_ROBOT_BASE_URL,
-    ROBOT_MAP_POIS_FILE,
-    ROBOT_MAP_SETTINGS_FILE,
-)
-from ksq.safe_io import safe_write_text
+from ksq.constants import ROBOT_MAP_POIS_FILE, ROBOT_MAP_SETTINGS_FILE
+from ksq.robot import client, store
+from ksq.robot.client import RobotApiError
+
 
 _REQUEST_TIMEOUT_SECONDS = 8
 
@@ -80,12 +76,6 @@ _PATROL_TRACK_PLANS: Dict[str, dict] = {}
 _PATROL_TRACK_METADATA_KEY = "ksq_patrol_edge"
 
 
-class RobotApiError(RuntimeError):
-    def __init__(self, message: str, status_code: int = 502) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-
-
 class RobotConnectionSwitchRequired(RuntimeError):
     """The old chassis could not be stopped before changing endpoints."""
 
@@ -107,17 +97,7 @@ def _invalidate_telemetry_cache() -> None:
 # --------------------------------------------------------------------------
 
 def load_settings() -> Dict[str, object]:
-    settings: Dict[str, object] = {"robot_base_url": DEFAULT_ROBOT_BASE_URL}
-    if ROBOT_MAP_SETTINGS_FILE.is_file():
-        try:
-            payload = json.loads(ROBOT_MAP_SETTINGS_FILE.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            payload = {}
-        if isinstance(payload, dict):
-            base_url = str(payload.get("robot_base_url") or "").strip()
-            if base_url:
-                settings["robot_base_url"] = base_url.rstrip("/")
-    return settings
+    return store.load_settings(ROBOT_MAP_SETTINGS_FILE)
 
 
 def save_settings(payload: Dict[str, object]) -> Dict[str, object]:
@@ -161,7 +141,7 @@ def save_settings(payload: Dict[str, object]) -> Dict[str, object]:
                 timeout=3,
                 base_url=base_url,
             )
-            from ksq.web import robot_mapping_api
+            from ksq.robot import mapping as robot_mapping_api
 
             robot_mapping_api.revoke_drive(current)
             try:
@@ -172,10 +152,7 @@ def save_settings(payload: Dict[str, object]) -> Dict[str, object]:
                     raise RobotConnectionSwitchRequired(
                         "无法确认旧底盘已停止，请现场确认后再强制切换。"
                     ) from error
-        safe_write_text(
-            ROBOT_MAP_SETTINGS_FILE,
-            json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
-        )
+        store.save_settings(ROBOT_MAP_SETTINGS_FILE, settings)
         _PATROL_TRACK_PLANS.clear()
         _invalidate_telemetry_cache()
         return settings
@@ -203,73 +180,12 @@ def require_current_base_url(expected_base_url: object) -> str:
 # Low-level HTTP
 # --------------------------------------------------------------------------
 
-def _request(
-    method: str,
-    path: str,
-    payload: Optional[object] = None,
-    *,
-    timeout: float = _REQUEST_TIMEOUT_SECONDS,
-    base_url: Optional[str] = None,
-    accept: str = "application/json",
-) -> Tuple[int, object]:
-    request_base_url = base_url or _base_url()
-    url = f"{request_base_url}{path}"
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
-    headers = {"Accept": accept}
-    if data is not None:
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
-            status = int(response.status)
-    except urllib.error.HTTPError as error:
-        raw = error.read().decode("utf-8", errors="replace")
-        try:
-            body = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            body = raw
-        raise RobotApiError(
-            f"机器人接口返回错误：{method} {path} → HTTP {error.code}"
-            + (f"（{body}）" if body else ""),
-            status_code=error.code,
-        ) from error
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        reason = getattr(error, "reason", None) or str(error)
-        raise RobotApiError(
-            f"无法连接机器人 {request_base_url}：{reason}", status_code=504
-        ) from error
-    if not raw:
-        return status, {}
-    try:
-        return status, json.loads(raw)
-    except json.JSONDecodeError:
-        return status, raw
+def _request(method, path, payload=None, *, timeout=_REQUEST_TIMEOUT_SECONDS, base_url=None, accept="application/json"):
+    return client.request(method, path, payload, timeout=timeout, base_url=base_url or _base_url(), accept=accept)
 
 
-def _request_bytes(
-    method: str,
-    path: str,
-    *,
-    timeout: float = _REQUEST_TIMEOUT_SECONDS,
-) -> bytes:
-    url = f"{_base_url()}{path}"
-    request = urllib.request.Request(
-        url, headers={"Accept": "application/octet-stream"}, method=method
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read()
-    except urllib.error.HTTPError as error:
-        raise RobotApiError(
-            f"机器人接口返回错误：{method} {path} → HTTP {error.code}",
-            status_code=error.code,
-        ) from error
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        reason = getattr(error, "reason", None) or str(error)
-        raise RobotApiError(
-            f"无法连接机器人 {_base_url()}：{reason}", status_code=504
-        ) from error
+def _request_bytes(method, path, *, timeout=_REQUEST_TIMEOUT_SECONDS):
+    return client.request_bytes(method, path, timeout=timeout, base_url=_base_url())
 
 
 # --------------------------------------------------------------------------
@@ -903,7 +819,7 @@ def _create_action(
     *,
     base_url: Optional[str] = None,
 ) -> Dict[str, object]:
-    from ksq.web.robot_mapping_api import require_navigation_allowed
+    from ksq.robot.mapping import require_navigation_allowed
 
     require_navigation_allowed(base_url or _base_url())
     _, body = _request(
@@ -1142,7 +1058,7 @@ def _normalize_patrol_targets(
 
 
 def _require_patrol_idle(base_url: str) -> None:
-    from ksq.web.robot_mapping_api import require_navigation_allowed
+    from ksq.robot.mapping import require_navigation_allowed
 
     require_navigation_allowed(base_url)
     try:
@@ -1388,7 +1304,7 @@ def _cancel_current_action_for(base_url: str) -> None:
 
 
 def cancel_current_action(*, expected_base_url: object = None) -> None:
-    from ksq.web import robot_mapping_api
+    from ksq.robot import mapping as robot_mapping_api
 
     with _ROBOT_CONNECTION_LOCK:
         base_url = _require_current_base_url_unlocked(expected_base_url)
@@ -1403,53 +1319,6 @@ def cancel_current_action(*, expected_base_url: object = None) -> None:
 # (/api/core/artifact/v1/pois) remains the source of truth.
 # --------------------------------------------------------------------------
 
-def _read_poi_caches() -> Dict[str, List[Dict[str, object]]]:
-    if not ROBOT_MAP_POIS_FILE.is_file():
-        return {}
-    try:
-        payload = json.loads(ROBOT_MAP_POIS_FILE.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return {}
-    # Legacy files were a bare list with no robot identity.  Reusing that list
-    # after an address switch could send a different chassis to stale points.
-    if not isinstance(payload, dict):
-        return {}
-    endpoints = payload.get("endpoints")
-    if not isinstance(endpoints, dict):
-        return {}
-    caches = {
-        endpoint: items
-        for endpoint, items in endpoints.items()
-        if isinstance(endpoint, str) and isinstance(items, list)
-    }
-    if payload.get("version") == 2:
-        caches = {
-            endpoint: _migrate_default_poi_order(items)
-            for endpoint, items in caches.items()
-        }
-    return caches
-
-
-def _migrate_default_poi_order(
-    items: List[Dict[str, object]],
-) -> List[Dict[str, object]]:
-    """Recover creation order encoded by this UI's legacy default names."""
-    numbered: List[Tuple[int, Dict[str, object]]] = []
-    seen: set[int] = set()
-    for item in items:
-        if not isinstance(item, dict):
-            return items
-        name = str(item.get("name") or "")
-        suffix = name[len("停留点") :] if name.startswith("停留点") else ""
-        if not suffix.isdigit():
-            return items
-        sequence = int(suffix)
-        if sequence in seen:
-            return items
-        seen.add(sequence)
-        numbered.append((sequence, item))
-    return [item for _, item in sorted(numbered, key=lambda entry: entry[0])]
-
 
 def _merge_pois_in_cached_order(
     cached: List[Dict[str, object]], live: List[Dict[str, object]]
@@ -1457,7 +1326,7 @@ def _merge_pois_in_cached_order(
     if not cached:
         # A fresh install has no local creation history.  The UI's default
         # names are the only stable order signal available from the chassis.
-        return _migrate_default_poi_order(live)
+        return store._migrate_default_poi_order(live)
     live_by_id = {
         str(item.get("id")): item
         for item in live
@@ -1482,18 +1351,12 @@ def _merge_pois_in_cached_order(
 
 def _load_poi_cache(base_url: str) -> List[Dict[str, object]]:
     with _POI_CACHE_LOCK:
-        return _read_poi_caches().get(base_url, [])
+        return store.read_poi_caches(ROBOT_MAP_POIS_FILE).get(base_url, [])
 
 
 def _save_poi_cache(base_url: str, pois: List[Dict[str, object]]) -> None:
     with _POI_CACHE_LOCK:
-        caches = _read_poi_caches()
-        caches[base_url] = pois
-        safe_write_text(
-            ROBOT_MAP_POIS_FILE,
-            json.dumps({"version": 3, "endpoints": caches}, ensure_ascii=False, indent=2)
-            + "\n",
-        )
+        store.save_poi_cache(ROBOT_MAP_POIS_FILE, base_url, pois)
 
 
 def list_pois() -> List[Dict[str, object]]:

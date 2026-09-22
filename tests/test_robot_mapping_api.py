@@ -12,8 +12,8 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from ksq.web import robot_map_api as robot
-from ksq.web import robot_mapping_api as mapping
+from ksq.robot import service as robot
+from ksq.robot import mapping as mapping
 
 _REAL_STCM_REQUEST = mapping._stcm_request
 
@@ -600,7 +600,7 @@ class MappingTests(unittest.TestCase):
         self.assertFalse(any(method in {"POST", "PUT", "DELETE"} for method, *_ in self.calls))
 
     def test_deployment_uses_shared_idle_guard_and_invalidates_patrol(self):
-        from ksq.web import robot_mapping_objects
+        from ksq.robot import mapping_objects as robot_mapping_objects
 
         self.execute("start")
         with patch.object(robot_mapping_objects, "save_object", return_value={"object": {"id": "new"}}) as save:
@@ -616,7 +616,7 @@ class MappingTests(unittest.TestCase):
             self.assertNotIn(self.base, robot._PATROL_TRACK_PLANS)
 
     def test_accepted_deployment_readback_warning_reaches_client_without_retry(self):
-        from ksq.web import robot_mapping_objects
+        from ksq.robot import mapping_objects as robot_mapping_objects
 
         warning = "Configuration accepted; readback failed. Do not submit again."
         with patch.object(robot_mapping_objects, "save_object", return_value={"object": None, "warning": warning}) as save:

@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from ksq.robot import service as robot_map_api
+
+from ksq.web.routes import data as data_routes
+from ksq.data import service as data_service
+
+from ksq.order import active as active_orders
+
 import io
 import json
 import tempfile
@@ -11,7 +18,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from ksq.web import auth, dashboard_api, data_storage, edit_workspace, pages, state
+from ksq.web import auth, pages
+from ksq.dashboard import service as dashboard_api
+from ksq.data import storage as data_storage
+from ksq.data import workspace as edit_workspace
+from ksq.data import state as state
 from ksq.web import handlers
 
 try:
@@ -125,21 +136,21 @@ class HandlerRegressionTests(unittest.TestCase):
         persist.assert_called_once_with()
         self.assertEqual(handler.rfile.read(), b"")
 
-    def test_viewer_cannot_sync_active_dashboard_order(self) -> None:
+    def test_viewer_can_sync_active_dashboard_order(self) -> None:
         payload = {
             "task_id": "task-viewer",
             "items": [{"item_id": "SKU-1", "quantity": 1}],
         }
-        with patch.object(dashboard_api, "set_active_order") as set_order:
+        with patch.object(active_orders, "set_active_order", return_value=payload) as set_order:
             handler, status, data = self._request(
                 "POST",
                 "/api/dashboard/order",
                 role=auth.ROLE_VIEWER,
                 payload=payload,
             )
-        self.assertEqual(status, 403)
-        self.assertIn("管理员", data["error"])
-        set_order.assert_not_called()
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        set_order.assert_called_once_with(payload)
         self.assertEqual(handler.rfile.read(), b"")
 
     def test_dashboard_order_rejects_empty_or_malformed_items(self) -> None:
@@ -155,7 +166,7 @@ class HandlerRegressionTests(unittest.TestCase):
         )
         for payload in invalid_payloads:
             with self.subTest(payload=payload), patch.object(
-                dashboard_api, "set_active_order"
+                active_orders, "set_active_order"
             ) as set_order:
                 handler, status, _data = self._request(
                     "POST",
@@ -173,7 +184,7 @@ class HandlerRegressionTests(unittest.TestCase):
             "items": [{"item_id": "SKU-1", "quantity": 2}],
         }
         with patch.object(
-            dashboard_api, "set_active_order", return_value={"task_id": "task-admin"}
+            active_orders, "set_active_order", return_value={"task_id": "task-admin"}
         ) as set_order:
             handler, status, data = self._request(
                 "POST",
@@ -236,7 +247,7 @@ class HandlerRegressionTests(unittest.TestCase):
             "error": None,
         }
         with patch.object(
-            handlers.robot_map_api,
+            robot_map_api,
             "get_telemetry_snapshot",
             return_value=snapshot,
         ) as get_snapshot:
@@ -250,9 +261,9 @@ class HandlerRegressionTests(unittest.TestCase):
 
     def test_map_current_action_translates_idle_404_to_an_idle_payload(self) -> None:
         with patch.object(
-            handlers.robot_map_api,
+            robot_map_api,
             "get_current_action",
-            side_effect=handlers.RobotApiError("Action Not Found", status_code=404),
+            side_effect=robot_map_api.RobotApiError("Action Not Found", status_code=404),
         ) as get_current_action:
             _handler, status, data = self._request(
                 "GET", "/api/map/current-action", role=auth.ROLE_VIEWER
@@ -269,7 +280,7 @@ class HandlerRegressionTests(unittest.TestCase):
             "state": {"status": 1, "result": 0},
         }
         with patch.object(
-            handlers.robot_map_api, "get_current_action", return_value=action
+            robot_map_api, "get_current_action", return_value=action
         ) as get_current_action:
             _handler, status, data = self._request(
                 "GET", "/api/map/current-action", role=auth.ROLE_VIEWER
@@ -282,7 +293,7 @@ class HandlerRegressionTests(unittest.TestCase):
     def test_map_home_pose_and_patrol_plan_are_exposed_read_only(self) -> None:
         base_url = "http://192.168.5.9:1448"
         with patch.object(
-            handlers.robot_map_api,
+            robot_map_api,
             "get_home_pose",
             return_value={"x": 1.0, "y": 2.0, "yaw": 0.3},
         ):
@@ -293,7 +304,7 @@ class HandlerRegressionTests(unittest.TestCase):
         self.assertEqual(data["pose"]["yaw"], 0.3)
 
         with patch.object(
-            handlers.robot_map_api,
+            robot_map_api,
             "get_remaining_path",
             return_value={"path_points": [[1, 2], [3, 4]]},
         ) as get_path:
@@ -307,9 +318,9 @@ class HandlerRegressionTests(unittest.TestCase):
         get_path.assert_called_once_with(expected_base_url=base_url)
 
         with patch.object(
-            handlers.robot_map_api,
+            robot_map_api,
             "get_home_pose",
-            side_effect=handlers.RobotApiError("timeout", status_code=504),
+            side_effect=robot_map_api.RobotApiError("timeout", status_code=504),
         ):
             _handler, status, data = self._request(
                 "GET", "/api/map/home-pose", role=auth.ROLE_VIEWER
@@ -320,7 +331,7 @@ class HandlerRegressionTests(unittest.TestCase):
     def test_map_speed_limit_uses_the_current_robot_maximum(self) -> None:
         base_url = "http://192.168.5.9:1448"
         with patch.object(
-            handlers.robot_map_api, "get_max_moving_speed", return_value=0.8
+            robot_map_api, "get_max_moving_speed", return_value=0.8
         ) as get_max_speed:
             _handler, status, data = self._request(
                 "GET",
@@ -345,9 +356,9 @@ class HandlerRegressionTests(unittest.TestCase):
             "expected_robot_base_url": "http://192.168.5.9:1448",
         }
         with patch.object(
-            handlers.robot_map_api,
+            robot_map_api,
             "save_settings",
-            side_effect=handlers.robot_map_api.RobotConnectionSwitchRequired(
+            side_effect=robot_map_api.RobotConnectionSwitchRequired(
                 "无法确认旧底盘已停止"
             ),
         ):
@@ -373,23 +384,23 @@ class HandlerRegressionTests(unittest.TestCase):
         )
         for path, raw_body in control_routes:
             with self.subTest(path=path), patch.object(
-                handlers.robot_map_api, "move_to"
+                robot_map_api, "move_to"
             ) as move_to, patch.object(
-                handlers.robot_map_api, "series_move_to"
+                robot_map_api, "series_move_to"
             ) as series_move_to, patch.object(
-                handlers.robot_map_api, "plan_patrol"
+                robot_map_api, "plan_patrol"
             ) as plan_patrol, patch.object(
-                handlers.robot_map_api, "delete_tracks"
+                robot_map_api, "delete_tracks"
             ) as delete_tracks, patch.object(
-                handlers.robot_map_api, "cancel_current_action"
+                robot_map_api, "cancel_current_action"
             ) as cancel, patch.object(
-                handlers.robot_map_api, "go_home"
+                robot_map_api, "go_home"
             ) as go_home, patch.object(
-                handlers.robot_map_api, "recover_localization"
+                robot_map_api, "recover_localization"
             ) as relocate, patch.object(
-                handlers.robot_map_api, "create_poi"
+                robot_map_api, "create_poi"
             ) as create_poi, patch.object(
-                handlers.robot_map_api, "delete_poi"
+                robot_map_api, "delete_poi"
             ) as delete_poi:
                 handler, status, data = self._request(
                     "POST", path, role=auth.ROLE_VIEWER, raw_body=raw_body
@@ -421,7 +432,7 @@ class HandlerRegressionTests(unittest.TestCase):
         )
         for raw_body in invalid_bodies:
             with self.subTest(raw_body=raw_body), patch.object(
-                handlers.robot_map_api, "move_to"
+                robot_map_api, "move_to"
             ) as move_to:
                 handler, status, data = self._request(
                     "POST",
@@ -437,7 +448,7 @@ class HandlerRegressionTests(unittest.TestCase):
     def test_map_navigate_forwards_real_speed_when_requested(self) -> None:
         base_url = "http://192.168.5.9:1448"
         with patch.object(
-            handlers.robot_map_api,
+            robot_map_api,
             "move_to",
             return_value={"action_id": 7},
         ) as move_to:
@@ -468,7 +479,7 @@ class HandlerRegressionTests(unittest.TestCase):
     def test_map_patrol_forwards_ordered_targets_and_real_speed(self) -> None:
         base_url = "http://192.168.5.9:1448"
         with patch.object(
-            handlers.robot_map_api,
+            robot_map_api,
             "series_move_to",
             return_value={"action_id": 8},
         ) as series_move_to:
@@ -500,10 +511,10 @@ class HandlerRegressionTests(unittest.TestCase):
     def test_map_patrol_plan_does_not_require_speed_or_start_motion(self) -> None:
         base_url = "http://192.168.5.9:1448"
         with (
-            patch.object(handlers.robot_map_api, "plan_patrol", return_value={
+            patch.object(robot_map_api, "plan_patrol", return_value={
                 "plan_id": "planned-route", "patrol_tracks": [],
             }) as plan_patrol,
-            patch.object(handlers.robot_map_api, "series_move_to") as series_move_to,
+            patch.object(robot_map_api, "series_move_to") as series_move_to,
         ):
             _handler, status, data = self._request(
                 "POST", "/api/map/patrol/plan", role=auth.ROLE_ADMIN,
@@ -524,9 +535,9 @@ class HandlerRegressionTests(unittest.TestCase):
         base_url = "http://192.168.5.9:1448"
         tracks = [{"id": 12, "start": {"x": 1, "y": 0}, "end": {"x": 2, "y": 0}}]
         for error, expected_status in ((None, 200), (ValueError("invalid"), 400),
-                                       (handlers.RobotApiError("changed"), 502)):
+                                       (robot_map_api.RobotApiError("changed"), 502)):
             with self.subTest(status=expected_status), patch.object(
-                handlers.robot_map_api, "delete_tracks", side_effect=error,
+                robot_map_api, "delete_tracks", side_effect=error,
                 return_value={"deleted_ids": [12], "patrol_tracks": []},
             ) as delete_tracks:
                 _handler, status, data = self._request(
@@ -547,7 +558,7 @@ class HandlerRegressionTests(unittest.TestCase):
             "expected_robot_base_url": "http://192.168.5.10:1448",
         }
         with patch.object(
-            handlers.robot_map_api,
+            robot_map_api,
             "move_to",
             side_effect=ValueError("底盘连接已变更，请刷新地图后重试。"),
         ) as move_to:
@@ -571,7 +582,7 @@ class HandlerRegressionTests(unittest.TestCase):
         self.assertEqual(handler.rfile.read(), b"")
 
     def test_map_navigate_requires_the_rendered_robot_endpoint(self) -> None:
-        with patch.object(handlers.robot_map_api, "move_to") as move_to:
+        with patch.object(robot_map_api, "move_to") as move_to:
             handler, status, data = self._request(
                 "POST",
                 "/api/map/navigate",
@@ -599,7 +610,7 @@ class LoadPathsRollbackTests(unittest.TestCase):
         storage_paths.start()
         self.addCleanup(storage_paths.stop)
         state_fields = (
-            *handlers._LOAD_PATH_STATE_FIELDS,
+            *data_service._LOAD_PATH_STATE_FIELDS,
             "configured_config_pnp",
             "configured_vfm_app",
             "_cli_config_paths",
@@ -716,18 +727,8 @@ class LoadPathsRollbackTests(unittest.TestCase):
 
         self.addCleanup(restore_state)
 
-        class FakeServer:
-            def __init__(self, *_args: object) -> None:
-                pass
-
-            def serve_forever(self) -> None:
-                raise KeyboardInterrupt
-
-            def server_close(self) -> None:
-                pass
-
         with (
-            patch.object(cli, "ThreadingHTTPServer", FakeServer),
+            patch.object(cli.uvicorn, "run") as run_server,
             patch.object(
                 cli,
                 "configure_runtime_logging",
@@ -735,10 +736,6 @@ class LoadPathsRollbackTests(unittest.TestCase):
             ),
             patch.object(cli, "reset_state_if_version_changed"),
             patch.object(state, "reload_config_pnp_paths"),
-            patch.object(cli.dashboard_api, "start_dashboard_monitor") as start_monitor,
-            patch.object(cli.dashboard_api, "stop_dashboard_monitor") as stop_monitor,
-            patch.object(cli.data_storage, "start_data_cleanup") as start_cleanup,
-            patch.object(cli.data_storage, "stop_data_cleanup") as stop_cleanup,
         ):
             cli.serve(
                 [
@@ -749,11 +746,8 @@ class LoadPathsRollbackTests(unittest.TestCase):
                 ]
             )
 
-        start_monitor.assert_called_once_with()
-        stop_monitor.assert_called_once_with()
-        start_cleanup.assert_called_once_with()
-        stop_cleanup.assert_called_once_with()
 
+        self.assertEqual(run_server.call_args.kwargs["workers"], 1)
         self.assertEqual(state.configured_knowledge_root, root.resolve())
         self.assertEqual(state.configured_knowledge, knowledge.resolve())
         self.assertEqual(
@@ -792,7 +786,7 @@ class LoadPathsRollbackTests(unittest.TestCase):
         temp, payload = self._valid_paths()
         self.addCleanup(temp.cleanup)
         with patch.object(
-            handlers, "load_from_configured_paths", side_effect=ValueError("bad data")
+            data_service, "load_from_configured_paths", side_effect=ValueError("bad data")
         ):
             status, data = self._request(payload)
         self.assertEqual(status, 400)
@@ -824,13 +818,13 @@ class LoadPathsRollbackTests(unittest.TestCase):
 
         with (
             patch.object(
-                handlers,
+                data_service,
                 "load_from_configured_paths",
                 return_value=(object(), None, None, [], 0.01),
             ),
             patch.object(edit_workspace, "init_workspace_from_loaded"),
-            patch.object(handlers, "format_status_html", return_value="loaded"),
-            patch.object(handlers, "build_missing_rows", return_value=[]),
+            patch.object(data_routes, "format_status_html", return_value="loaded"),
+            patch.object(data_routes, "build_missing_rows", return_value=[]),
         ):
             for knowledge_value in (
                 "pnp_percept/templates_260827/knowledge",
@@ -905,13 +899,13 @@ class LoadPathsRollbackTests(unittest.TestCase):
 
         with (
             patch.object(
-                handlers,
+                data_service,
                 "load_from_configured_paths",
                 return_value=(object(), None, None, [], 0.01),
             ),
             patch.object(edit_workspace, "init_workspace_from_loaded"),
-            patch.object(handlers, "format_status_html", return_value="loaded"),
-            patch.object(handlers, "build_missing_rows", return_value=[]),
+            patch.object(data_routes, "format_status_html", return_value="loaded"),
+            patch.object(data_routes, "build_missing_rows", return_value=[]),
         ):
             status, _data = self._request(
                 {
@@ -962,13 +956,13 @@ class LoadPathsRollbackTests(unittest.TestCase):
 
         with (
             patch.object(
-                handlers,
+                data_service,
                 "load_from_configured_paths",
                 return_value=(object(), None, None, [], 0.01),
             ),
             patch.object(edit_workspace, "init_workspace_from_loaded"),
-            patch.object(handlers, "format_status_html", return_value="loaded"),
-            patch.object(handlers, "build_missing_rows", return_value=[]),
+            patch.object(data_routes, "format_status_html", return_value="loaded"),
+            patch.object(data_routes, "build_missing_rows", return_value=[]),
         ):
             status, _data = self._request(
                 {"knowledge": "knowledge", "shelves": "shelves.csv"}
@@ -1033,7 +1027,7 @@ class LoadPathsRollbackTests(unittest.TestCase):
         self.assertEqual(list(self.data.glob(".staging-*")), [])
 
     def test_zip_load_uses_private_copy_and_keeps_source_settings(self) -> None:
-        from ksq.web import loader
+        from ksq.data import loader as loader
 
         self._seed_state()
         temporary, payload = self._valid_paths()
@@ -1070,7 +1064,7 @@ class LoadPathsRollbackTests(unittest.TestCase):
             "shelves": Path(payload["shelves"]), "unavailable": None,
             "tool_mapping": None, "pick_strategy": None,
         }
-        with patch.object(handlers, "format_status_html", side_effect=ValueError("response failed")):
+        with patch.object(data_routes, "format_status_html", side_effect=ValueError("response failed")):
             status, result = self._request({}, "/load-auto")
         self.assertEqual(status, 400)
         self.assertIn("response failed", result["error"])
@@ -1089,7 +1083,7 @@ class LoadPathsRollbackTests(unittest.TestCase):
         with (
             patch.object(state, "reload_config_pnp_paths"),
             patch.object(
-                handlers,
+                data_service,
                 "apply_configured_paths_reload",
                 side_effect=ValueError("auto load failed"),
             ) as reload_paths,
@@ -1135,12 +1129,12 @@ class LoadPathsRollbackTests(unittest.TestCase):
 
         with (
             patch.object(
-                handlers,
+                data_service,
                 "apply_configured_paths_reload",
                 side_effect=apply_reload,
             ),
-            patch.object(handlers, "format_status_html", return_value="loaded"),
-            patch.object(handlers, "build_missing_rows", return_value=[]),
+            patch.object(data_routes, "format_status_html", return_value="loaded"),
+            patch.object(data_routes, "build_missing_rows", return_value=[]),
         ):
             status, data = self._request({}, "/load-auto")
 
@@ -1152,8 +1146,11 @@ class LoadPathsRollbackTests(unittest.TestCase):
         self.assertEqual(
             data["paths"]["shelves"], "etm_sku_locations_cache.csv"
         )
+        self.assertEqual(data["source_paths"]["knowledge"], str(final_knowledge.resolve()))
+        self.assertEqual(data["source_paths"]["shelves"], str(final_shelves.resolve()))
         for key in ("unavailable", "tool_mapping", "pick_strategy"):
             self.assertEqual(data["paths"][key], "")
+            self.assertEqual(data["source_paths"][key], "")
 
     def test_root_only_auto_load_restores_default_target(self) -> None:
         self._seed_state()
@@ -1185,12 +1182,12 @@ class LoadPathsRollbackTests(unittest.TestCase):
 
         with (
             patch.object(
-                handlers,
+                data_service,
                 "apply_configured_paths_reload",
                 side_effect=apply_reload,
             ),
-            patch.object(handlers, "format_status_html", return_value="loaded"),
-            patch.object(handlers, "build_missing_rows", return_value=[]),
+            patch.object(data_routes, "format_status_html", return_value="loaded"),
+            patch.object(data_routes, "build_missing_rows", return_value=[]),
         ):
             status, data = self._request({}, "/load-auto")
 
@@ -1266,12 +1263,12 @@ class LoadPathsRollbackTests(unittest.TestCase):
 
         with (
             patch.object(
-                handlers,
+                data_service,
                 "apply_configured_paths_reload",
                 side_effect=apply_reload,
             ),
-            patch.object(handlers, "format_status_html", return_value="loaded"),
-            patch.object(handlers, "build_missing_rows", return_value=[]),
+            patch.object(data_routes, "format_status_html", return_value="loaded"),
+            patch.object(data_routes, "build_missing_rows", return_value=[]),
         ):
             status, data = self._request({}, "/load-auto")
 

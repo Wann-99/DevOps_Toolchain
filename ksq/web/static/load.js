@@ -50,7 +50,10 @@
   const initialPathValues = {};
   PATH_INPUT_IDS.forEach((id) => {
     const input = document.getElementById(id);
-    if (input) initialPathValues[id] = input.value;
+    if (input) {
+      initialPathValues[id] = input.value;
+      input.addEventListener("input", () => renderSourcePaths());
+    }
   });
   const filePickerPlaceholders = new WeakMap();
   const loadSource = document.getElementById("load-source");
@@ -73,6 +76,7 @@
       if (!global.KsqLoadProgress.isBusy()) {
         if (shelvesSource === "local") localShelvesPath = shelvesInput.value;
         shelvesSource = input.value;
+        renderSourcePaths();
       }
       renderShelvesSource();
     });
@@ -201,6 +205,7 @@
   }
 
   function clearPanelResult(method) {
+    if (method === "path") renderSourcePaths();
     panelState[method] = {
       statusHtml: "",
       showNext: false,
@@ -289,6 +294,7 @@
 
   function applyLoad(method, data) {
     resetOtherPanels(method);
+    if (method === "path") renderSourcePaths(data.source_paths);
     panelState[method] = {
       statusHtml: capabilityNotice(data) + (data.html || ""),
       showNext: true,
@@ -327,6 +333,9 @@
         return line;
       })
       .join("");
+    const ignored = (data.ignored_files || [])
+      .map((name) => "<li>" + escapeHtml(name) + "</li>")
+      .join("");
     const reloaded = Boolean(data.reloaded);
     const tip = reloaded
       ? '<p class="meta compact">已自动重新加载，可直接前往数据查询。</p>'
@@ -337,6 +346,7 @@
         escapeHtml(data.message || "已写入") +
         "</p>" +
         (lines ? '<ul class="status-list">' + lines + "</ul>" : "") +
+        (ignored ? '<p class="meta">已忽略的辅助或无药品标识的文件：</p><ul class="status-list">' + ignored + "</ul>" : "") +
         tip +
         "</div>",
       showNext: reloaded,
@@ -479,6 +489,13 @@
       await showLoadError("path", "数据加载失败", error);
     }
   });
+
+  function renderSourcePaths(paths = {}) {
+    document.querySelectorAll("#path-form [data-source-path]").forEach((label) => {
+      const path = paths[label.dataset.sourcePath];
+      label.textContent = path ? "（" + path + "）" : "";
+    });
+  }
 
   function setPathValue(id, value) {
     if (typeof value !== "string") return;

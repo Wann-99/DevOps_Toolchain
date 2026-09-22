@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from ksq.dashboard import parsing as log_parser
+from ksq.order import model as order_model
+
 import json
 import tempfile
 import unittest
@@ -11,7 +14,9 @@ from ksq.naming import is_shelves_file_name
 from ksq.package_io import load_package, save_package
 from ksq.shelves import parse_shelf_locations
 from ksq.test_order_select import load_candidates, parse_import_csv, public_item
-from ksq.web import dashboard_api, edit_workspace, order_api
+from ksq.dashboard import service as dashboard_api
+from ksq.data import workspace as edit_workspace
+from ksq.order import service as order_api
 from ksq.web.pages import records_payload
 
 
@@ -112,12 +117,12 @@ class SkuIdCompatibilityTests(unittest.TestCase):
         self.assertNotIn("sku_id", broker_body["items"][0])
         self.assertEqual(local_body["items"][0]["sku_id"], "sku-new")
 
-        order = dashboard_api._build_active_order(
+        order = order_model._build_active_order(
             {"items": local_body["items"], "task_id": "TASK-1"}
         )
         self.assertEqual(order["items"][0]["sku_id"], "sku-new")
         self.assertEqual(
-            dashboard_api._merged_code_aliases(order, ""),
+            log_parser._merged_code_aliases(order, ""),
             {"sku-new": "690001"},
         )
 

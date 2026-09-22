@@ -578,6 +578,8 @@
         " · 共 " +
         total +
         " 个子任务";
+      const queuedCount = Number((data.order_queue || {}).queued_count || 0);
+      if (queuedCount) progressMeta.textContent += " · 等待 " + queuedCount + " 单";
     }
     if (bar) {
       const finished = done + failed + skipped;
@@ -1533,7 +1535,9 @@
       if (typeof payload === "string" || payload == null) {
         session = { task_id: payload || "" };
       }
-      focusTaskId = String((session && session.task_id) || "");
+      if (!(session && session.queued)) {
+        focusTaskId = String((session && session.task_id) || "");
+      }
       await registerOrder(session || {});
       if (global.KsqShell && global.KsqShell.showView) {
         global.KsqShell.showView("dashboard");

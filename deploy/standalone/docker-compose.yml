@@ -2,7 +2,7 @@
 # 用法: bash start.sh
 services:
   knowledge_shelf_query:
-    image: ${RUNTIME_IMAGE:-hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime:v1.1.1}
+    image: ${RUNTIME_IMAGE:-hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime:v1.2.0}
     container_name: knowledge_shelf_query
     network_mode: host
     working_dir: /app
@@ -15,9 +15,9 @@ services:
       - --config-pnp
       - /data/config_pnp
       - --knowledge-root
-      - /data/knowledge
+      - /data/templates
       - --knowledge
-      - /data/knowledge/knowledge
+      - /data/templates/knowledge
       # 旧参数（由 config_pnp 目录驱动，不再逐项指定）:
       # - --shelves
       # - /data/config_pnp/sku-shelves.csv
@@ -55,9 +55,14 @@ services:
       - ./data:/app/data
       # 业务数据（设备自带；KNOWLEDGE_DIR 指向 templates 根，页面可选择其下任意目录）
       - ${CONFIG_PNP_DIR:-/home/nvidia/compiled/PNPApp_deploy/config_pnp}:/data/config_pnp
-      - ${KNOWLEDGE_DIR:-/home/nvidia/compiled/VfmApp_deploy/model/templates}:/data/knowledge
+      - ${KNOWLEDGE_DIR:-/home/nvidia/compiled/VfmApp_deploy/model/templates}:/data/templates
       # 机器人键盘环境（可选）
       - ./robot_keyboard.env:/data/robot_keyboard.env
       # 容器内已包含 Docker CLI / Compose，仅共享宿主 Docker API。
       - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
     restart: always

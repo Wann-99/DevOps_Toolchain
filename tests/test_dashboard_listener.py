@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from ksq.order import active as active_orders
+from ksq.dashboard import cache as dashboard_cache
+from ksq.order import model as order_model
+from ksq.order import store as order_store
+
 import json
 import tempfile
 import unittest
@@ -8,11 +13,11 @@ from pathlib import Path
 from threading import Event
 from unittest.mock import patch
 
-from ksq.web import dashboard_api
+from ksq.dashboard import service as dashboard_api
 
 
 def _order(task_id: str = "task-listener") -> dict[str, object]:
-    return dashboard_api._build_active_order(
+    return order_model._build_active_order(
         {
             "task_id": task_id,
             "items": [{"item_id": "690001", "quantity": 1}],
@@ -46,41 +51,41 @@ def _prompt_snapshot(order: dict[str, object]) -> dict[str, object]:
 class DashboardListenerTests(unittest.TestCase):
     def setUp(self) -> None:
         dashboard_api.stop_dashboard_monitor(0.2)
-        self.saved_active = dashboard_api._ACTIVE_ORDER
-        self.saved_loaded = dashboard_api._ACTIVE_ORDER_LOADED
-        with dashboard_api._DASHBOARD_CACHE_LOCK:
-            self.saved_cache = dashboard_api._DASHBOARD_CACHE
-            self.saved_generation = dashboard_api._DASHBOARD_CACHE_GENERATION
-            dashboard_api._DASHBOARD_CACHE = None
-            dashboard_api._DASHBOARD_CACHE_GENERATION = 0
+        self.saved_active = order_store._ACTIVE_ORDER
+        self.saved_loaded = order_store._ACTIVE_ORDER_LOADED
+        with dashboard_cache._DASHBOARD_CACHE_LOCK:
+            self.saved_cache = dashboard_cache._DASHBOARD_CACHE
+            self.saved_generation = dashboard_cache._DASHBOARD_CACHE_GENERATION
+            dashboard_cache._DASHBOARD_CACHE = None
+            dashboard_cache._DASHBOARD_CACHE_GENERATION = 0
 
     def tearDown(self) -> None:
         dashboard_api.stop_dashboard_monitor(0.2)
-        dashboard_api._ACTIVE_ORDER = self.saved_active
-        dashboard_api._ACTIVE_ORDER_LOADED = self.saved_loaded
-        with dashboard_api._DASHBOARD_CACHE_LOCK:
-            dashboard_api._DASHBOARD_CACHE = self.saved_cache
-            dashboard_api._DASHBOARD_CACHE_GENERATION = self.saved_generation
+        order_store._ACTIVE_ORDER = self.saved_active
+        order_store._ACTIVE_ORDER_LOADED = self.saved_loaded
+        with dashboard_cache._DASHBOARD_CACHE_LOCK:
+            dashboard_cache._DASHBOARD_CACHE = self.saved_cache
+            dashboard_cache._DASHBOARD_CACHE_GENERATION = self.saved_generation
 
     def test_pending_confirmation_survives_reload_and_log_gap(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         state_file = Path(temporary.name) / "active_order.json"
         order = _order()
-        dashboard_api._ACTIVE_ORDER = order
-        dashboard_api._ACTIVE_ORDER_LOADED = True
+        order_store._ACTIVE_ORDER = order
+        order_store._ACTIVE_ORDER_LOADED = True
 
-        with patch.object(dashboard_api, "DASHBOARD_ACTIVE_ORDER_FILE", state_file):
+        with patch.object(order_store, "DASHBOARD_ACTIVE_ORDER_FILE", state_file):
             fresh = dashboard_api._reconcile_pending_confirmation(
                 _prompt_snapshot(order)
             )
             self.assertTrue(fresh["needs_confirm"])
-            self.assertIn("pending_confirm", dashboard_api._ACTIVE_ORDER)
+            self.assertIn("pending_confirm", order_store._ACTIVE_ORDER)
 
             # Simulate a backend process restart: only the state file survives.
-            dashboard_api._ACTIVE_ORDER = None
-            dashboard_api._ACTIVE_ORDER_LOADED = False
-            loaded = dashboard_api.get_active_order()
+            order_store._ACTIVE_ORDER = None
+            order_store._ACTIVE_ORDER_LOADED = False
+            loaded = active_orders.get_active_order()
             self.assertIsNotNone(loaded)
             self.assertIn("pending_confirm", loaded)
 
@@ -104,7 +109,7 @@ class DashboardListenerTests(unittest.TestCase):
             closed["confirm_closed"] = True
             result = dashboard_api._reconcile_pending_confirmation(closed)
             self.assertFalse(result["needs_confirm"])
-            self.assertNotIn("pending_confirm", dashboard_api.get_active_order())
+            self.assertNotIn("pending_confirm", active_orders.get_active_order())
             persisted = json.loads(state_file.read_text(encoding="utf-8"))
             self.assertNotIn("pending_confirm", persisted)
 
@@ -175,10 +180,10 @@ class DashboardListenerTests(unittest.TestCase):
         task = deepcopy(remembered)
         task["elapsed_seconds"] = 2.0
         order["item_states"] = {"690001": remembered}
-        dashboard_api._ACTIVE_ORDER = order
-        dashboard_api._ACTIVE_ORDER_LOADED = True
+        order_store._ACTIVE_ORDER = order
+        order_store._ACTIVE_ORDER_LOADED = True
 
-        with patch.object(dashboard_api, "_save_active_order_unlocked") as save:
+        with patch.object(order_store, "_save_active_order_unlocked") as save:
             dashboard_api._persist_item_states(order, [task])
 
         save.assert_not_called()

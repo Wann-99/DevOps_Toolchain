@@ -2,41 +2,22 @@
 
 from __future__ import annotations
 
-import json
-import hashlib
-import math
-import random
-import threading
-import time
 from copy import deepcopy
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 from uuid import uuid4
+import hashlib
+import json
+import math
+import random
+import threading
+import time
 
 from ksq.constants import TEST_ORDER_STATE_FILE
-from ksq.test_order_select import (
-    ALL_PACKAGING,
-    ALL_TOOLS,
-    DEFAULT_CLOSED_LOOP_RATIO,
-    DEFAULT_COLUMNS,
-    DEFAULT_PACKAGING_RATIO,
-    DEFAULT_TOOL_RATIO,
-    TOOL_CHOICES,
-    display_rows_to_csv_bytes,
-    item_key,
-    load_candidates,
-    load_packaging,
-    load_small_skus,
-    load_tool_mapping,
-    load_unavailable,
-    packaging_choices,
-    parse_import_csv_full,
-    public_item,
-    select_items,
-    summarize,
-)
-from ksq.web import state
+from ksq.data import state as state
 from ksq.safe_io import safe_write_text
+from ksq.test_order_select import ALL_PACKAGING, ALL_TOOLS, DEFAULT_CLOSED_LOOP_RATIO, DEFAULT_COLUMNS, DEFAULT_PACKAGING_RATIO, DEFAULT_TOOL_RATIO, TOOL_CHOICES, display_rows_to_csv_bytes, item_key, load_candidates, load_packaging, load_small_skus, load_tool_mapping, load_unavailable, packaging_choices, parse_import_csv_full, public_item, select_items, summarize
+
 
 STATE_FILE = TEST_ORDER_STATE_FILE
 _STATE_BACKUP_KEEP_DAYS = 2
@@ -148,7 +129,7 @@ def _parse_bool(source: Dict[str, object], key: str, default: bool) -> bool:
 
 def _load_packaging_choices() -> List[str]:
     try:
-        unavailable = load_unavailable(state.loaded_path("unavailable"))
+        unavailable = load_unavailable(state.loaded_path("unavailable")) | set(state.loaded_unavailable_ids or ())
         tools = load_tool_mapping(state.loaded_path("tool_mapping"))
         small_skus = load_small_skus(state.loaded_path("pick_strategy"))
         packaging = load_packaging(state.loaded_path("knowledge"))
@@ -506,7 +487,7 @@ def generate(payload: Dict[str, object]) -> Dict[str, object]:
     if seed is not None:
         random.seed(int(seed))
 
-    unavailable = load_unavailable(state.loaded_path("unavailable"))
+    unavailable = load_unavailable(state.loaded_path("unavailable")) | set(state.loaded_unavailable_ids or ())
     tools = load_tool_mapping(state.loaded_path("tool_mapping"))
     small_skus = load_small_skus(state.loaded_path("pick_strategy"))
     packaging = load_packaging(state.loaded_path("knowledge"))
@@ -591,7 +572,7 @@ def import_csv(payload: Dict[str, object]) -> Dict[str, object]:
     if group_mode == "group" and not group_field:
         raise ValueError("组合模式需要指定组合字段。")
 
-    unavailable = load_unavailable(state.loaded_path("unavailable"))
+    unavailable = load_unavailable(state.loaded_path("unavailable")) | set(state.loaded_unavailable_ids or ())
     tools = load_tool_mapping(state.loaded_path("tool_mapping"))
     small_skus = load_small_skus(state.loaded_path("pick_strategy"))
     packaging = load_packaging(state.loaded_path("knowledge"))

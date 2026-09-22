@@ -10,7 +10,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ksq.dataset import build_dataset
-from ksq.web import edit_workspace, state, test_order_api
+from ksq.data import workspace as edit_workspace
+from ksq.data import state as state
+from ksq.order import test_service as test_order_api
 
 
 class ShelfEditingTests(unittest.TestCase):

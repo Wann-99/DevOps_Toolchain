@@ -2,22 +2,17 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Callable, Iterator, Optional
 import logging
 import re
 import shutil
 import tempfile
 import threading
-from contextlib import contextmanager
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Callable, Iterator, Optional
 
-from ksq.constants import (
-    APP_DIRECTORY,
-    PICK_STRATEGY_FILE_NAME,
-    SHELVES_FILE_NAME,
-    TOOL_MAPPING_FILE_NAME,
-)
+from ksq.constants import APP_DIRECTORY, PICK_STRATEGY_FILE_NAME, SHELVES_FILE_NAME, TOOL_MAPPING_FILE_NAME
 from ksq.knowledge import list_knowledge_files
 from ksq.models import BundlePaths
 
@@ -67,7 +62,7 @@ def copy_dataset_files(
     progress: Optional[Callable[[int, int], None]] = None,
 ) -> BundlePaths:
     """Copy only files used by the loaders, preserving every source file."""
-    knowledge_files, _ = list_knowledge_files(knowledge)
+    knowledge_files, ignored_files = list_knowledge_files(knowledge)
     knowledge_target = staging / "knowledge"
     config_target = staging / "config_pnp"
     knowledge_target.mkdir(parents=True, exist_ok=True)
@@ -78,6 +73,7 @@ def copy_dataset_files(
         config_target / "unavailable_obj.json" if unavailable is not None else None,
         config_target / TOOL_MAPPING_FILE_NAME if tool_mapping is not None else None,
         config_target / PICK_STRATEGY_FILE_NAME if pick_strategy is not None else None,
+        tuple(ignored_files),
     )
     copies = [(path, knowledge_target / path.name) for path in knowledge_files]
     copies.extend(

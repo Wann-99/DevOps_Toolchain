@@ -76,7 +76,7 @@ def check():
                     patch.object(files_api, "TerminalSession", side_effect=AssertionError("Must spawn on host")):
                 listing = file_url("list", path=str(root))
                 assert request("GET", listing, token="")[0] == 401
-                assert request("GET", listing, token=viewer)[0] == 403
+                assert request("GET", listing, token=viewer)[0] == 200
                 assert request("GET", listing, headers={"Sec-Fetch-Site": "cross-site"})[0] == 403
                 code, data = request("GET", listing)
                 assert code == 200 and data["environment"] == "宿主机"
@@ -99,10 +99,9 @@ def check():
                     assert source.read("sub/中文.txt") == content
 
                 rename = {"path": str(root / "sub"), "name": "中文.txt", "new_name": "重命名.txt"}
-                assert request("POST", "/api/files/rename", rename, token=viewer)[0] == 403
                 assert request("POST", "/api/files/rename", rename, headers={"Origin": "https://example.invalid"})[0] == 403
                 assert request("POST", "/api/files/rename", rename, headers={"X-KSQ-Request": ""})[0] == 403
-                assert request("POST", "/api/files/rename", rename)[0] == 200
+                assert request("POST", "/api/files/rename", rename, token=viewer)[0] == 200
                 assert (root / "sub/重命名.txt").read_bytes() == content and not (root / "sub/中文.txt").exists()
                 assert request("POST", "/api/files/rename", dict(rename, name="重命名.txt", new_name="中文.txt"))[0] == 200
 

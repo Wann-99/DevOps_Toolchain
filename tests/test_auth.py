@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ksq.order import active as active_orders
+
 import io
 import json
 import tempfile
@@ -10,7 +12,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ksq.web import auth, dashboard_api
+from ksq.web import auth
+from ksq.dashboard import service as dashboard_api
 
 try:
     from ksq.web.handlers import QueryHandler
@@ -114,7 +117,7 @@ class AuthTestCase(unittest.TestCase):
         self.assertIn("/api/edit/save", auth.VIEWER_FORBIDDEN_POST_PATHS)
         self.assertIn("/api/edit/persist", auth.VIEWER_FORBIDDEN_POST_PATHS)
         self.assertIn("/api/import", auth.VIEWER_FORBIDDEN_POST_PATHS)
-        # 其余一律放行（含加载、下单、Token 刷新、模式切换）
+        # 加载、下单和 Token 刷新放行；设置路由按字段限制。
         self.assertNotIn("/load-auto", auth.VIEWER_FORBIDDEN_POST_PATHS)
         self.assertNotIn("/api/order/create", auth.VIEWER_FORBIDDEN_POST_PATHS)
         self.assertNotIn("/api/order/token", auth.VIEWER_FORBIDDEN_POST_PATHS)
@@ -220,7 +223,7 @@ class AuthRouteTests(unittest.TestCase):
 
     def test_admin_passes_role_gate(self) -> None:
         with patch.object(
-            dashboard_api, "set_active_order", return_value={"task_id": "t"}
+            active_orders, "set_active_order", return_value={"task_id": "t"}
         ):
             status, data = self._request(
                 "POST",
@@ -234,33 +237,29 @@ class AuthRouteTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(data["ok"])
 
-    def test_viewer_mode_switch_filters_settings_payload(self) -> None:
-        """普通用户可切换工作模式与自动确认，其余设置字段被后端过滤。"""
-        captured: dict[str, object] = {}
+    def test_viewer_cannot_edit_settings_but_can_toggle_dashboard_confirmation(self):
+        with patch.object(dashboard_api, "save_dashboard_settings", return_value={"ok": True}) as save:
+            for payload in ({"mode": "prod"}, {"keyboard_device": "/dev/input/event9"},
+                            {"etm_base_url": "http://example.invalid"},
+                            {"auto_confirm": True, "restart_robot": True},
+                            {"feishu_enabled": True}):
+                with self.subTest(payload=payload):
+                    status, _ = self._request("POST", "/api/dashboard/keyboard", auth.ROLE_VIEWER, payload)
+                    self.assertEqual(status, 403)
+            save.assert_not_called()
+            status, _ = self._request("POST", "/api/dashboard/keyboard", auth.ROLE_VIEWER,
+                                      {"auto_confirm": True, "restart_robot": False})
+            self.assertEqual(status, 200)
+            save.assert_called_once_with({"auto_confirm": True}, False)
 
-        def fake_save(payload, restart_robot):
-            captured["payload"] = payload
-            captured["restart_robot"] = restart_robot
-            return {"ok": True}
-
-        with patch.object(
-            dashboard_api, "save_dashboard_settings", side_effect=fake_save
-        ):
-            status, _ = self._request(
-                "POST",
-                "/api/dashboard/keyboard",
-                role=auth.ROLE_VIEWER,
-                payload={
-                    "keyboard_device": "/dev/input/event9",
-                    "mode": "prod",
-                    "etm_base_url": "http://evil",
-                    "auto_confirm": True,
-                    "restart_robot": True,
-                },
-            )
-        self.assertEqual(status, 200)
-        self.assertEqual(captured["payload"], {"mode": "prod", "auto_confirm": True})
-        self.assertFalse(captured["restart_robot"])
+    def test_viewer_cannot_write_any_map_endpoint(self):
+        from ksq.web.routes import map as map_routes, mapping
+        for routes in (map_routes.ROUTES, mapping.ROUTES):
+            for method in ("POST", "PUT"):
+                for path in routes.get(method, ()):
+                    with self.subTest(method=method, path=path):
+                        status, _ = self._request(method, path, auth.ROLE_VIEWER, {})
+                        self.assertEqual(status, 403)
 
     def test_admin_keyboard_payload_untouched(self) -> None:
         captured: dict[str, object] = {}

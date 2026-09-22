@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from ksq import vfm_app
-from ksq.web import state
+from ksq.data import state as state
 
 
 # 现场 config.yaml 的关键结构：template 与 template_for_validation 各有一个
@@ -170,11 +170,11 @@ class StandaloneKnowledgeMountTests(unittest.TestCase):
         project = Path(__file__).resolve().parents[1]
         expected_root_mount = (
             "${KNOWLEDGE_DIR:-/home/nvidia/compiled/VfmApp_deploy/model/templates}"
-            ":/data/knowledge"
+            ":/data/templates"
         )
         expected_command = (
-            "- --knowledge-root\n      - /data/knowledge\n"
-            "      - --knowledge\n      - /data/knowledge/knowledge"
+            "- --knowledge-root\n      - /data/templates\n"
+            "      - --knowledge\n      - /data/templates/knowledge"
         )
         for compose_name in (
             "deploy/standalone/docker-compose.yml",

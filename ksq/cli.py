@@ -2,32 +2,22 @@
 
 from __future__ import annotations
 
-import argparse
-import time
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import List, Optional
+import argparse
+import time
 
-from ksq.constants import (
-    DEFAULT_CONFIG_PNP_DIR,
-    DEFAULT_KNOWLEDGE,
-    DEFAULT_KNOWLEDGE_ROOT,
-    DEFAULT_PICK_STRATEGY,
-    DEFAULT_SHELVES,
-    DEFAULT_TOOL_MAPPING,
-    DEFAULT_UNAVAILABLE,
-    DEFAULT_VFM_APP_DIR,
-    HOST,
-    PORT,
-)
+import uvicorn
+
+from ksq.constants import DEFAULT_CONFIG_PNP_DIR, DEFAULT_KNOWLEDGE, DEFAULT_KNOWLEDGE_ROOT, DEFAULT_PICK_STRATEGY, DEFAULT_SHELVES, DEFAULT_TOOL_MAPPING, DEFAULT_UNAVAILABLE, DEFAULT_VFM_APP_DIR, HOST, PORT
+from ksq.data import state as state
+from ksq.data.loader import existing_optional_path, resolve_knowledge_path
 from ksq.dataset import build_dataset
 from ksq.package_io import save_package
-from ksq.state_reset import reset_state_if_version_changed
 from ksq.runtime_logging import configure as configure_runtime_logging
 from ksq.runtime_logging import get_logger
-from ksq.web import dashboard_api, data_storage, files_api, state
-from ksq.web.handlers import QueryHandler
-from ksq.web.loader import existing_optional_path, resolve_knowledge_path
+from ksq.state_reset import reset_state_if_version_changed
+from ksq.web.app import create_app
 
 
 LOGGER = get_logger("startup")
@@ -135,19 +125,12 @@ def serve(arguments: Optional[List[str]] = None) -> None:
     reset_state_if_version_changed()
 
     LOGGER.info("数据尚未加载，请在页面中按需加载。")
-    server = ThreadingHTTPServer((parsed.host, parsed.port), QueryHandler)
-    LOGGER.info("服务已监听：http://%s:%s", parsed.host, parsed.port)
-    try:
-        data_storage.start_data_cleanup()
-        dashboard_api.start_dashboard_monitor()
-        server.serve_forever()
-    except KeyboardInterrupt:
-        LOGGER.info("收到退出信号，服务停止")
-    finally:
-        files_api.close_terminals()
-        dashboard_api.stop_dashboard_monitor()
-        data_storage.stop_data_cleanup()
-        server.server_close()
+    # Session/queue ownership is process-local; always run one worker.
+    uvicorn.run(
+        create_app(), host=parsed.host, port=parsed.port, workers=1,
+        proxy_headers=False, access_log=False, log_config=None,
+        ws="websockets-sansio", timeout_graceful_shutdown=10,
+    )
 
 
 def build_package_main(arguments: Optional[List[str]] = None) -> int:

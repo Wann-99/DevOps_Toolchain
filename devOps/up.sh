@@ -24,7 +24,7 @@ COMPILED_DIR="${COMPILED_DIR:-/home/nvidia/compiled}"
 export CONFIG_PNP_DIR="${CONFIG_PNP_DIR:-${COMPILED_DIR}/PNPApp_deploy/config_pnp}"
 # KNOWLEDGE_DIR is the mounted templates root; default target is ./knowledge.
 export KNOWLEDGE_DIR="${KNOWLEDGE_DIR:-${COMPILED_DIR}/VfmApp_deploy/model/templates}"
-export RUNTIME_IMAGE="${RUNTIME_IMAGE:-hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime:v1.1.0}"
+export RUNTIME_IMAGE="${RUNTIME_IMAGE:-hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime:v1.2.0}"
 
 # 兼容旧 .env：旧值通常是 templates/knowledge，新挂载约定需要 templates 根。
 _knowledge_root_candidate="${KNOWLEDGE_DIR%/}"

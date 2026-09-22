@@ -270,9 +270,14 @@
       });
     });
     if (matchedItems.length) displayItems = matchedItems;
+    return productSummary(displayItems);
+  }
+
+  function productSummary(items) {
+    if (!Array.isArray(items)) return "";
     const lines = [];
     const seen = new Set();
-    displayItems.forEach((item) => {
+    items.forEach((item) => {
       if (!item || typeof item !== "object") return;
       const name = String(item.name || item.product_name || "").trim();
       const barcode = String(
@@ -298,10 +303,15 @@
     const previousOrderBlocked =
       payload.error_code === "PREVIOUS_ORDER_REQUIRES_COMPLETION";
     const message = errorSummary(payload, opts.fallback);
-    const productSummary = missingProductSummary(payload, opts.items);
+    const missingSummary = missingProductSummary(payload, opts.items);
+    const unavailableSummary = productSummary(payload.unavailable_items);
     return notice({
       title: previousOrderBlocked ? "请先完成上一单" : opts.title || "操作失败",
-      message: productSummary ? message + "\n\n" + productSummary : message,
+      message: [
+        message,
+        missingSummary,
+        unavailableSummary ? "在不可处理清单中：\n" + unavailableSummary : "",
+      ].filter(Boolean).join("\n\n"),
       confirmText: "确认",
       tone: "error",
     });

@@ -11,8 +11,8 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib.parse import urlencode
 
-from ksq.web import robot_map_api as robot
-from ksq.web import robot_mapping_api as mapping
+from ksq.robot import service as robot
+from ksq.robot import mapping as mapping
 from ksq.web import auth
 
 try:

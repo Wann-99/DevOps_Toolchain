@@ -20,7 +20,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(pwd)"
 
 ACTION="${1:-start}"
-RUNTIME_IMAGE="${RUNTIME_IMAGE:-hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime:v1.1.1}"
+RUNTIME_IMAGE="${RUNTIME_IMAGE:-hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime:v1.2.0}"
 APP_BIN="bin/knowledge_shelf_query.bin"
 APP_BIN_BACKUP="${APP_BIN}.bak"
 export RUNTIME_IMAGE

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ksq.data import service as data_service
+
 import io
 import json
 import tempfile
@@ -13,7 +15,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from ksq.web import auth, data_storage, handlers, import_api, load_progress, loader, state
+from ksq.web import auth, handlers
+from ksq.data import storage as data_storage
+from ksq.data import imports as import_api
+from ksq.data import progress as load_progress
+from ksq.data import loader as loader
+from ksq.data import state as state
+from ksq.order import test_service
+from ksq.web.pages import records_payload
 
 
 CSV = (
@@ -49,7 +58,7 @@ class CloudLoadingTests(unittest.TestCase):
         )
         storage.start()
         self.addCleanup(storage.stop)
-        fields = set(handlers._LOAD_PATH_STATE_FIELDS) | {
+        fields = set(data_service._LOAD_PATH_STATE_FIELDS) | {
             "shelves_source", "configured_config_pnp", "configured_vfm_app",
             "_cli_config_paths", "_cli_knowledge_root", "_cli_knowledge_path",
         }
@@ -113,6 +122,59 @@ class CloudLoadingTests(unittest.TestCase):
     def _current_files(self) -> dict[Path, bytes]:
         return {path.relative_to(self.current): path.read_bytes() for path in self.current.rglob("*") if path.is_file()}
 
+    def test_config_restrictions_merge_with_json_and_filter_generated_orders(self) -> None:
+        state.configured_config_pnp = self.knowledge.parent
+        config = state.configured_config_pnp / "config.py"
+        config.write_text('config.scene.unavailable_shelf_list = ["33"]\n', encoding="utf-8")
+        self.shelves.write_bytes(CSV + (
+            "SKU-2,0690002,blocked,0033,05,01,keep\n"
+            "SKU-3,0690003,available,0019,06,01,keep\n"
+        ).encode())
+        source_json = state.configured_unavailable.read_bytes()
+        status, result = self._request(self._payload("local"))
+        self.assertEqual(status, 200, result)
+        self.assertEqual(set(result["unavailable_ids"]), {"SKU-1", "SKU-2"})
+        self.assertTrue(result["has_unavailable"])
+        records = records_payload(state.loaded_dataset, None, None, state.loaded_unavailable_ids)["records"]
+        self.assertEqual({row["id"]: row["unavailable"] for row in records}, {"SKU-1": "是", "SKU-2": "是", "SKU-3": "否"})
+        with (
+            patch.object(test_service, "STATE_FILE", self.root / "test-order-state.json"),
+            patch.object(test_service, "_candidate_packaging_choices", return_value=["全部"]),
+        ):
+            generated = test_service.generate({"count": 10})
+        self.assertEqual([row["sku_id"] for row in generated["pending"]], ["SKU-3"])
+        self.assertEqual(state.configured_unavailable.read_bytes(), source_json)
+        self.assertEqual(state.loaded_paths["unavailable"].read_bytes(), source_json)
+
+        # Invalid restrictions abort the transaction and preserve the old set.
+        previous = data_service._snapshot_load_path_state()
+        files = self._current_files()
+        config.write_text('config.scene.unavailable_shelf_list = dynamic_rules()\n', encoding="utf-8")
+        status, result = self._request({}, "/api/reload")
+        self.assertEqual(status, 400, result)
+        self.assertEqual(data_service._snapshot_load_path_state(), previous)
+        self.assertEqual(self._current_files(), files)
+
+        config.write_text('config.scene.unavailable_shelf_list = []\n', encoding="utf-8")
+        status, result = self._request({}, "/api/reload")
+        self.assertEqual(status, 200, result)
+        self.assertEqual(state.loaded_unavailable_ids, frozenset({"SKU-1"}))
+
+    def test_config_only_restrictions_work_with_cloud_shelves(self) -> None:
+        state.configured_config_pnp = self.knowledge.parent
+        (state.configured_config_pnp / "config.py").write_text(
+            'config.scene.unavailable_shelf_unit = ["000101"]\n', encoding="utf-8"
+        )
+        payload = self._payload()
+        payload["unavailable"] = ""
+        with patch.object(urllib.request, "urlopen", return_value=CsvResponse()):
+            status, result = self._request(payload)
+        self.assertEqual(status, 200, result)
+        self.assertTrue(result["has_unavailable"])
+        self.assertEqual(result["unavailable_ids"], ["SKU-1"])
+        self.assertEqual(state.loaded_unavailable_ids, frozenset({"SKU-1"}))
+        self.assertIsNone(state.loaded_paths["unavailable"])
+
     def test_cloud_load_and_reload_download_again_keep_local_side_files_and_backup(self) -> None:
         original = {path: path.read_bytes() for path in self.knowledge.parent.rglob("*") if path.is_file()}
         replacement = CSV.replace(b"0001", b"0002")
@@ -155,7 +217,7 @@ class CloudLoadingTests(unittest.TestCase):
         self.shelves.write_bytes(CSV)
         status, result = self._request(self._payload("local"))
         self.assertEqual(status, 200, result)
-        previous = handlers._snapshot_load_path_state()
+        previous = data_service._snapshot_load_path_state()
         files = self._current_files()
         cases = (urllib.error.URLError("connection refused"), CsvResponse(b"not,a,valid,csv\n"))
         for response in cases:
@@ -164,7 +226,7 @@ class CloudLoadingTests(unittest.TestCase):
                 with patch.object(urllib.request, "urlopen", **kwargs):
                     status, result = self._request(self._payload())
                 self.assertEqual(status, 400, result)
-                self.assertEqual(handlers._snapshot_load_path_state(), previous)
+                self.assertEqual(data_service._snapshot_load_path_state(), previous)
                 self.assertEqual(self._current_files(), files)
                 self.assertEqual(list(self.backups.glob("*")), [])
                 self.assertEqual(list((self.root / "data").glob(".staging-*")), [])
@@ -198,6 +260,11 @@ class CloudLoadingTests(unittest.TestCase):
         # Retain the local source as metadata so the local toggle can restore it.
         # Frontend source-control tests assert the cloud input itself stays empty.
         self.assertEqual(result["paths"]["shelves"], self.shelves.name)
+        self.assertEqual(result["source_paths"], {
+            "knowledge": str(self.knowledge.resolve()),
+            "shelves": loader.CLOUD_SHELVES_URL,
+            **{key: str((self.root / "source" / filename).resolve()) for key, (filename, _) in self.sides.items()},
+        })
         self.assertEqual(state.shelves_source, "cloud")
         self.assertFalse(self.shelves.exists())
 

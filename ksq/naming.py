@@ -25,7 +25,7 @@ def matches_file_prefix(file_name: str, prefix: str, suffix: str) -> bool:
 
 
 def is_shelves_file_name(file_name: str) -> bool:
-    return any(
+    return file_name.lower() == "goods-locations.csv" or any(
         matches_file_prefix(file_name, prefix, ".csv")
         for prefix in (SHELVES_FILE_PREFIX, ETM_SHELVES_FILE_PREFIX)
     )
@@ -68,9 +68,13 @@ def is_order_config_file_name(file_name: str) -> bool:
     return lowered in {"order_config.json", "order_config.test.json"}
 
 
+def is_auxiliary_knowledge_file(file_name: str) -> bool:
+    return file_name.lower() in {"block.json", "bookshelf.json", "bottle cap.json"}
+
+
 def is_knowledge_member(member_name: str, file_name: str) -> bool:
     lowered = file_name.lower()
-    if not lowered.endswith(".json"):
+    if not lowered.endswith(".json") or is_auxiliary_knowledge_file(file_name):
         return False
     if is_optional_config_file_name(file_name):
         return False

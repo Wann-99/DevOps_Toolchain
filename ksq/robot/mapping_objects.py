@@ -12,7 +12,7 @@ import math
 import re
 import uuid
 
-from ksq.web import robot_map_api as api
+from ksq.robot import service as api
 
 
 _PATHS = {

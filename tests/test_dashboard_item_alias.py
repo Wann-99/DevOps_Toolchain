@@ -3,7 +3,8 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from ksq.web import dashboard_api as da
+from ksq.dashboard import service as da
+from ksq.order import store as order_store
 
 
 # 现场实测数据：日志的 item 行编号用 sku_id，start process object 行同时带
@@ -37,19 +38,19 @@ ORDERED_ITEM = {
 
 class PersistItemStatesAliasTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.saved = da._ACTIVE_ORDER
-        self.saved_loaded = da._ACTIVE_ORDER_LOADED
+        self.saved = order_store._ACTIVE_ORDER
+        self.saved_loaded = order_store._ACTIVE_ORDER_LOADED
 
     def tearDown(self) -> None:
-        da._ACTIVE_ORDER = self.saved
-        da._ACTIVE_ORDER_LOADED = self.saved_loaded
+        order_store._ACTIVE_ORDER = self.saved
+        order_store._ACTIVE_ORDER_LOADED = self.saved_loaded
 
     def persist(self, order, tasks):
-        da._ACTIVE_ORDER = order
-        da._ACTIVE_ORDER_LOADED = True
-        with patch.object(da, "_save_active_order_unlocked"):
+        order_store._ACTIVE_ORDER = order
+        order_store._ACTIVE_ORDER_LOADED = True
+        with patch.object(order_store, "_save_active_order_unlocked"):
             da._persist_item_states(order, tasks)
-        return da._ACTIVE_ORDER["items"]
+        return order_store._ACTIVE_ORDER["items"]
 
     def test_sku_id_task_does_not_duplicate_existing_barcode_item(self) -> None:
         """核心场景：日志按 sku_id 上报同一药品，不得再追加一条影子子任务。"""
@@ -109,7 +110,7 @@ class PersistItemStatesAliasTests(unittest.TestCase):
 
         self.persist(order, [{"code": SKU_ID, "status": "skipped"}])
 
-        self.assertIn(SKU_ID, da._ACTIVE_ORDER["item_states"])
+        self.assertIn(SKU_ID, order_store._ACTIVE_ORDER["item_states"])
 
 
 if __name__ == "__main__":

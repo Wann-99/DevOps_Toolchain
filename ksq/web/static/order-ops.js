@@ -1,7 +1,7 @@
 (function (global) {
   // 订单操作视图：对齐 devtools（order_broker_ultra_tester.html）的调试能力。
   // 每个接口一张折叠卡片：方法徽章 + 标题 + 卡片内响应区（状态码 + 耗时 + JSON）。
-  // 写操作仅测试模式（服务端 prod 返回 403），PUT 路由要求管理员会话。
+  // 写操作仅测试模式（服务端 prod 返回 403）。
 
   function el(id) {
     return document.getElementById(id);

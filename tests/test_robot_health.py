@@ -8,7 +8,8 @@ import unittest
 from unittest.mock import call, patch
 from urllib.parse import urlencode
 
-from ksq.web import auth, robot_map_api as api
+from ksq.web import auth
+from ksq.robot import service as api
 
 try:
     from ksq.web import handlers

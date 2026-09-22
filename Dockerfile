@@ -1,13 +1,12 @@
 # Stable runtime only. Application code is mounted as knowledge_shelf_query.bin.
-# Python 3.12 is pinned because the application still uses the stdlib cgi module,
-# which was removed in Python 3.13.
+# Python 3.12 remains the deployment baseline for the ASGI runtime.
 FROM docker:27.5.1-cli AS docker-cli
 
 FROM python:3.12.13-slim-bookworm
 
 LABEL org.opencontainers.image.title="knowledge_shelf_query runtime" \
       org.opencontainers.image.description="Python and Docker CLI runtime without application source" \
-      org.opencontainers.image.version="1.1.1"
+      org.opencontainers.image.version="1.2.0"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -17,8 +16,9 @@ WORKDIR /app
 
 RUN mkdir -p /opt/ksq
 
-# Pillow：失败工单的日志截图渲染（飞书附件）依赖它。
-RUN pip3 install --no-cache-dir pillow==10.4.0
+# Web transport and screenshot dependencies; application code stays in the .bin.
+COPY requirements.txt /opt/ksq/requirements.txt
+RUN pip3 install --no-cache-dir -r /opt/ksq/requirements.txt
 
 # 文泉驿正黑：截图里的中文靠它渲染（slim 基础镜像不带任何字体）。
 RUN apt-get update \

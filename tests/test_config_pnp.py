@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 from ksq import config_pnp
-from ksq.web import state
+from ksq.data import state as state
+from ksq.shelves import parse_shelf_locations
+from ksq.side_data import unavailable_ids_from_config
 
 # A representative config.py excerpt matching the device format.
 CONFIG_PY_CONTENT = """\
@@ -31,6 +34,68 @@ class LoadConfigPnpPathsTests(unittest.TestCase):
     def write_config(self, content: str) -> Path:
         (self.directory / "config.py").write_text(content, encoding="utf-8")
         return self.directory
+
+    def test_unavailable_shelves_levels_and_bins_expand_to_all_matching_skus(self) -> None:
+        marker = self.directory / "must-not-run"
+        self.write_config(
+            f"open({str(marker)!r}, 'w').write('executed')\n"
+            'config.scene.unavailable_shelf_list = ["33", "34", "35"]\n'
+            'config.scene.unavailable_shelf_unit = ["1905", "260306", "00270306", "0201"]\n'
+            'config.scene.cannot_process_bin_unit_list = ["28-04-07"]\n'
+        )
+        locations = {
+            "rack-a": "0033,01,01", "rack-b": "33,02,02",
+            "rack-c": "0034,03,01", "rack-d": "35,04,01",
+            "level-a": "0019,05,01", "level-b": "19,5,02",
+            "bin-six": "0026,03,06", "bin-eight": "27,03,06",
+            "bin-dashed": "0028,04,07", "level-short": "2,01,07",
+            "safe-rack": "133,01,01", "safe-level": "19,06,01",
+            "safe-bin": "26,03,07", "safe-global": "90,02,01",
+            "safe-customer": "12,04,05",
+        }
+        shelves = parse_shelf_locations(StringIO(
+            "sku_id,sku_code,name,shelf_number,level,bin_unit,customer_location_code\n"
+            + "".join(f"{sku},barcode-{sku},Drug,{location},190501\n" for sku, location in locations.items())
+            + "multi,barcode-multi,Drug,33,01,01,\n"
+            + "multi,barcode-multi,Drug,99,01,01,\n"
+        ))
+        blocked = unavailable_ids_from_config(self.directory, shelves.entries)
+        self.assertEqual(blocked, {sku for sku in locations if not sku.startswith("safe-")} | {"multi"})
+        self.assertFalse(marker.exists())
+
+    def test_compact_level_is_the_bin_code_without_its_last_two_digits(self) -> None:
+        shelves = parse_shelf_locations(StringIO(
+            "sku_code,name,shelf_number,level,bin_unit\n"
+            "one,Drug,0019,05,01\n"
+            "two,Drug,19,5,02\n"
+            "other-level,Drug,19,06,01\n"
+            "other-shelf,Drug,20,05,01\n"
+        ))
+        for field in ("unavailable_shelf_unit", "cannot_process_bin_unit_list"):
+            for full_code in ("190501", "00190501"):
+                with self.subTest(field=field, full_code=full_code):
+                    self.write_config(f"config.scene.{field} = [{full_code!r}]\n")
+                    self.assertEqual(unavailable_ids_from_config(self.directory, shelves.entries), {"one"})
+                    self.write_config(f"config.scene.{field} = [{full_code[:-2]!r}]\n")
+                    self.assertEqual(unavailable_ids_from_config(self.directory, shelves.entries), {"one", "two"})
+
+    def test_unavailable_config_rejects_invalid_rules_without_execution(self) -> None:
+        marker = self.directory / "must-not-run"
+        for expression in ("make_rules()", "[True]", "[{}]", '"190501"', '["invalid"]', '["19--05"]', f"[open({str(marker)!r}, 'w')]"):
+            with self.subTest(expression=expression):
+                self.write_config(f"config.scene.unavailable_shelf_unit = {expression}\n")
+                with self.assertRaisesRegex(ValueError, "config.scene.unavailable_shelf_unit"):
+                    unavailable_ids_from_config(self.directory, {})
+        self.assertFalse(marker.exists())
+
+    def test_unavailable_config_missing_and_last_empty_assignment(self) -> None:
+        self.assertEqual(config_pnp.load_config_pnp_unavailable(None), {})
+        self.assertEqual(config_pnp.load_config_pnp_unavailable(self.directory), {})
+        self.write_config(
+            'config.scene.unavailable_shelf_list = ["33"]\n'
+            'config.scene.unavailable_shelf_list = []\n'
+        )
+        self.assertEqual(config_pnp.load_config_pnp_unavailable(self.directory), {"unavailable_shelf_list": []})
 
     # ------------------------------------------------------------------
     # Standard parsing & key mapping

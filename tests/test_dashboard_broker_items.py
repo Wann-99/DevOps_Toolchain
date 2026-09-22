@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from ksq.web import dashboard_api as da
+from ksq.dashboard import service as da
 
 
 # 现场 Broker 单任务详情的真实形状（字段已裁剪，保留取值相关的部分）：

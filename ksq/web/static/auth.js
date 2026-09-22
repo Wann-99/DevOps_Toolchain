@@ -5,6 +5,12 @@
 (function (global) {
   const rawFetch = global.fetch.bind(global);
   global.fetch = function (resource, options) {
+    const url = new URL(resource && typeof resource.url === "string" ? resource.url : String(resource), global.location.href);
+    const method = String((options && options.method) || resource.method || "GET").toUpperCase();
+    if (url.origin === global.location.origin && url.pathname.startsWith("/api/map/") &&
+        !["GET", "HEAD"].includes(method) && (!currentUser || currentUser.role !== "admin")) {
+      return Promise.reject(new Error("地图导航操作仅管理员可用。"));
+    }
     return rawFetch(resource, options).then((response) => {
       if (response.status === 401) {
         global.location.href = "/login";
@@ -18,26 +24,27 @@
   let currentUser = null;
 
   // 需要管理员权限的控件（viewer 登录时置灰并阻止点击）。
-  // 仅覆盖三类编辑操作：库位编辑保存、设置配置（工作模式切换除外）、导入。
+  // 各页面均可进入；限制地图操作、查询/设置编辑和数据导入。
   // 服务端仍做最终拦截，此处仅为交互提示。
   const ADMIN_ONLY_SELECTORS = [
-    ".sidebar-nav [data-view='files']",
-    "#view-files input",
-    "#view-files button",
     // 数据加载：仅「导入」方式受限（本机路径 / 包加载放行）
     "#import-form input",
     "#import-form button",
     // 数据查询：库位编辑与保存
     "#view-query [data-role='btn-toggle-edit']",
     "#view-query [data-role='btn-save-edit']",
-    // 测试下单配置由管理员维护；服务端 PUT 同步要求 admin。
-    "#view-test-order #test-order-flag-closed-loop",
-    "#view-test-order #test-order-flag-tool",
-    "#view-test-order #test-order-flag-packaging",
-    // 设置：除工作模式切换外的全部配置项（折叠开关除外）
-    "#view-settings input:not(#settings-mode-toggle)",
+    // 地图保留查看、刷新、图层、缩放、导出和面板开关。
+    "#view-map button:not(.map-toolbar button, .map-drawer-tab, [data-build-command='export'], " +
+      "#map-btn-health-details, #map-btn-get-pose, #map-health-refresh, #map-health-close, " +
+      "#map-btn-cancel-popover, #map-btn-poi-cancel, #map-build-dialog-close, #map-build-dialog-cancel)",
+    "#view-map input:not(.map-toolbar input, .map-live-toolbar input)",
+    "#view-map select, #view-map textarea",
+    // 设置只读，保留查看和刷新；模式切换同样属于编辑。
+    "#view-settings input",
     "#view-settings select",
-    "#view-settings button:not([data-fold-toggle])",
+    "#view-settings textarea",
+    "#view-settings button:not([data-fold-toggle], #settings-order-token, #settings-order-stores, " +
+      "#settings-keyboard-refresh, #settings-cfg-secret-toggle, #settings-feishu-submit)",
   ];
 
   function addViewerBanner(container, text) {
@@ -49,18 +56,28 @@
     container.insertBefore(note, firstCard || container.firstChild);
   }
 
-  function applyViewerRestrictions() {
-    document.body.classList.add("role-viewer");
+  function disableAdminControls() {
     ADMIN_ONLY_SELECTORS.forEach((selector) => {
       document.querySelectorAll(selector).forEach((el) => {
-        el.setAttribute("data-admin-only", "");
-        if ("disabled" in el) el.disabled = true;
+        if (!el.hasAttribute("data-admin-only")) el.setAttribute("data-admin-only", "");
+        if ("disabled" in el && !el.disabled) el.disabled = true;
         el.title = "需要管理员权限";
       });
     });
+  }
+
+  function applyViewerRestrictions() {
+    document.body.classList.add("role-viewer");
+    disableAdminControls();
+    // 轮询会更新 disabled，动态列表也会新增编辑按钮；重新应用同一规则。
+    const observer = new MutationObserver(disableAdminControls);
+    ["view-map", "view-query", "view-settings", "import-form"].forEach((id) => {
+      const root = document.getElementById(id);
+      if (root) observer.observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: ["disabled"] });
+    });
     addViewerBanner(
       document.getElementById("view-settings"),
-      "当前为普通用户：仅工作模式可切换，其余配置项需管理员权限。"
+      "当前为普通用户：可查看配置，编辑和工作模式切换需管理员权限。"
     );
     const importForm = document.getElementById("import-form");
     addViewerBanner(

@@ -1,7 +1,11 @@
-"""Order Broker HTTP API helpers used by the web handler."""
+"""Order business operations backed by Broker and the active-order service."""
 
 from __future__ import annotations
 
+from copy import deepcopy
+from pathlib import Path
+from typing import Callable, Set
+from typing import Dict, List, Optional, Tuple
 import base64
 import binascii
 import json
@@ -9,21 +13,18 @@ import math
 import re
 import threading
 import time
-from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from ksq.constants import ORDER_CONFIG_FILE, ORDER_CONFIG_PROD_FILE
+from ksq.dashboard import settings as dashboard_settings
+from ksq.data import state as data_state
+from ksq.order import active as active_orders
 from ksq.order import broker
-from ksq.order.config import (
-    load_order_config,
-    merge_config_update,
-    public_order_config,
-    save_order_config,
-    validate_order_config,
-)
+from ksq.order import cache as order_cache
+from ksq.order import model as order_model
+from ksq.order.config import load_order_config, merge_config_update, public_order_config, save_order_config, validate_order_config
 from ksq.order.payload import build_create_task_body, generate_order_no
 from ksq.runtime_logging import get_logger
-from ksq.web import state
+from ksq.side_data import resolve_unavailable_label
 
 
 LOGGER = get_logger("order")
@@ -129,8 +130,8 @@ def _token_cache_key(config: Dict[str, object]) -> str:
 
 def _cached_token(config: Dict[str, object]) -> Optional[str]:
     key = _token_cache_key(config)
-    with state.DATASET_LOCK:
-        tokens = getattr(state, "order_access_tokens", None)
+    with order_cache.TOKEN_LOCK:
+        tokens = getattr(order_cache, "order_access_tokens", None)
         if isinstance(tokens, dict):
             cached = tokens.get(key)
             if isinstance(cached, str) and cached:
@@ -138,13 +139,13 @@ def _cached_token(config: Dict[str, object]) -> Optional[str]:
                     return cached
                 tokens.pop(key, None)
         # Backward compatible single-slot cache for the default config path.
-        if state.order_access_token and key == getattr(
-            state, "order_access_token_key", ""
+        if order_cache.order_access_token and key == getattr(
+            order_cache, "order_access_token_key", ""
         ):
-            if not _token_expired(state.order_access_token):
-                return state.order_access_token
-            state.order_access_token = None
-            state.order_access_token_key = ""
+            if not _token_expired(order_cache.order_access_token):
+                return order_cache.order_access_token
+            order_cache.order_access_token = None
+            order_cache.order_access_token_key = ""
     return None
 
 
@@ -170,25 +171,25 @@ def _token_expired(token: str) -> bool:
 
 def _store_token(config: Dict[str, object], token: str) -> None:
     key = _token_cache_key(config)
-    with state.DATASET_LOCK:
-        tokens = getattr(state, "order_access_tokens", None)
+    with order_cache.TOKEN_LOCK:
+        tokens = getattr(order_cache, "order_access_tokens", None)
         if not isinstance(tokens, dict):
             tokens = {}
-            state.order_access_tokens = tokens
+            order_cache.order_access_tokens = tokens
         tokens[key] = token
-        state.order_access_token = token
-        state.order_access_token_key = key
+        order_cache.order_access_token = token
+        order_cache.order_access_token_key = key
 
 
 def _clear_token(config: Dict[str, object]) -> None:
     key = _token_cache_key(config)
-    with state.DATASET_LOCK:
-        tokens = getattr(state, "order_access_tokens", None)
+    with order_cache.TOKEN_LOCK:
+        tokens = getattr(order_cache, "order_access_tokens", None)
         if isinstance(tokens, dict):
             tokens.pop(key, None)
-        if getattr(state, "order_access_token_key", "") == key:
-            state.order_access_token = None
-            state.order_access_token_key = ""
+        if getattr(order_cache, "order_access_token_key", "") == key:
+            order_cache.order_access_token = None
+            order_cache.order_access_token_key = ""
 
 
 def update_config(
@@ -419,32 +420,64 @@ def _ensure_broker_response_succeeded(
 
 
 def ensure_order_creation_allowed() -> None:
-    from ksq.web import dashboard_api
-
-    if dashboard_api.active_order_requires_manual_completion():
+    active_orders.promote_queued_order_if_ready()
+    if active_orders.active_order_requires_manual_completion():
         raise OrderQueueConflict(
             "上一单仍在等待人工确认，当前机器人流程可能已无法继续。",
             "PREVIOUS_ORDER_REQUIRES_COMPLETION",
             "请先到「仪表板 → 门店任务列表」完成上一单，再重新下单。",
         )
-    if dashboard_api.active_order_blocks_new_order():
+    try:
+        active_orders.ensure_order_queue_capacity()
+    except ValueError as error:
         raise OrderQueueConflict(
-            "上一单尚未完成，当前不能下单，请等待上一单完成。",
-            "PREVIOUS_ORDER_IN_PROGRESS",
-            "请等待仪表板中的上一单完成后再下单。",
-        )
+            str(error), "ORDER_QUEUE_FULL", "请等待当前单结束，仪表板会自动切换到等待单。"
+        ) from error
+
+
+def unavailable_order_items(raw_items: object) -> List[Dict[str, str]]:
+    """Explain local unavailable flags without changing Broker submission rules."""
+    if not isinstance(raw_items, list):
+        return []
+    with data_state.DATASET_LOCK:
+        unavailable = data_state.loaded_unavailable_ids
+        dataset = data_state.loaded_dataset
+    if not unavailable:
+        return []
+    aliases: Dict[str, Dict[str, str]] = {}
+    if dataset is not None:
+        for sku_id, entries in dataset.shelf_entries.items():
+            if resolve_unavailable_label(sku_id, unavailable, (entry.sku_code for entry in entries)) != "是":
+                continue
+            for entry in entries:
+                info = {"sku_id": sku_id, "name": entry.name, "barcode": entry.sku_code}
+                for value in (sku_id, entry.sku_code, entry.out_item_id):
+                    if value:
+                        aliases[value] = info
+    result = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        keys = [str(item.get(key) or "").strip() for key in (
+            "sku_id", "item_id", "out_item_id", "barcode", "sku_code", "code",
+        )]
+        if not any(key and (key in unavailable or key in aliases) for key in keys):
+            continue
+        info = next((aliases[key] for key in keys if key in aliases), {})
+        result.append({
+            "sku_id": str(item.get("sku_id") or info.get("sku_id") or ""),
+            "item_id": str(item.get("item_id") or item.get("out_item_id") or ""),
+            "name": str(item.get("name") or item.get("common_name") or info.get("name") or ""),
+            "barcode": str(item.get("barcode") or item.get("sku_code") or item.get("code") or info.get("barcode") or ""),
+        })
+    return result
 
 
 def create_order(payload: Dict[str, object]) -> Tuple[int, object, Dict[str, object]]:
-    from ksq.web import dashboard_api
 
-    mode = dashboard_api.resolve_dashboard_mode(payload.get("mode"))
+    mode = dashboard_settings.resolve_dashboard_mode(payload.get("mode"))
     ensure_order_creation_allowed()
-    try:
-        dashboard_api.ensure_order_queue_capacity()
-    except ValueError as error:
-        raise OrderQueueConflict(str(error)) from error
-    blocking = set(dashboard_api.active_order_blocking_keys())
+    blocking = set(active_orders.active_order_blocking_keys())
     raw_items = payload.get("items")
     if blocking and isinstance(raw_items, list):
         conflicts = []
@@ -506,7 +539,6 @@ def create_registered_order(
     payload: Dict[str, object], source: str = "order"
 ) -> Tuple[int, object, Dict[str, object], Dict[str, object]]:
     """Serialize Broker creation and local queue registration."""
-    from ksq.web import dashboard_api
 
     with _ORDER_CREATE_LOCK:
         status, data, body = create_order(payload)
@@ -516,7 +548,7 @@ def create_registered_order(
                 "Broker 响应缺少 task_id，下单结果无法注册。", status, data
             )
         try:
-            session = dashboard_api.register_created_order(task_id, body, source)
+            session = active_orders.register_created_order(task_id, body, source)
         except ValueError as error:
             # Capacity was checked while holding _ORDER_CREATE_LOCK; this only
             # protects against an unrelated manual dashboard overwrite.
@@ -527,13 +559,12 @@ def create_registered_order(
 def get_task_detail(
     task_id: str, config_file: Optional[Path] = None
 ) -> Tuple[int, object]:
-    from ksq.web import dashboard_api
 
     if config_file is not None:
         path = config_file
         mode = _mode_for_config_file(path)
     else:
-        mode = dashboard_api.resolve_dashboard_mode("")
+        mode = dashboard_settings.resolve_dashboard_mode("")
         path = config_file_for_mode(mode)
     config = load_order_config(path)
     token = _ensure_token(config, mode)
@@ -823,12 +854,11 @@ def list_tasks(
 
 
 def _current_task_context() -> Tuple[Dict[str, object], str, Dict[str, object], str]:
-    from ksq.web import dashboard_api
 
-    mode = dashboard_api.resolve_dashboard_mode("")
+    mode = dashboard_settings.resolve_dashboard_mode("")
     if mode == "prod":
         raise ProductionOrderWriteForbidden("生产模式不允许修改工单。")
-    active = dashboard_api.get_active_order()
+    active = active_orders.get_active_order()
     if not isinstance(active, dict):
         raise CurrentOrderConflict("当前没有活动工单。")
     task_id = str(active.get("task_id") or "").strip()
@@ -886,9 +916,8 @@ def operate_current_order(action: str, cancel_reason: object = "") -> Dict[str, 
         )
     _ensure_task_action_succeeded(action_value, status_code, data)
     clear_task_list_cache()
-    from ksq.web import dashboard_api
 
-    dashboard_api.invalidate_broker_order_cache(task_id)
+    order_cache.invalidate_broker_order_cache(task_id)
     return {
         "ok": True,
         "action": action_value,
@@ -905,7 +934,6 @@ def operate_task(
     cancel_reason: object = "",
     cancel_type: object = "user",
 ) -> Dict[str, object]:
-    from ksq.web import dashboard_api
 
     action_value = str(action or "").strip().lower()
     if action_value not in {"cancel", "manual_claim", "manual_complete"}:
@@ -913,7 +941,7 @@ def operate_task(
     task_id_value = str(task_id or "").strip()
     if not task_id_value:
         raise ValueError("task_id 不能为空。")
-    mode = dashboard_api.resolve_dashboard_mode("")
+    mode = dashboard_settings.resolve_dashboard_mode("")
     if mode == "prod":
         raise ProductionOrderWriteForbidden("生产模式不允许修改工单。")
     config = load_order_config(config_file_for_mode(mode))
@@ -965,7 +993,7 @@ def operate_task(
         )
     _ensure_task_action_succeeded(action_value, status_code, data)
     clear_task_list_cache()
-    dashboard_api.invalidate_broker_order_cache(task_id_value)
+    order_cache.invalidate_broker_order_cache(task_id_value)
     result: Dict[str, object] = {
         "ok": True,
         "action": action_value,
@@ -974,22 +1002,21 @@ def operate_task(
         "status": status_code,
         "data": data,
     }
-    active = dashboard_api.get_active_order()
+    active = active_orders.get_active_order()
     active_task_id = (
         str(active.get("task_id") or "").strip() if isinstance(active, dict) else ""
     )
     if active_task_id == task_id_value:
         # 仪表板活跃订单的生命周期由 get_dashboard_snapshot 轮询同步；
         # 此处保留订单状态摘要供前端即时刷新。
-        result["queue"] = dashboard_api.order_queue_status()
+        result["queue"] = active_orders.order_queue_status()
     return result
 
 
 def _test_mode_write_config() -> Tuple[Dict[str, object], str]:
     """订单/门店写操作仅测试模式开放；返回已校验的配置与模式。"""
-    from ksq.web import dashboard_api
 
-    mode = dashboard_api.resolve_dashboard_mode("")
+    mode = dashboard_settings.resolve_dashboard_mode("")
     if mode == "prod":
         raise ProductionOrderWriteForbidden("生产模式不允许修改工单。")
     config = load_order_config(config_file_for_mode(mode))
@@ -1025,9 +1052,8 @@ def update_task_retail_order(
     )
     _ensure_task_action_succeeded("update", status, data)
     clear_task_list_cache()
-    from ksq.web import dashboard_api
 
-    dashboard_api.invalidate_broker_order_cache(task_id_value)
+    order_cache.invalidate_broker_order_cache(task_id_value)
     return {
         "ok": True,
         "task_id": task_id_value,
@@ -1059,9 +1085,8 @@ def operate_order_action(action: str, order_no: str) -> Dict[str, object]:
     )
     _ensure_task_action_succeeded(action_value, status, data)
     clear_task_list_cache()
-    from ksq.web import dashboard_api
 
-    dashboard_api.invalidate_broker_order_cache("")
+    order_cache.invalidate_broker_order_cache("")
     return {
         "ok": True,
         "action": action_value,
@@ -1082,9 +1107,8 @@ def _resolve_store_id(config: Dict[str, object], store_id: object) -> str:
 
 def list_business_modes() -> Dict[str, object]:
     """GET /api/business-modes：可选业务模式列表（只读，双模式可用）。"""
-    from ksq.web import dashboard_api
 
-    mode = dashboard_api.resolve_dashboard_mode("")
+    mode = dashboard_settings.resolve_dashboard_mode("")
     config = load_order_config(config_file_for_mode(mode))
     validate_order_config(config)
     status, data = _request_with_token_retry(
@@ -1100,9 +1124,8 @@ def list_business_modes() -> Dict[str, object]:
 
 def get_business_config(store_id: object = "") -> Dict[str, object]:
     """GET /api/retail-stores/{store_id}/business-config（只读，双模式可用）。"""
-    from ksq.web import dashboard_api
 
-    mode = dashboard_api.resolve_dashboard_mode("")
+    mode = dashboard_settings.resolve_dashboard_mode("")
     config = load_order_config(config_file_for_mode(mode))
     validate_order_config(config)
     store = _resolve_store_id(config, store_id)
@@ -1280,3 +1303,88 @@ def extract_task_id(response_body: object) -> Optional[str]:
     if isinstance(task_id, str) and task_id.strip():
         return task_id.strip()
     return None
+
+
+def _fetch_broker_order(task_id: str, mode: str = "test") -> Dict[str, object]:
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return {"ok": False, "error": "无 task_id"}
+    cache_key = "%s|%s" % (mode, task_id)
+    now = time.monotonic()
+    with order_cache._BROKER_ORDER_CACHE_LOCK:
+        cached = order_cache._BROKER_ORDER_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < order_cache._BROKER_ORDER_CACHE_TTL_SECONDS:
+            return deepcopy(cached[1])
+    try:
+        from ksq.order.broker import OrderBrokerError
+
+        config_file = (
+            ORDER_CONFIG_PROD_FILE if mode == "prod" else ORDER_CONFIG_FILE
+        )
+        if mode == "prod" and not config_file.is_file():
+            return {
+                "ok": False,
+                "error": "未找到生产 Broker 配置 order_config.prod.json",
+            }
+        status_code, data = get_task_detail(task_id, config_file)
+        task = order_model._unwrap_broker_task(data)
+        if task is None:
+            return {
+                "ok": False,
+                "http_status": status_code,
+                "error": "任务详情格式无效",
+            }
+        broker_status = str(task.get("status") or "").strip()
+        platform_order_no = order_model._platform_order_no_from_task_dict(task)
+        order_source = order_model._infer_order_source(
+            task.get("order_source"), platform_order_no
+        )
+        if not order_source:
+            params = task.get("params")
+            if isinstance(params, dict):
+                order_source = order_model._infer_order_source(
+                    params.get("order_source"), platform_order_no
+                )
+        result = {
+            "ok": True,
+            "http_status": status_code,
+            "task_id": str(task.get("task_id") or task_id).strip(),
+            "order_no": order_model._order_no_from_task_dict(task),
+            "platform_order_no": platform_order_no,
+            "order_source": order_source,
+            "status": broker_status,
+            "status_label": order_model._BROKER_STATUS_LABELS.get(
+                broker_status, broker_status or "未知"
+            ),
+            "ended": broker_status in order_model._BROKER_ORDER_ENDED,
+            "terminal": broker_status in order_model._BROKER_ORDER_TERMINAL,
+            "create_time": str(
+                task.get("create_time") or task.get("order_time") or ""
+            ),
+            "raw": task,
+            "source": "broker",
+        }
+        with order_cache._BROKER_ORDER_CACHE_LOCK:
+            order_cache._BROKER_ORDER_CACHE[cache_key] = (time.monotonic(), deepcopy(result))
+        return result
+    except OrderBrokerError as error:
+        return {
+            "ok": False,
+            "error": str(error),
+            "http_status": error.status_code,
+        }
+    except (ValueError, FileNotFoundError, KeyError, TypeError) as error:
+        return {"ok": False, "error": str(error)}
+
+
+def _is_broker_configured(mode: str) -> bool:
+    """Return True when order_config has valid Broker credentials."""
+    from ksq.order.config import load_order_config, validate_order_config
+
+    config_file = ORDER_CONFIG_PROD_FILE if mode == "prod" else ORDER_CONFIG_FILE
+    try:
+        config = load_order_config(config_file)
+        validate_order_config(config)
+        return True
+    except (ValueError, FileNotFoundError, json.JSONDecodeError, OSError):
+        return False

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ksq.dashboard import settings as dashboard_settings
+
 import json
 import unittest
 from unittest.mock import patch
@@ -16,7 +18,7 @@ from ksq.feishu.event_builder import build_events
 from ksq.feishu.form_builder import build_form_fields
 from ksq.feishu.log_parser import parse_robot_log
 from ksq.feishu.pipeline import build_submission
-from ksq.web import dashboard_api
+from ksq.dashboard import service as dashboard_api
 
 
 LOG = """2026-08-20T10:00:00Z case_id=L39
@@ -278,7 +280,7 @@ class ConfigurationAndSubmissionTests(unittest.TestCase):
         fetch.assert_not_called()
 
     def test_new_config_ignores_old_business_fields(self) -> None:
-        config = dashboard_api._normalize_feishu_settings(
+        config = dashboard_settings._normalize_feishu_settings(
             {
                 "enabled": False,
                 "tester": "old",
@@ -304,7 +306,7 @@ class ConfigurationAndSubmissionTests(unittest.TestCase):
         self.assertEqual(config["selected_form"], "new-form")
 
     def test_feishu_link_is_parsed_into_submission_target(self) -> None:
-        form = dashboard_api._normalize_feishu_forms(
+        form = dashboard_settings._normalize_feishu_forms(
             [
                 {
                     "name": "药房功能测试",
@@ -319,7 +321,7 @@ class ConfigurationAndSubmissionTests(unittest.TestCase):
 
     def test_feishu_link_rejects_missing_table_query(self) -> None:
         with self.assertRaisesRegex(ValueError, "链接无效"):
-            dashboard_api._normalize_feishu_forms(
+            dashboard_settings._normalize_feishu_forms(
                 [{"name": "缺少表格", "url": "https://feishu.cn/base/token"}],
                 strict=True,
             )
@@ -379,7 +381,7 @@ class ConfigurationAndSubmissionTests(unittest.TestCase):
 
     def test_enabled_config_rejects_incomplete_form(self) -> None:
         with self.assertRaisesRegex(ValueError, "完整填写"):
-            dashboard_api._normalize_feishu_settings(
+            dashboard_settings._normalize_feishu_settings(
                 {
                     "enabled": True,
                     "app_id": "app",

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from ksq.order import active as active_orders
+from ksq.dashboard import settings as dashboard_settings
+
 import base64
 import inspect
 import io
@@ -15,7 +18,12 @@ from urllib.parse import parse_qs, urlparse
 from ksq.order import broker
 from ksq.order import config as order_config
 from ksq.order.payload import build_create_task_body
-from ksq.web import auth, dashboard_api, order_api
+from ksq.web import auth
+from ksq.dashboard import service as dashboard_api
+from ksq.order import service as order_api
+from ksq.data import state as data_state
+from ksq.shelves import parse_shelf_locations
+from types import SimpleNamespace
 
 try:
     from ksq.web.handlers import QueryHandler
@@ -123,7 +131,7 @@ class ConfigurationDefaultsTests(unittest.TestCase):
         self.assertTrue(str(body["platform_order_no"]).startswith("JD"))
 
     def test_feishu_default_is_disabled(self) -> None:
-        self.assertFalse(dashboard_api._default_feishu_settings()["enabled"])
+        self.assertFalse(dashboard_settings._default_feishu_settings()["enabled"])
 
     def test_store_id_is_only_required_for_order_validation(self) -> None:
         config = dict(VALID_CONFIG)
@@ -159,16 +167,16 @@ class StoreListingTests(unittest.TestCase):
         key = order_api._token_cache_key(config)
         with (
             patch.object(order_api, "load_order_config", return_value=config),
-            patch.object(order_api.state, "order_access_tokens", {key: token}),
-            patch.object(order_api.state, "order_access_token", None),
+            patch.object(order_api.order_cache, "order_access_tokens", {key: token}),
+            patch.object(order_api.order_cache, "order_access_token", None),
             patch.object(order_api.time, "time", return_value=100),
         ):
             self.assertTrue(order_api.get_public_config("test")["token_ready"])
 
         with (
             patch.object(order_api, "load_order_config", return_value=config),
-            patch.object(order_api.state, "order_access_tokens", {key: token}),
-            patch.object(order_api.state, "order_access_token", None),
+            patch.object(order_api.order_cache, "order_access_tokens", {key: token}),
+            patch.object(order_api.order_cache, "order_access_token", None),
             patch.object(order_api.time, "time", return_value=201),
         ):
             self.assertFalse(order_api.get_public_config("test")["token_ready"])
@@ -643,8 +651,8 @@ class CurrentOrderActionTests(unittest.TestCase):
 
     def test_production_mode_is_forbidden_before_reading_active_order(self) -> None:
         with (
-            patch.object(dashboard_api, "resolve_dashboard_mode", return_value="prod"),
-            patch.object(dashboard_api, "get_active_order") as active,
+            patch.object(dashboard_settings, "resolve_dashboard_mode", return_value="prod"),
+            patch.object(active_orders, "get_active_order") as active,
         ):
             with self.assertRaises(order_api.ProductionOrderWriteForbidden):
                 order_api.operate_current_order("manual_claim")
@@ -652,17 +660,17 @@ class CurrentOrderActionTests(unittest.TestCase):
 
     def test_missing_current_order_is_a_conflict(self) -> None:
         with (
-            patch.object(dashboard_api, "resolve_dashboard_mode", return_value="test"),
-            patch.object(dashboard_api, "get_active_order", return_value=None),
+            patch.object(dashboard_settings, "resolve_dashboard_mode", return_value="test"),
+            patch.object(active_orders, "get_active_order", return_value=None),
         ):
             with self.assertRaises(order_api.CurrentOrderConflict):
                 order_api.operate_current_order("manual_claim")
 
     def test_missing_order_number_is_a_conflict(self) -> None:
         with (
-            patch.object(dashboard_api, "resolve_dashboard_mode", return_value="test"),
+            patch.object(dashboard_settings, "resolve_dashboard_mode", return_value="test"),
             patch.object(
-                dashboard_api,
+                active_orders,
                 "get_active_order",
                 return_value={
                     "task_id": "current-task",
@@ -722,10 +730,10 @@ class OperateTaskTests(unittest.TestCase):
             },
         )
         with (
-            patch.object(dashboard_api, "resolve_dashboard_mode", return_value="test"),
-            patch.object(dashboard_api, "get_active_order", return_value=active_order),
+            patch.object(dashboard_settings, "resolve_dashboard_mode", return_value="test"),
+            patch.object(active_orders, "get_active_order", return_value=active_order),
             patch.object(
-                dashboard_api, "order_queue_status", return_value={"total": 1}
+                active_orders, "order_queue_status", return_value={"total": 1}
             ),
             patch.object(order_api, "load_order_config", return_value=VALID_CONFIG),
             patch.object(order_api, "_ensure_token", return_value="token"),
@@ -828,7 +836,7 @@ class OperateTaskTests(unittest.TestCase):
 
     def test_production_mode_is_forbidden_before_broker_call(self) -> None:
         with (
-            patch.object(dashboard_api, "resolve_dashboard_mode", return_value="prod"),
+            patch.object(dashboard_settings, "resolve_dashboard_mode", return_value="prod"),
             patch.object(order_api.broker, "get_robot_task") as detail,
         ):
             with self.assertRaises(order_api.ProductionOrderWriteForbidden):
@@ -850,7 +858,7 @@ class OperateTaskTests(unittest.TestCase):
     def test_mismatched_broker_task_is_a_conflict(self) -> None:
         detail = (200, {"data": {"task_id": "other-task", "status": "running"}})
         with (
-            patch.object(dashboard_api, "resolve_dashboard_mode", return_value="test"),
+            patch.object(dashboard_settings, "resolve_dashboard_mode", return_value="test"),
             patch.object(order_api, "load_order_config", return_value=VALID_CONFIG),
             patch.object(order_api, "_ensure_token", return_value="token"),
             patch.object(order_api.broker, "get_robot_task", return_value=detail),
@@ -900,8 +908,8 @@ class ErrorPayloadTests(unittest.TestCase):
 
     def test_detail_lookup_does_not_change_active_order(self) -> None:
         with (
-            patch.object(dashboard_api, "resolve_dashboard_mode", return_value="test"),
-            patch.object(dashboard_api, "get_active_order") as active,
+            patch.object(dashboard_settings, "resolve_dashboard_mode", return_value="test"),
+            patch.object(active_orders, "get_active_order") as active,
             patch.object(order_api, "load_order_config", return_value=VALID_CONFIG),
             patch.object(order_api, "_ensure_token", return_value="token"),
             patch.object(
@@ -925,10 +933,10 @@ class CreateOrderBusinessCodeTests(unittest.TestCase):
     def _create(self, create_side_effect, items=None):
         with (
             patch.object(
-                dashboard_api, "ensure_order_queue_capacity", return_value=None
+                active_orders, "ensure_order_queue_capacity", return_value=None
             ),
             patch.object(
-                dashboard_api, "active_order_blocking_keys", return_value=[]
+                active_orders, "active_order_blocking_keys", return_value=[]
             ),
             patch.object(
                 order_api, "load_order_config", return_value=dict(self.CONFIG)
@@ -1010,7 +1018,7 @@ class CreateOrderBusinessCodeTests(unittest.TestCase):
                 "create_order",
                 return_value=(200, {"code": 0, "data": {}}, {"items": []}),
             ),
-            patch.object(dashboard_api, "register_created_order") as register,
+            patch.object(active_orders, "register_created_order") as register,
             self.assertRaisesRegex(broker.OrderBrokerError, "缺少 task_id"),
         ):
             order_api.create_registered_order({"items": []})
@@ -1020,7 +1028,7 @@ class CreateOrderBusinessCodeTests(unittest.TestCase):
     def test_unresolved_previous_prompt_is_rejected_before_broker_request(self) -> None:
         with (
             patch.object(
-                dashboard_api,
+                active_orders,
                 "active_order_requires_manual_completion",
                 return_value=True,
             ),
@@ -1081,6 +1089,45 @@ class OrderRouteTests(unittest.TestCase):
             raise AssertionError(f"Unsupported test method: {method}")
         return int(response["status"]), response["data"]
 
+    def test_create_errors_keep_original_details_and_list_unavailable_medicines(self) -> None:
+        shelves = parse_shelf_locations(io.StringIO(
+            "sku_id,sku_code,out_item_id,name,shelf_number,level,bin_unit\n"
+            "SKU-1,690001,1001,配置禁用药,0019,05,01\n"
+            "SKU-2,690002,1002,JSON禁用药,0020,01,01\n"
+            "SKU-3,690003,1003,正常药,0021,01,01\n"
+        ))
+        items = [{"item_id": str(code), "location_code": "190501"} for code in (1001, 1002, 1003)]
+        payload = {"items": items}
+        errors = (
+            (broker.OrderBrokerError("原有错误", 200, {"code": 4552, "msg": "原有错误"}), 502),
+            (order_api.OrderQueueConflict("队列已满", "ORDER_QUEUE_FULL"), 409),
+            (ValueError("库位不能为空"), 400),
+        )
+        with patch.multiple(
+            data_state, data_load_method="paths",
+            loaded_dataset=SimpleNamespace(shelf_entries=shelves.entries),
+            loaded_unavailable_ids=frozenset({"SKU-1", "690002"}),
+        ):
+            for error, expected_status in errors:
+                with self.subTest(error=str(error)), patch.object(
+                    order_api, "create_registered_order", side_effect=error
+                ) as create:
+                    status, result = self.request("POST", "/api/order/create", payload)
+                self.assertEqual(status, expected_status)
+                self.assertEqual(result["error"], str(error))
+                self.assertEqual([item["name"] for item in result["unavailable_items"]], ["配置禁用药", "JSON禁用药"])
+                self.assertEqual([item["barcode"] for item in result["unavailable_items"]], ["690001", "690002"])
+                create.assert_called_once_with(payload, "order")
+                if expected_status == 502:
+                    self.assertEqual(result["upstream"], {"code": 4552, "msg": "原有错误"})
+                    self.assertIn("库位管理工具", result["hint"])
+
+            for item in ({"sku_id": "SKU-1"}, {"barcode": "690002"}, {"sku_code": "690002"}):
+                self.assertEqual(len(order_api.unavailable_order_items([item])), 1)
+            self.assertEqual(order_api.unavailable_order_items([None, {"item_id": "1003"}]), [])
+        with patch.object(data_state, "loaded_unavailable_ids", None):
+            self.assertEqual(order_api.unavailable_order_items(items), [])
+
     def test_list_ignores_browser_store_id(self) -> None:
         expected = {
             "mode": "test",
@@ -1093,7 +1140,7 @@ class OrderRouteTests(unittest.TestCase):
             "has_more": False,
         }
         with (
-            patch.object(dashboard_api, "resolve_dashboard_mode", return_value="test"),
+            patch.object(dashboard_settings, "resolve_dashboard_mode", return_value="test"),
             patch.object(order_api, "list_tasks", return_value=expected) as list_tasks,
         ):
             status, data = self.request(
@@ -1103,6 +1150,114 @@ class OrderRouteTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(data, expected)
         self.assertNotIn("store_id", list_tasks.call_args.kwargs)
+
+    def test_list_uses_server_mode_and_preserves_query_parameters(self) -> None:
+        with (
+            patch.object(dashboard_settings, "resolve_dashboard_mode", return_value="prod") as mode,
+            patch.object(order_api, "list_tasks", return_value={"tasks": []}) as list_tasks,
+        ):
+            status, data = self.request(
+                "GET", "/api/order/tasks?mode=test&store_id=ignored&page=2"
+                "&page_size=20&order_by=asc&status=success&tz=Asia%2FShanghai&refresh=1"
+            )
+        self.assertEqual((status, data), (200, {"tasks": []}))
+        mode.assert_called_once_with("")
+        list_tasks.assert_called_once_with(
+            mode="prod", page="2", page_size="20", order_by="asc",
+            status="success", timezone_name="Asia/Shanghai", refresh="1",
+        )
+
+    def test_order_reads_require_login(self) -> None:
+        for suffix, service in (
+            ("config", "get_public_config"), ("stores", "list_stores"),
+            ("tasks", "list_tasks"), ("tasks/task-1", "get_task_detail"),
+            ("business-modes", "list_business_modes"),
+            ("business-config", "get_business_config"),
+        ):
+            with (
+                self.subTest(path=suffix),
+                patch.object(auth, "session_from_cookie", return_value=None),
+                patch.object(order_api, service) as operation,
+                patch.object(dashboard_settings, "resolve_dashboard_mode") as mode,
+            ):
+                status, data = self.request("GET", "/api/order/" + suffix)
+                self.assertEqual(status, 401)
+                self.assertIn("error", data)
+                operation.assert_not_called()
+                mode.assert_not_called()
+
+    def test_config_secret_visibility_remains_role_based(self) -> None:
+        for role in (auth.ROLE_ADMIN, auth.ROLE_VIEWER):
+            with (
+                self.subTest(role=role),
+                patch.object(auth, "session_from_cookie", return_value={"role": role}),
+                patch.object(dashboard_settings, "resolve_dashboard_mode", return_value="prod") as mode,
+                patch.object(order_api, "get_public_config", return_value={"mode": "prod"}) as config,
+            ):
+                status, data = self.request("GET", "/api/order/config?mode=prod")
+                self.assertEqual((status, data), (200, {"mode": "prod"}))
+                mode.assert_called_once_with("prod")
+                config.assert_called_once_with("prod", include_secret=role == auth.ROLE_ADMIN)
+
+    def test_viewer_reads_preserve_service_responses(self) -> None:
+        for suffix, service, args, result, expected in (
+            ("stores?mode=prod", "list_stores", ("prod",), {"stores": []}, {"stores": []}),
+            ("tasks?mode=test", "list_tasks", None, {"tasks": []}, {"tasks": []}),
+            ("business-modes", "list_business_modes", (), {"modes": []}, {"modes": []}),
+            ("business-config?store_id=store%20one", "get_business_config", ("store one",),
+             {"ok": True}, {"ok": True}),
+            ("tasks/task%20one", "get_task_detail", ("task one",),
+             (202, {"id": "task one"}), {"status": 202, "data": {"id": "task one"}}),
+        ):
+            with (
+                self.subTest(path=suffix),
+                patch.object(auth, "session_from_cookie", return_value={"role": auth.ROLE_VIEWER}),
+                patch.object(dashboard_settings, "resolve_dashboard_mode", return_value="prod"),
+                patch.object(order_api, service, return_value=result) as operation,
+            ):
+                self.assertEqual(self.request("GET", "/api/order/" + suffix), (200, expected))
+                if args is not None:
+                    operation.assert_called_once_with(*args)
+
+    def test_order_read_errors_preserve_status_and_redaction(self) -> None:
+        upstream = broker.OrderBrokerError(
+            "upstream failed", 403, {"message": "denied", "client_secret": "fixture-secret"}
+        )
+        for suffix, service in (
+            ("stores", "list_stores"), ("tasks", "list_tasks"),
+            ("business-modes", "list_business_modes"),
+            ("business-config", "get_business_config"),
+            ("tasks/task-1", "get_task_detail"),
+        ):
+            failures = [(upstream, 502)]
+            if service != "get_task_detail":
+                failures.append((ValueError("invalid query"), 400))
+            for failure, expected_status in failures:
+                with (
+                    self.subTest(path=suffix, status=expected_status),
+                    patch.object(dashboard_settings, "resolve_dashboard_mode", return_value="prod"),
+                    patch.object(order_api, service, side_effect=failure),
+                ):
+                    status, data = self.request("GET", "/api/order/" + suffix)
+                    self.assertEqual(status, expected_status)
+                    if expected_status == 502:
+                        self.assertEqual(data["upstream_status"], 403)
+                        self.assertEqual(data["upstream"]["client_secret"], "***")
+                    else:
+                        self.assertEqual(data, {"error": "invalid query"})
+
+    def test_detail_rejects_invalid_task_id_before_service_call(self) -> None:
+        for suffix in ("", "%20", "a%2Fb", "a/b"):
+            with self.subTest(task_id=suffix), patch.object(order_api, "get_task_detail") as detail:
+                status, data = self.request("GET", "/api/order/tasks/" + suffix)
+                self.assertEqual((status, data), (400, {"error": "task_id 无效。"}))
+                detail.assert_not_called()
+
+    def test_unknown_order_read_keeps_not_found_response(self) -> None:
+        self.assertEqual(
+            self.request("GET", "/api/order/unknown"),
+            (404, {"error": "Endpoint not found"}),
+        )
 
     def test_order_preflight_returns_structured_previous_order_conflict(self) -> None:
         conflict = order_api.OrderQueueConflict(

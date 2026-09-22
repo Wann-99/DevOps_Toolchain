@@ -45,6 +45,10 @@
         <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-7-6.1-7-11.5A7 7 0 0 1 19 9.5C19 14.9 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.4"/></svg>
         <span class="nav-label">地图导航</span>
       </button>
+      <button type="button" class="nav-item" data-view="arm" title="机械臂">
+        <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21h16M8 21v-4l5-5-5-5 3-3 7 7-4 6v4M11 4l4-2 3 3-2 4"/><circle cx="8" cy="7" r="2"/><circle cx="13" cy="12" r="2"/></svg>
+        <span class="nav-label">机械臂</span>
+      </button>
       <button type="button" class="nav-item" data-view="logs" title="日志查询">
         <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 3.5h-7v17h11v-13z"/><path d="M13.5 3.5v4h4"/><path d="M9.5 12.5h5m-5 3.5h5"/></svg>
         <span class="nav-label">日志查询</span>
@@ -97,6 +101,12 @@
       <div class="app-boot-spinner" aria-hidden="true"></div>
       <p class="app-boot-text">加载中…</p>
     </div>
+    <section id="view-arm" class="view" hidden>
+      <div class="arm-toolbar actions">
+        <button id="arm-refresh" class="secondary" type="button">刷新</button>
+      </div>
+      <iframe id="arm-frame" title="机械臂示教器" allow="fullscreen" sandbox="allow-scripts allow-same-origin allow-forms allow-downloads allow-popups"></iframe>
+    </section>
     <section id="view-dashboard" class="view" hidden>
       <div class="dash-top">
         <div>
@@ -388,11 +398,11 @@
         <div id="path-panel" class="panel active" data-load-method="path">
           <form id="path-form">
             <div class="path-fields">
-              <label class="path-field"><span>Knowledge 目录</span><input id="knowledge-path" value="__KNOWLEDGE__" required></label>
-              <label class="path-field"><span>库位表（sku-shelves* / etm_sku_locations_cache*）</span><input id="shelves-path" value="__SHELVES__" required></label>
-              <label class="path-field"><span>不可处理列表</span><input id="unavailable-path" value="__UNAVAILABLE__"></label>
-              <label class="path-field"><span>工具映射</span><input id="tool-mapping-path" value="__TOOL_MAPPING__"></label>
-              <label class="path-field"><span>闭环吸取列表</span><input id="pick-strategy-path" value="__PICK_STRATEGY__"></label>
+              <label class="path-field"><span>Knowledge 目录 <small data-source-path="knowledge"></small></span><input id="knowledge-path" value="__KNOWLEDGE__" required></label>
+              <label class="path-field"><span>库位表（sku-shelves* / etm_sku_locations_cache*） <small data-source-path="shelves"></small></span><input id="shelves-path" value="__SHELVES__" required></label>
+              <label class="path-field"><span>不可处理列表 <small data-source-path="unavailable"></small></span><input id="unavailable-path" value="__UNAVAILABLE__"></label>
+              <label class="path-field"><span>工具映射 <small data-source-path="tool_mapping"></small></span><input id="tool-mapping-path" value="__TOOL_MAPPING__"></label>
+              <label class="path-field"><span>闭环吸取列表 <small data-source-path="pick_strategy"></small></span><input id="pick-strategy-path" value="__PICK_STRATEGY__"></label>
             </div>
             <div class="actions">
               <button class="primary" type="submit">加载数据</button>

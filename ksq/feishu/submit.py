@@ -10,7 +10,7 @@ from typing import Dict, List, Mapping, Optional, Sequence
 from ksq.feishu.client import FeishuApiError, create_bitable_record
 from ksq.feishu.pipeline import build_submission
 from ksq.feishu.rules import normalize_rule_id
-from ksq.web.logs_api import LogServiceError, fetch_logs
+from ksq.robot.logs import LogServiceError, fetch_logs
 
 
 _SUBMIT_LOCK = Lock()

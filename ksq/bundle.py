@@ -12,6 +12,7 @@ from ksq.constants import (
 )
 from ksq.models import BundlePaths
 from ksq.naming import (
+    is_auxiliary_knowledge_file,
     is_knowledge_member,
     is_pick_strategy_file_name,
     is_shelves_file_name,
@@ -34,12 +35,16 @@ def extract_bundle_from_zip(zip_path: Path, destination: Path) -> BundlePaths:
     tool_mapping_file: Path | None = None
     pick_strategy_file: Path | None = None
     saved_knowledge_count = 0
+    ignored_files: list[str] = []
 
     with zipfile.ZipFile(zip_path) as archive:
         for member_name in archive.namelist():
             if member_name.endswith("/"):
                 continue
             file_name = Path(member_name).name
+            if is_auxiliary_knowledge_file(file_name):
+                ignored_files.append(file_name)
+                continue
             if is_shelves_file_name(file_name):
                 shelves_file = destination / SHELVES_FILE_NAME
                 with archive.open(member_name) as raw_file, shelves_file.open("wb") as out:
@@ -85,4 +90,5 @@ def extract_bundle_from_zip(zip_path: Path, destination: Path) -> BundlePaths:
         unavailable_file=unavailable_file,
         tool_mapping_file=tool_mapping_file,
         pick_strategy_file=pick_strategy_file,
+        ignored_knowledge_files=tuple(ignored_files),
     )

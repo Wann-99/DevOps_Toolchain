@@ -1,7 +1,7 @@
 """登录认证与角色权限：用户存储、会话管理与登录校验。
 
-角色分为 admin（管理员，可执行全部操作）与 viewer（普通用户，只读，
-不可执行编辑类操作）。用户存储在 users.json 中；为便于现场直接编辑，
+角色分为 admin（管理员）与 viewer（普通用户）。普通用户可访问全部页面，
+禁止地图写操作、查询/设置编辑和数据导入。用户存储在 users.json 中；为便于现场直接编辑，
 明文密码会在首次读取时自动迁移为 PBKDF2 加盐哈希并回写文件。
 """
 
@@ -26,23 +26,13 @@ SESSION_COOKIE = "ksq_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
 _PBKDF2_ITERATIONS = 60000
 
-# 普通用户可以查看地图和遥测，但不能触发底盘动作或修改底盘侧数据。
-# 设置配置保存由 PUT 统一拦截；工作模式切换等非底盘控制字段由 handlers
-# 单独做字段过滤放行。
+# 地图写操作按 /api/map/ 前缀统一拦截；此处保留查询编辑和数据导入。
+# 设置保存由 handlers 与 dashboard 路由拦截，仪表板自动确认单独放行。
 VIEWER_FORBIDDEN_POST_PATHS = frozenset(
     {
         "/api/edit/save",
         "/api/edit/persist",
         "/api/import",
-        "/api/map/navigate",
-        "/api/map/patrol",
-        "/api/map/patrol/plan",
-        "/api/map/tracks/delete",
-        "/api/map/actions/cancel",
-        "/api/map/gohome",
-        "/api/map/relocate",
-        "/api/map/pois",
-        "/api/map/pois/delete",
     }
 )
 

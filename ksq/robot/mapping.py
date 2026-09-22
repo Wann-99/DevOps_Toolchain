@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from pathlib import Path
 import base64
 import binascii
 import hashlib
@@ -13,11 +15,10 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
-from pathlib import Path
 
+from ksq.robot import service as robot
 from ksq.safe_io import safe_write_bytes, safe_write_text
-from ksq.web import robot_map_api as robot
+
 
 MAX_STCM_BYTES = 32 * 1024 * 1024
 _MAPPING_PATH = "/api/core/slam/v1/mapping/:enable"
@@ -731,7 +732,7 @@ def _execute(payload: dict) -> dict:
                     ) from error
                 state.update(phase="saved", dirty=False)
             elif command in {"deploy", "delete-object"}:
-                from ksq.web import robot_mapping_objects
+                from ksq.robot import mapping_objects as robot_mapping_objects
 
                 if command == "deploy":
                     kind = robot_mapping_objects._kind(payload)

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from ksq.dashboard import settings as dashboard_settings
+from ksq.dashboard import parsing as log_parser
+
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -7,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ksq.feishu import client as feishu_client
-from ksq.web import dashboard_api
+from ksq.dashboard import service as dashboard_api
 
 
 class FeishuAcknowledgementTests(unittest.TestCase):
@@ -33,13 +36,13 @@ class FeishuAcknowledgementTests(unittest.TestCase):
 class DashboardRecoverySafetyTests(unittest.TestCase):
     def test_old_log_cannot_recover_a_new_queue_lock(self) -> None:
         old = datetime.now(timezone.utc) - timedelta(
-            seconds=dashboard_api._LOG_ORDER_RECOVERY_MAX_AGE_SECONDS + 1
+            seconds=log_parser._LOG_ORDER_RECOVERY_MAX_AGE_SECONDS + 1
         )
         seen = {"task-old": old}
-        self.assertFalse(dashboard_api._has_recent_log_activity(seen, datetime.now(timezone.utc)))
+        self.assertFalse(log_parser._has_recent_log_activity(seen, datetime.now(timezone.utc)))
 
     def test_untimestamped_log_cannot_recover_a_queue_lock(self) -> None:
-        self.assertFalse(dashboard_api._has_recent_log_activity({}))
+        self.assertFalse(log_parser._has_recent_log_activity({}))
 
 
 class DashboardSettingsSafetyTests(unittest.TestCase):
@@ -48,14 +51,14 @@ class DashboardSettingsSafetyTests(unittest.TestCase):
             settings_file = Path(directory) / "dashboard_settings.json"
             settings_file.write_text("{bad", encoding="utf-8")
             with (
-                patch.object(dashboard_api, "DASHBOARD_SETTINGS_FILE", settings_file),
+                patch.object(dashboard_settings, "DASHBOARD_SETTINGS_FILE", settings_file),
                 patch.object(
-                    dashboard_api,
+                    dashboard_settings,
                     "ROBOT_KEYBOARD_ENV_FILE",
                     Path(directory) / "missing.env",
                 ),
             ):
-                settings = dashboard_api.load_dashboard_settings()
+                settings = dashboard_settings.load_dashboard_settings()
         self.assertEqual(settings["mode"], "test")
         self.assertEqual(settings["keyboard_device"], "/dev/input/event1")
 
@@ -64,8 +67,8 @@ class DashboardSettingsSafetyTests(unittest.TestCase):
             settings_file = Path(directory) / "dashboard_settings.json"
             env_file = Path(directory) / "keyboard.env"
             with (
-                patch.object(dashboard_api, "DASHBOARD_SETTINGS_FILE", settings_file),
-                patch.object(dashboard_api, "ROBOT_KEYBOARD_ENV_FILE", env_file),
+                patch.object(dashboard_settings, "DASHBOARD_SETTINGS_FILE", settings_file),
+                patch.object(dashboard_settings, "ROBOT_KEYBOARD_ENV_FILE", env_file),
             ):
                 with self.assertRaisesRegex(ValueError, "auto_confirm"):
                     dashboard_api.save_dashboard_settings(
@@ -77,14 +80,14 @@ class DashboardSettingsSafetyTests(unittest.TestCase):
             settings_file = Path(directory) / "dashboard_settings.json"
             settings_file.write_text('{"auto_confirm": "false"}', encoding="utf-8")
             with (
-                patch.object(dashboard_api, "DASHBOARD_SETTINGS_FILE", settings_file),
+                patch.object(dashboard_settings, "DASHBOARD_SETTINGS_FILE", settings_file),
                 patch.object(
-                    dashboard_api,
+                    dashboard_settings,
                     "ROBOT_KEYBOARD_ENV_FILE",
                     Path(directory) / "missing.env",
                 ),
             ):
-                settings = dashboard_api.load_dashboard_settings()
+                settings = dashboard_settings.load_dashboard_settings()
         self.assertFalse(settings["auto_confirm"])
 
     def test_invalid_persisted_feishu_booleans_default_to_false(self) -> None:
@@ -95,14 +98,14 @@ class DashboardSettingsSafetyTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with (
-                patch.object(dashboard_api, "DASHBOARD_SETTINGS_FILE", settings_file),
+                patch.object(dashboard_settings, "DASHBOARD_SETTINGS_FILE", settings_file),
                 patch.object(
-                    dashboard_api,
+                    dashboard_settings,
                     "ROBOT_KEYBOARD_ENV_FILE",
                     Path(directory) / "missing.env",
                 ),
             ):
-                settings = dashboard_api.load_dashboard_settings()
+                settings = dashboard_settings.load_dashboard_settings()
         self.assertFalse(settings["feishu"]["enabled"])
         self.assertFalse(settings["feishu"]["ai"]["enabled"])
 
@@ -111,8 +114,8 @@ class DashboardSettingsSafetyTests(unittest.TestCase):
             settings_file = Path(directory) / "dashboard_settings.json"
             env_file = Path(directory) / "keyboard.env"
             with (
-                patch.object(dashboard_api, "DASHBOARD_SETTINGS_FILE", settings_file),
-                patch.object(dashboard_api, "ROBOT_KEYBOARD_ENV_FILE", env_file),
+                patch.object(dashboard_settings, "DASHBOARD_SETTINGS_FILE", settings_file),
+                patch.object(dashboard_settings, "ROBOT_KEYBOARD_ENV_FILE", env_file),
             ):
                 with self.assertRaisesRegex(ValueError, "feishu.enabled"):
                     dashboard_api.save_dashboard_settings(
@@ -129,8 +132,8 @@ class DashboardSettingsSafetyTests(unittest.TestCase):
             settings_file = Path(directory) / "dashboard_settings.json"
             env_file = Path(directory) / "keyboard.env"
             with (
-                patch.object(dashboard_api, "DASHBOARD_SETTINGS_FILE", settings_file),
-                patch.object(dashboard_api, "ROBOT_KEYBOARD_ENV_FILE", env_file),
+                patch.object(dashboard_settings, "DASHBOARD_SETTINGS_FILE", settings_file),
+                patch.object(dashboard_settings, "ROBOT_KEYBOARD_ENV_FILE", env_file),
             ):
                 with self.assertRaisesRegex(ValueError, "feishu 必须"):
                     dashboard_api.save_dashboard_settings(

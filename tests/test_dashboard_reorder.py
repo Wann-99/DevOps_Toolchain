@@ -8,10 +8,13 @@ dashboard to the previous order's page forever).
 
 from __future__ import annotations
 
+from ksq.dashboard import parsing as log_parser
+from ksq.order import model as order_model
+
 import unittest
 from datetime import datetime, timezone
 
-from ksq.web import dashboard_api
+from ksq.dashboard import service as dashboard_api
 
 TASK_A = "7016999b-5a24-4b2d-9dd4-39278a057b00"
 TASK_B = "8b687893-75ab-4549-ae70-8626503a32df"
@@ -43,7 +46,7 @@ LOG_B_START = "\n".join(
 
 
 def _order_b() -> dict[str, object]:
-    return dashboard_api._build_active_order(
+    return order_model._build_active_order(
         {
             "task_id": TASK_B,
             "order_no": "TEST20260817101628822FJ",
@@ -59,39 +62,39 @@ def _order_b() -> dict[str, object]:
 class StaleLogTasksTests(unittest.TestCase):
     def test_previous_order_task_is_stale(self) -> None:
         order = _order_b()
-        _latest, _codes, last_seen = dashboard_api._discover_log_tasks(LOG_A)
-        stale = dashboard_api._stale_log_tasks(order, last_seen)
+        _latest, _codes, last_seen = log_parser._discover_log_tasks(LOG_A)
+        stale = log_parser._stale_log_tasks(order, last_seen)
         self.assertIn(TASK_A, stale)
 
     def test_own_task_is_never_stale(self) -> None:
         order = _order_b()
         logs = LOG_A + "\n" + LOG_B_START
-        _latest, _codes, last_seen = dashboard_api._discover_log_tasks(logs)
-        stale = dashboard_api._stale_log_tasks(order, last_seen)
+        _latest, _codes, last_seen = log_parser._discover_log_tasks(logs)
+        stale = log_parser._stale_log_tasks(order, last_seen)
         self.assertIn(TASK_A, stale)
         self.assertNotIn(TASK_B, stale)
 
     def test_reconciled_robot_task_is_never_stale(self) -> None:
         order = _order_b()
         order["robot_task_id"] = TASK_A
-        _latest, _codes, last_seen = dashboard_api._discover_log_tasks(LOG_A)
-        stale = dashboard_api._stale_log_tasks(order, last_seen)
+        _latest, _codes, last_seen = log_parser._discover_log_tasks(LOG_A)
+        stale = log_parser._stale_log_tasks(order, last_seen)
         self.assertNotIn(TASK_A, stale)
 
     def test_missing_timestamps_keep_legacy_behaviour(self) -> None:
         order = _order_b()
         plain = f"MedicinePickUpTaskItem(code={CODE_1}, task_id={TASK_A}, seq_id=1)"
-        _latest, _codes, last_seen = dashboard_api._discover_log_tasks(plain)
-        stale = dashboard_api._stale_log_tasks(order, last_seen)
+        _latest, _codes, last_seen = log_parser._discover_log_tasks(plain)
+        stale = log_parser._stale_log_tasks(order, last_seen)
         self.assertEqual(stale, frozenset())
 
 
 class MatchLogTaskTests(unittest.TestCase):
     def test_stale_task_not_matched_for_new_order(self) -> None:
         order = _order_b()
-        latest, codes_by_task, last_seen = dashboard_api._discover_log_tasks(LOG_A)
+        latest, codes_by_task, last_seen = log_parser._discover_log_tasks(LOG_A)
         self.assertEqual(latest, TASK_A)
-        matched = dashboard_api._match_log_task_for_order(
+        matched = log_parser._match_log_task_for_order(
             order, codes_by_task, latest, last_seen
         )
         # Falls back to the order's own task id instead of A's stale scope.
@@ -100,17 +103,17 @@ class MatchLogTaskTests(unittest.TestCase):
     def test_fresh_task_matched_by_overlap(self) -> None:
         order = _order_b()
         logs = LOG_A + "\n" + LOG_B_START
-        latest, codes_by_task, last_seen = dashboard_api._discover_log_tasks(logs)
+        latest, codes_by_task, last_seen = log_parser._discover_log_tasks(logs)
         self.assertEqual(latest, TASK_B)
-        matched = dashboard_api._match_log_task_for_order(
+        matched = log_parser._match_log_task_for_order(
             order, codes_by_task, latest, last_seen
         )
         self.assertEqual(matched, TASK_B)
 
     def test_without_timestamps_legacy_overlap_match(self) -> None:
         order = _order_b()
-        latest, codes_by_task, _ = dashboard_api._discover_log_tasks(LOG_A)
-        matched = dashboard_api._match_log_task_for_order(
+        latest, codes_by_task, _ = log_parser._discover_log_tasks(LOG_A)
+        matched = log_parser._match_log_task_for_order(
             order, codes_by_task, latest
         )
         # No timestamp information: keep the legacy overlap behaviour.
@@ -131,7 +134,7 @@ class MatchLogTaskTests(unittest.TestCase):
 
 class ParseWithStaleTasksTests(unittest.TestCase):
     def test_stale_execution_does_not_poison_new_order(self) -> None:
-        parsed = dashboard_api.parse_robot_log_text(
+        parsed = log_parser.parse_robot_log_text(
             LOG_A,
             focus_task_id=TASK_B,
             extra_allowed_codes={CODE_1, CODE_2},
@@ -145,7 +148,7 @@ class ParseWithStaleTasksTests(unittest.TestCase):
 
     def test_stale_lines_used_without_stale_hint(self) -> None:
         # Legacy behaviour when the caller provides no stale information.
-        parsed = dashboard_api.parse_robot_log_text(
+        parsed = log_parser.parse_robot_log_text(
             LOG_A,
             focus_task_id=TASK_B,
             extra_allowed_codes={CODE_1, CODE_2},
@@ -155,7 +158,7 @@ class ParseWithStaleTasksTests(unittest.TestCase):
 
     def test_fresh_execution_tracked_after_stale_tail(self) -> None:
         logs = LOG_A + "\n" + LOG_B_START
-        parsed = dashboard_api.parse_robot_log_text(
+        parsed = log_parser.parse_robot_log_text(
             logs,
             focus_task_id=TASK_B,
             extra_allowed_codes={CODE_1, CODE_2},
@@ -234,7 +237,7 @@ class NewLogFormatTests(unittest.TestCase):
     """新版机器人日志：sku_id 编号经 barcode 别名翻译成订单的 69码。"""
 
     def test_sku_id_translated_to_barcode(self) -> None:
-        parsed = dashboard_api.parse_robot_log_text(
+        parsed = log_parser.parse_robot_log_text(
             NEW_FORMAT_LOG,
             focus_task_id="8302f452-9b09-11f1-9649-d7a8da00e18f",
             extra_allowed_codes={"6924364520087"},
@@ -248,7 +251,7 @@ class NewLogFormatTests(unittest.TestCase):
         self.assertEqual(item.get("parent_task_id"), "8302f452-9b09-11f1-9649-d7a8da00e18f")
 
     def test_discover_tasks_uses_barcode_codes(self) -> None:
-        latest, codes_by_task, _seen = dashboard_api._discover_log_tasks(NEW_FORMAT_LOG)
+        latest, codes_by_task, _seen = log_parser._discover_log_tasks(NEW_FORMAT_LOG)
         self.assertEqual(latest, "8302f452-9b09-11f1-9649-d7a8da00e18f")
         self.assertIn("6924364520087", codes_by_task.get("8302f452-9b09-11f1-9649-d7a8da00e18f", []))
 
@@ -260,9 +263,9 @@ class NewLogFormatTests(unittest.TestCase):
             "2026-08-18T21:40:00.000Z [INFO] [FVR] "
             "item sku-aaa process end time: 1787060100.0"
         )
-        aliases = dashboard_api._merged_code_aliases(order, late_log)
+        aliases = log_parser._merged_code_aliases(order, late_log)
         self.assertEqual(aliases.get("sku-aaa"), "6924364520087")
-        parsed = dashboard_api.parse_robot_log_text(
+        parsed = log_parser.parse_robot_log_text(
             late_log,
             focus_task_id="8302f452-9b09-11f1-9649-d7a8da00e18f",
             extra_allowed_codes={"6924364520087"},
@@ -274,7 +277,7 @@ class NewLogFormatTests(unittest.TestCase):
 
     def test_merged_aliases_union_persisted_and_current(self) -> None:
         order = {"task_id": "T", "code_aliases": {"sku-old": "6911111111111"}}
-        merged = dashboard_api._merged_code_aliases(order, NEW_FORMAT_LOG)
+        merged = log_parser._merged_code_aliases(order, NEW_FORMAT_LOG)
         self.assertEqual(merged.get("sku-old"), "6911111111111")
         self.assertEqual(merged.get("sku-aaa"), "6924364520087")
 
@@ -288,13 +291,13 @@ class KeyboardPromptCompatibilityTests(unittest.TestCase):
             "Press any key to continue",
         ):
             with self.subTest(prompt=prompt):
-                parsed = dashboard_api.parse_robot_log_text(prompt)
+                parsed = log_parser.parse_robot_log_text(prompt)
                 self.assertTrue(parsed["needs_confirm"])
                 self.assertTrue(parsed["order_await_active"])
                 self.assertEqual(parsed["await_kind"], "pack")
 
     def test_unrelated_keyboard_log_does_not_trigger_popup(self) -> None:
-        parsed = dashboard_api.parse_robot_log_text("keyboard device connected")
+        parsed = log_parser.parse_robot_log_text("keyboard device connected")
         self.assertFalse(parsed["needs_confirm"])
 
 

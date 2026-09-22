@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ksq.dashboard import settings as dashboard_settings
+
 import io
 import json
 import tempfile
@@ -10,9 +12,19 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ksq import config_pnp
+from ksq.bundle import extract_bundle_from_zip
+from ksq.dataset import load_dataset_from_zip
+from ksq.knowledge import load_knowledge_from_mapping, load_knowledge_records
+from ksq.web.pages import format_status_html
 from ksq.order import broker
 from ksq.order import config as order_config
-from ksq.web import dashboard_api, data_storage, edit_workspace, import_api, loader, order_api, state
+from ksq.dashboard import service as dashboard_api
+from ksq.data import storage as data_storage
+from ksq.data import workspace as edit_workspace
+from ksq.data import imports as import_api
+from ksq.data import loader as loader
+from ksq.order import service as order_api
+from ksq.data import state as state
 
 
 class _Form:
@@ -34,6 +46,46 @@ def _upload(name: str, payload: bytes) -> SimpleNamespace:
 
 
 class ConfigAndWorkspaceTests(unittest.TestCase):
+    def test_auxiliary_configs_are_ignored_but_other_records_require_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "sku-1.json").write_text('{"id": "sku-1"}', encoding="utf-8")
+            (root / "block.json").write_text("{}", encoding="utf-8")
+            (root / "BLOCK.JSON").write_text("not a record", encoding="utf-8")
+            (root / "bookshelf.json").write_text("{}", encoding="utf-8")
+            (root / "BOOKSHELF.JSON").write_text("not a record", encoding="utf-8")
+            (root / "bottle cap.json").write_text("{}", encoding="utf-8")
+            (root / "BOTTLE CAP.JSON").write_text("not a record", encoding="utf-8")
+            (root / "camera.json").write_text('{"exposure": 20}', encoding="utf-8")
+            (root / "fixtures.json").write_text('[{"长度": 10}]', encoding="utf-8")
+            (root / "99.json").write_text('{"宽度": 10}', encoding="utf-8")
+            records, count, _, _, _, ignored = load_knowledge_records(root)
+            self.assertEqual(records, [{"id": "sku-1"}])
+            self.assertEqual(count, 1)
+            self.assertEqual(set(ignored), {
+                "block.json", "BLOCK.JSON", "bookshelf.json", "BOOKSHELF.JSON",
+                "bottle cap.json", "BOTTLE CAP.JSON",
+                "camera.json", "fixtures.json", "99.json",
+            })
+            (root / "blocker.json").write_text('{"包装类型": "纸盒"}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "缺少有效的 id 字段：blocker.json"):
+                load_knowledge_records(root)
+
+    def test_damaged_products_stay_strict_and_mapping_packages_never_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "SKU-1.json"
+            for value in ({}, [], {"id": None}, {"id": ""}, {"id": True}, {"id": 1.5}):
+                with self.subTest(value=value):
+                    path.write_text(json.dumps(value), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_knowledge_records(root, expected_ids={"SKU-1"})
+            path.write_text('{"camera":', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "JSON 文件格式错误"):
+                load_knowledge_records(root)
+        with self.assertRaisesRegex(ValueError, "缺少有效的 id"):
+            load_knowledge_from_mapping([("package[0]", {})])
+
     def test_config_prefix_sibling_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "cfg"
@@ -130,7 +182,7 @@ class OrderConfigAndBrokerTests(unittest.TestCase):
                 order_api.list_tasks("test", refresh=True)
 
         with (
-            patch.object(dashboard_api, "resolve_dashboard_mode", return_value="test"),
+            patch.object(dashboard_settings, "resolve_dashboard_mode", return_value="test"),
             patch.object(order_api, "load_order_config", return_value=self.VALID),
             patch.object(order_api, "_ensure_token", return_value="token"),
             patch.object(order_api.broker, "list_business_modes", return_value=response),
@@ -204,6 +256,69 @@ class ImportTransactionTests(unittest.TestCase):
         for key, value in self._state.items():
             setattr(state, key, value)
         self.temporary.cleanup()
+
+    def test_auxiliary_configs_are_ignored_in_zip_and_file_imports(self) -> None:
+        bundle = self.root / "bundle.zip"
+        with zipfile.ZipFile(bundle, "w") as archive:
+            archive.writestr("knowledge/new.json", '{"id": "new"}')
+            archive.writestr("knowledge/block.json", "{}")
+            archive.writestr("BLOCK.JSON", "not a record")
+            archive.writestr("knowledge/bookshelf.json", "{}")
+            archive.writestr("BOOKSHELF.JSON", "not a record")
+            archive.writestr("knowledge/bottle cap.json", "{}")
+            archive.writestr("BOTTLE CAP.JSON", "not a record")
+            archive.writestr("sku-shelves.csv", self.shelves.read_bytes())
+        dataset = load_dataset_from_zip(bundle)
+        self.assertEqual(dataset.knowledge_records, ({"id": "new"},))
+        paths = extract_bundle_from_zip(bundle, self.root / "extracted")
+        self.assertEqual([path.name for path in paths.knowledge_directory.iterdir()], ["new.json"])
+        result = import_api.import_uploaded_files(_Form("files", [
+            _upload("bundle.zip", bundle.read_bytes()),
+            _upload("block.json", b"{}"),
+            _upload("bookshelf.json", b"{}"),
+            _upload("bottle cap.json", b"{}"),
+        ]))
+        self.assertTrue(result["reloaded"])
+        self.assertEqual({path.name for path in (self.current / "knowledge").iterdir()}, {"old.json", "new.json"})
+
+    def test_loading_mixed_json_filters_private_copy_and_reports_every_ignored_file(self) -> None:
+        auxiliary = {f"camera-{i}.json": '{"exposure": 20}' for i in range(6)}
+        auxiliary.update({"fixtures.json": "[]", "block.json": "known auxiliary"})
+        for name, payload in auxiliary.items():
+            (self.knowledge / name).write_text(payload, encoding="utf-8")
+        original = {path.name: path.read_bytes() for path in self.knowledge.iterdir()}
+        dataset, *_ = loader.load_from_configured_paths()
+        self.assertEqual(dataset.knowledge_records, ({"id": "old"},))
+        self.assertEqual(dataset.report.knowledge_file_count, 1)
+        self.assertEqual(set(dataset.report.ignored_knowledge_files), set(auxiliary))
+        self.assertEqual({path.name for path in (self.current / "knowledge").iterdir()}, {"old.json"})
+        self.assertEqual({path.name: path.read_bytes() for path in self.knowledge.iterdir()}, original)
+        html = format_status_html(dataset, 0, "loaded", "knowledge", "shelves", False, False, False)
+        for name in auxiliary:
+            self.assertIn(name, html)
+
+        bundle = self.root / "mixed.zip"
+        with zipfile.ZipFile(bundle, "w") as archive:
+            for name, payload in original.items():
+                archive.writestr("knowledge/" + name, payload)
+            archive.writestr("sku-shelves.csv", self.shelves.read_bytes())
+        direct = load_dataset_from_zip(bundle)
+        self.assertEqual(direct.knowledge_records, dataset.knowledge_records)
+        self.assertEqual(set(direct.report.ignored_knowledge_files), set(auxiliary))
+        paths = extract_bundle_from_zip(bundle, self.root / "extracted")
+        uploaded, *_ = loader.load_bundle_paths(paths, "bundle")
+        self.assertEqual(uploaded.knowledge_records, dataset.knowledge_records)
+        self.assertEqual(set(uploaded.report.ignored_knowledge_files), set(auxiliary))
+        self.assertEqual({path.name for path in (self.current / "knowledge").iterdir()}, {"old.json"})
+
+    def test_matching_sku_without_id_keeps_previous_dataset_and_backup_untouched(self) -> None:
+        dataset, *_ = loader.load_from_configured_paths()
+        (self.knowledge / "old.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "缺少有效的 id 字段：old.json"):
+            loader.load_from_configured_paths()
+        self.assertIs(state.loaded_dataset, dataset)
+        self.assertEqual((self.current / "knowledge" / "old.json").read_text(), '{"id": "old"}')
+        self.assertFalse(self.backups.exists())
 
     def test_bad_batch_leaves_targets_and_runtime_untouched(self) -> None:
         runtime = self.root / ".runtime_upload"

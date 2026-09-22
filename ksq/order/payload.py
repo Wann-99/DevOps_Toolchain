@@ -46,7 +46,13 @@ def normalize_order_items(raw_items: object) -> List[Dict[str, object]]:
         if not isinstance(raw, dict):
             raise ValueError(f"items[{index}] 必须是对象。")
         item_id = str(raw.get("item_id") or "").strip()
-        location_code = str(raw.get("location_code") or "").strip().replace("-", "")
+        customer_location = raw.get("customer_location_code")
+        if customer_location is not None and not isinstance(customer_location, str):
+            raise ValueError(f"items[{index}].customer_location_code 必须是字符串。")
+        # 客户库位是外部标识，保留前导零和连字符；旧表仍使用物理库位。
+        location_code = (customer_location or "").strip() or str(
+            raw.get("location_code") or ""
+        ).strip().replace("-", "")
         if not item_id:
             raise ValueError(f"items[{index}].item_id 不能为空。")
         if not location_code:

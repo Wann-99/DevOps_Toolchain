@@ -228,6 +228,9 @@ def send_download(handler, value, image=False):
         handler.send_header("Content-Security-Policy", "sandbox; default-src 'none'")
         handler.send_header("Cache-Control", "no-store")
         handler.end_headers()
+        if hasattr(handler, "stream_file"):
+            handler.stream_file(stream)
+            return
         try:
             shutil.copyfileobj(stream, handler.wfile, 1024 * 1024)
         except OSError:
@@ -411,6 +414,38 @@ def create_terminal(owner, payload, browser_desktop=True):
     return {"id": terminal.id}
 
 
+def authorize_request(handler, session):
+    """Shared file/terminal checks, before reading a request body."""
+    parsed = urlsplit(handler.path)
+    if not session:
+        handler._send_json(401, {"error": "请先登录。"})
+        return False
+    if handler.headers.get("Sec-Fetch-Site") == "cross-site":
+        handler._send_json(403, {"error": "拒绝跨站文件或终端请求。"})
+        return False
+    if parsed.path.startswith("/desktop/"):
+        if handler.command != "GET":
+            raise ValueError("桌面仅支持 GET 请求。")
+        if handler.headers.get("Upgrade", "").lower() == "websocket" and os.environ.get("KSQ_HOST_FILES_AGENT") != "1":
+            origin = urlsplit(handler.headers.get("Origin", ""))
+            if origin.scheme not in {"http", "https"} or origin.netloc != handler.headers.get("Host"):
+                raise PermissionError("拒绝跨站桌面连接。")
+    if handler.command != "GET":
+        origin = handler.headers.get("Origin")
+        if (handler.headers.get("X-KSQ-Request") != "1"
+                or (origin and (urlsplit(origin).netloc != handler.headers.get("Host")
+                                or urlsplit(origin).scheme not in {"http", "https"}))):
+            raise PermissionError("拒绝跨站文件或终端操作。")
+        if handler.headers.get("Transfer-Encoding"):
+            raise ValueError("不支持分块请求体。")
+    if handler.command == "POST":
+        length = int(handler.headers.get("Content-Length", "-1"))
+        limit = MAX_TRANSFER if parsed.path == "/api/files/upload" else 128 * 1024
+        if not 0 <= length <= limit:
+            raise ValueError("请求体大小无效。")
+    return True
+
+
 def handle_request(handler, session):
     """Called after login validation; all file/terminal endpoints share this guard."""
     parsed = urlsplit(handler.path)
@@ -418,31 +453,12 @@ def handle_request(handler, session):
         return False
     # Close error paths instead of draining arbitrarily large untrusted uploads.
     handler.close_connection = True
-    if session.get("role") != auth.ROLE_ADMIN:
-        handler._send_json(403, {"error": "文件管理和终端仅管理员可用。"})
-        return True
-    if handler.headers.get("Sec-Fetch-Site") == "cross-site":
-        handler._send_json(403, {"error": "拒绝跨站文件或终端请求。"})
-        return True
     query = parse_qs(parsed.query)
     value = (query.get("path") or [""])[0]
     owner = auth.token_from_cookie(handler.headers.get("Cookie", ""))
     try:
-        if parsed.path.startswith("/desktop/"):
-            if handler.command != "GET":
-                raise ValueError("桌面仅支持 GET 请求。")
-            if handler.headers.get("Upgrade", "").lower() == "websocket" and os.environ.get("KSQ_HOST_FILES_AGENT") != "1":
-                origin = urlsplit(handler.headers.get("Origin", ""))
-                if origin.scheme not in {"http", "https"} or origin.netloc != handler.headers.get("Host"):
-                    raise PermissionError("拒绝跨站桌面连接。")
-        if handler.command != "GET":
-            origin = handler.headers.get("Origin")
-            if (handler.headers.get("X-KSQ-Request") != "1"
-                    or (origin and (urlsplit(origin).netloc != handler.headers.get("Host")
-                                    or urlsplit(origin).scheme not in {"http", "https"}))):
-                raise PermissionError("拒绝跨站文件或终端操作。")
-            if handler.headers.get("Transfer-Encoding"):
-                raise ValueError("不支持分块请求体。")
+        if not authorize_request(handler, session):
+            return True
         if os.environ.get("KSQ_HOST_FILES_SOCKET"):
             from ksq.web.host_files import forward
             forward(handler, owner)
@@ -470,7 +486,8 @@ def handle_request(handler, session):
         else:
             length = int(handler.headers.get("Content-Length", "-1"))
             if parsed.path == "/api/files/upload":
-                handler.connection.settimeout(120)
+                if handler.connection is not None:
+                    handler.connection.settimeout(120)
                 result = upload_file(value, (query.get("name") or [""])[0], handler.rfile, length)
             else:
                 if not 0 < length <= 128 * 1024:

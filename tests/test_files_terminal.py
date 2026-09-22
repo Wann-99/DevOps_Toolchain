@@ -64,12 +64,11 @@ def check():
             target = url("upload", path=directory, name="folder/sub/中文.txt")
             content = "测试 UTF-8\n<script>alert(1)</script>".encode()
             assert request("GET", url("list", path=directory), token="")[0] == 401
-            assert request("GET", url("list", path=directory), token=viewer)[0] == 403
-            assert request("POST", target, content, token=viewer)[0] == 403
+            assert request("GET", url("list", path=directory), token=viewer)[0] == 200
             assert request("POST", target, content, headers={"X-KSQ-Request": ""})[0] == 403
             assert request("POST", target, content, headers={"Origin": "https://example.invalid"})[0] == 403
             assert request("GET", url("list", path=directory), headers={"Sec-Fetch-Site": "cross-site"})[0] == 403
-            assert request("POST", target, content)[0] == 200
+            assert request("POST", target, content, token=viewer)[0] == 200
             assert request("POST", target, b"replacement")[0] == 409
             uploaded = root / "folder/sub/中文.txt"
             assert uploaded.read_bytes() == content
@@ -109,7 +108,6 @@ def check():
             original.write_bytes(content)
             payload = {"path": str(rename_root), "name": original.name, "new_name": "空 格'文件.txt"}
             assert request("POST", rename, payload, token="")[0] == 401
-            assert request("POST", rename, payload, token=viewer)[0] == 403
             assert request("POST", rename, payload, headers={"X-KSQ-Request": ""})[0] == 403
             assert request("POST", rename, payload, headers={"Origin": "https://example.invalid"})[0] == 403
             assert request("POST", rename, payload, headers={"Sec-Fetch-Site": "cross-site"})[0] == 403
@@ -118,7 +116,7 @@ def check():
                 assert request("POST", rename, dict(payload, name=invalid))[0] == 400
             assert original.read_bytes() == content
             assert request("POST", rename, dict(payload, new_name=original.name))[0] == 200
-            assert request("POST", rename, payload)[0] == 200
+            assert request("POST", rename, payload, token=viewer)[0] == 200
             assert not original.exists() and (rename_root / payload["new_name"]).read_bytes() == content
             assert request("POST", rename, payload)[0] == 404
             occupied = rename_root / "occupied"
@@ -154,7 +152,9 @@ def check():
             assert not (rename_root / winner).exists() and (rename_root / loser).read_text() == loser
 
             create = "/api/terminal/create"
-            assert request("POST", create, {"path": directory}, token=viewer)[0] == 403
+            code, viewer_terminal = request("POST", create, {"path": directory}, token=viewer)
+            assert code == 200
+            assert request("POST", "/api/terminal/close", {"id": viewer_terminal["id"]}, token=viewer)[0] == 200
             assert request("POST", create, {"path": directory}, headers={"X-KSQ-Request": ""})[0] == 403
             assert request("POST", create, {"path": directory, "rows": True})[0] == 400
             code, result = request("POST", create, {"path": directory, "cols": 91, "rows": 31})
@@ -209,7 +209,8 @@ def check():
             assert terminal.output(0)["truncated"]
             input_text("exit\r")
             deadline = time.monotonic() + 5
-            while not terminal.closed and time.monotonic() < deadline:
+            # close() sets the flag before it finishes waiting for the shell.
+            while (not terminal.closed or terminal.process.poll() is None) and time.monotonic() < deadline:
                 time.sleep(0.03)
             assert terminal.closed and terminal.process.poll() is not None
             assert terminal.output(0)["cwd"] is None

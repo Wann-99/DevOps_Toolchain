@@ -90,6 +90,7 @@ def forward(handler, owner, desktop_target=False):
         handler._send_json(503, {"error": "桌面连接已达上限，请关闭其他桌面标签页。"})
         return
     sent_headers = False
+    streaming = False
     try:
         connection.putrequest(handler.command, handler.path[len("/desktop"):] if desktop_target else handler.path)
         connection.putheader("Cookie", auth.SESSION_COOKIE + "=" + owner_key(owner))
@@ -111,7 +112,8 @@ def forward(handler, owner, desktop_target=False):
                 raise ValueError("请求体大小无效。")
             connection.putheader("Content-Length", str(remaining))
             connection.putheader("Content-Type", handler.headers.get("Content-Type", "application/json"))
-            handler.connection.settimeout(120)
+            if handler.connection is not None:
+                handler.connection.settimeout(120)
         connection.endheaders()
         while remaining:
             chunk = handler.rfile.read(min(1024 * 1024, remaining))
@@ -148,7 +150,7 @@ def forward(handler, owner, desktop_target=False):
             while True:
                 if not desktop_target:
                     session = auth.get_session(owner)
-                    if session is None or session.get("role") != auth.ROLE_ADMIN:
+                    if session is None:
                         break
                 readable, _, _ = select.select([client, upstream], [], [], 1)
                 for source in readable:
@@ -159,6 +161,10 @@ def forward(handler, owner, desktop_target=False):
             return
         if upgrade and response.fp is not None:
             response.fp = io.BufferedReader(response.fp)
+        if hasattr(handler, "stream_forward_response"):
+            handler.stream_forward_response(response, connection)
+            streaming = True
+            return
         while chunk := response.read(1024 * 1024):
             handler.wfile.write(chunk)
     except (OSError, http.client.HTTPException):
@@ -166,7 +172,8 @@ def forward(handler, owner, desktop_target=False):
             handler._send_json(503, {"error": "宿主机连接不可用，请在宿主机部署目录执行 bash start.sh host-files start。"})
         handler.close_connection = True
     finally:
-        connection.close()
+        if not streaming:
+            connection.close()
         if upgrade:
             _DESKTOP_CONNECTIONS.release()
 

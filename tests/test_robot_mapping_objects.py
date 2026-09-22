@@ -8,8 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from ksq.web import robot_map_api as api
-from ksq.web import robot_mapping_objects as objects
+from ksq.robot import service as api
+from ksq.robot import mapping_objects as objects
 
 
 BASE = "http://192.0.2.10:1448"

@@ -14,7 +14,7 @@ from unittest.mock import call, patch
 
 from PIL import Image
 
-from ksq.web import robot_map_api as api
+from ksq.robot import service as api
 
 
 def _scan() -> dict[str, object]:

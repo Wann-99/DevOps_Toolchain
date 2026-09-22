@@ -3,17 +3,15 @@
     return document.getElementById(id);
   }
 
-  // 密钥回显：服务端仅向管理员下发 client_secret，普通用户拿到的是空串，
-  // 此时回退到原来的「已保存，留空不改」占位提示。后端对空字符串不会覆盖
-  // 已存密钥，所以普通用户保存其他字段不会把密钥弄丢。
+  // 普通用户不接收密钥原文，通过占位提示区分「已配置」与「未配置」。
   function applyClientSecret(data) {
     const input = el("settings-cfg-client-secret");
     if (!input) return;
     const secret = String((data && data.client_secret) || "");
     input.value = secret;
     input.placeholder = data && data.has_client_secret
-      ? "已保存，留空不改"
-      : "请输入 client_secret";
+      ? "已配置（内容隐藏，留空不改）"
+      : "未配置";
     setSecretVisible(false);
   }
 
@@ -305,13 +303,13 @@
     if (aiModel) aiModel.value = String(ai.model || "gpt-4o-mini");
     if (aiApiKey) {
       aiApiKey.value = "";
-      aiApiKey.placeholder = ai.has_api_key ? "已保存，留空不改" : "请输入 API Key（可选）";
+      aiApiKey.placeholder = ai.has_api_key ? "已配置（内容隐藏，留空不改）" : "未配置（可选）";
     }
     if (appSecret) {
       appSecret.value = "";
       appSecret.placeholder = cfg.has_app_secret
-        ? "已保存，留空不改"
-        : "请输入 App Secret";
+        ? "已配置（内容隐藏，留空不改）"
+        : "未配置";
     }
     if (Array.isArray(cfg.form_rules) && cfg.form_rules.length) feishuRules = cfg.form_rules;
     renderFeishuForms(cfg.forms, String(cfg.selected_form || ""));
@@ -537,6 +535,18 @@
       el("settings-cfg-client-id").value = data.client_id || "";
       applyClientSecret(data);
       el("settings-cfg-store-id").value = data.store_id || "";
+      const storeSelect = el("settings-cfg-store-select");
+      storeSelect.innerHTML = '<option value="">— 未配置门店 —</option>';
+      if (data.store_id) {
+        const option = document.createElement("option");
+        option.value = "0";
+        option.dataset.storeId = String(data.store_id);
+        option.dataset.storeName = String(data.store_name || "");
+        option.textContent = option.dataset.storeId +
+          (option.dataset.storeName ? " — " + option.dataset.storeName : "");
+        option.selected = true;
+        storeSelect.appendChild(option);
+      }
       const dot = el("settings-token-dot");
       if (dot) {
         dot.classList.remove("ok", "err");
@@ -619,7 +629,7 @@
     const dot = el("settings-token-dot");
     setStatus(status, "获取 Token 中…");
     try {
-      await saveOrderConfig();
+      if (!global.KsqAuth || global.KsqAuth.isAdmin()) await saveOrderConfig();
       const response = await fetch(
         "/api/order/token?mode=" + encodeURIComponent(mode),
         {
@@ -649,7 +659,7 @@
     const mode = currentMode();
     setStatus(status, "获取门店中…");
     try {
-      await saveOrderConfig();
+      if (!global.KsqAuth || global.KsqAuth.isAdmin()) await saveOrderConfig();
       const response = await fetch(
         "/api/order/stores?mode=" + encodeURIComponent(mode)
       );

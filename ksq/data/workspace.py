@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 import csv
 import io
 import json
 import zipfile
-from copy import deepcopy
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
 
 from ksq import safe_io
+from ksq.data import state as state
 from ksq.models import Dataset, ShelfEntry
 from ksq.shelves import format_shelf_location, parse_shelf_locations, shelf_row_id
-from ksq.web import state
+
 
 SHELF_FIELD_MAP = {
     "货架属性": "shelf_attribute",

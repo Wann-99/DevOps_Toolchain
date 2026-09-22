@@ -6,7 +6,54 @@ import json
 from collections.abc import Iterable
 from pathlib import Path
 
+from ksq.config_pnp import load_config_pnp_unavailable
 from ksq.constants import DEFAULT_TOOL_NAME
+from ksq.models import ShelfEntry
+
+
+def unavailable_ids_from_config(
+    config_pnp_dir: Path | None,
+    shelf_entries: dict[str, tuple[ShelfEntry, ...]],
+) -> set[str]:
+    """Expand shelf/level/bin restrictions into the existing SKU blacklist."""
+    def normalize(value: str) -> str:
+        value = value.strip()
+        return str(int(value)) if value.isdecimal() else value
+
+    scopes: set[tuple[str, ...]] = set()
+    compact_scopes: set[str] = set()
+    for key, values in load_config_pnp_unavailable(config_pnp_dir).items():
+        for value in values:
+            if "-" in value:
+                parts = value.split("-")
+                if len(parts) not in (2, 3) or not all(part.strip() for part in parts):
+                    raise ValueError(f"config.scene.{key} 应填写货架-层或货架-层-库位。")
+            elif key == "unavailable_shelf_list":
+                parts = [value]
+            elif value.isdecimal() and len(value) in (4, 6, 8):
+                # A level is the full location without its last two digits.
+                compact_scopes.add(normalize(value))
+                continue
+            else:
+                raise ValueError(f"config.scene.{key} 应填写 4/6/8 位库位码、货架-层或货架-层-库位。")
+            scopes.add(tuple(normalize(part) for part in parts))
+
+    unavailable: set[str] = set()
+    for item_id, entries in shelf_entries.items():
+        for entry in entries:
+            parts = tuple(normalize(part) for part in entry.location.split("-"))
+            if len(parts) != 3:
+                continue
+            compact_level = parts[0] + parts[1].zfill(2)
+            compact_bin = compact_level + parts[2].zfill(2)
+            if (
+                any(scope in scopes for scope in (parts[:1], parts[:2], parts))
+                or normalize(compact_level) in compact_scopes
+                or normalize(compact_bin) in compact_scopes
+            ):
+                unavailable.add(item_id)
+                break
+    return unavailable
 
 
 def load_tool_mapping(mapping_file: Path) -> dict[str, str]:

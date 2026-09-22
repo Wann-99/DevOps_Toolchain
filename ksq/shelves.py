@@ -14,6 +14,7 @@ from ksq.models import ShelfEntry, ShelfParseResult
 MERGE_CONFLICT_FIELDS = (
     ("out_item_id", "商品编码"),
     ("sku_code", "69码"),
+    ("customer_location_code", "客户库位"),
     ("shelf_attribute", "货架属性"),
     ("baffle_height", "挡板高度"),
 )
@@ -71,6 +72,9 @@ def merge_shelf_entry(existing: ShelfEntry, incoming: ShelfEntry) -> ShelfEntry:
         baffle_height=baffle_height,
         out_item_id=out_item_id,
         sku_code=sku_code,
+        customer_location_code=(
+            existing.customer_location_code or incoming.customer_location_code
+        ),
     )
 
 
@@ -139,6 +143,7 @@ def parse_shelf_locations(file_object: TextIOWrapper) -> ShelfParseResult:
             baffle_height=baffle_height,
             out_item_id=out_item_id,
             sku_code=sku_code,
+            customer_location_code=(row.get("customer_location_code") or "").strip(),
         )
         entries = shelf_entries.setdefault(item_id, [])
         existing_index = next(

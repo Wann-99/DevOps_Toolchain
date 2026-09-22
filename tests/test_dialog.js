@@ -106,6 +106,23 @@ async function check() {
   p.node("button").focus(); result = p.api.confirm({}); p.paint(); p.get("cancel").emit("click");
   assert.equal(await result, false);
   assert.equal(p.document.activeElement, closeButton, "An open lower modal takes precedence over focus outside that modal");
+
+  const missing = { name: "原有缺失药品", barcode: "690003", item_id: "1003" };
+  const blocked = { name: "<b>不可处理药品</b>", barcode: "690001", item_id: "1001" };
+  const originalError = { error: "商品匹配失败 1003", upstream_code: 4552 };
+  result = p.api.apiError({ payload: originalError, items: [missing] });
+  const originalMessage = p.get("body").textContent;
+  p.get("confirm").emit("click"); await result;
+  result = p.api.apiError({
+    payload: { ...originalError, unavailable_items: [blocked, blocked] },
+    items: [missing],
+  });
+  assert.equal(p.get("body").textContent,
+    originalMessage + "\n\n在不可处理清单中：\n<b>不可处理药品</b>（69码：690001）");
+  p.get("confirm").emit("click"); await result;
+  result = p.api.apiError({ payload: { error: "网络错误", unavailable_items: [blocked] } });
+  assert.match(p.get("body").textContent, /^网络错误\n\n在不可处理清单中：/);
+  p.get("confirm").emit("click"); await result;
   console.log("Dialog checks passed");
 }
 

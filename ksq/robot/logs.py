@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+from collections import deque
+from datetime import datetime, timezone
+from typing import Dict, Iterator, List, Optional, Tuple
 import atexit
 import json
 import re
 import subprocess
 import threading
-from collections import deque
-from datetime import datetime, timezone
-from typing import Dict, Iterator, List, Optional, Tuple
+
 
 LOG_SERVICES: List[Dict[str, object]] = [
     {"id": "0", "name": "robot_workspace_move_test"},

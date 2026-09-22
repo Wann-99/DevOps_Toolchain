@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from ksq.web import data_storage
+from ksq.data import storage as data_storage
 
 
 class DataStorageTests(unittest.TestCase):
@@ -30,7 +30,7 @@ class DataStorageTests(unittest.TestCase):
         self.knowledge = self.root / "source" / "knowledge"
         self.knowledge.mkdir(parents=True)
         (self.knowledge / "1.json").write_text('{"id": "1"}', encoding="utf-8")
-        for ignored in (".hidden.json", "1.bak.json", "readme.txt"):
+        for ignored in (".hidden.json", "1.bak.json", "readme.txt", "block.json", "bookshelf.json", "bottle cap.json"):
             (self.knowledge / ignored).write_text("ignored", encoding="utf-8")
         self.shelves = self.root / "source" / "etm_sku_locations_cache.csv"
         self.shelves.write_text("sku_code,location\n1,A01\n", encoding="utf-8")

@@ -2,7 +2,8 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .runtime_upload/
-data/
+/data/
+/goods-locations.csv
 .Python
 .venv/
 venv/

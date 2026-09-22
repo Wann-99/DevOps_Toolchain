@@ -675,6 +675,7 @@ function buildOrderItems() {
       sku_id: line.sku_id || entry.record.sku_id || "",
       item_id: line.item_id,
       location_code: line.location_code,
+      customer_location_code: line.customer_location_code || "",
       barcode: line.barcode || "",
       name: line.name || "",
       quantity: 1,

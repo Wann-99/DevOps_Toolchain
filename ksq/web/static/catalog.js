@@ -1789,6 +1789,7 @@
           sku_id: line.sku_id || entry.record.sku_id || "",
           item_id: line.item_id,
           location_code: line.location_code,
+          customer_location_code: line.customer_location_code || "",
           barcode: line.barcode || "",
           name: line.name || "",
           quantity: 1,
@@ -1852,7 +1853,9 @@
         closeSelectedList();
         updateSelectedOrderUI();
         render(false);
-        setStatus("下单成功，正在打开仪表板...");
+        setStatus(data.order_session && data.order_session.queued
+          ? "下单成功，已排队；仪表板继续显示当前单。"
+          : "下单成功，正在打开仪表板...");
         if (window.KsqDashboard && window.KsqDashboard.openAfterOrder) {
           const requestBody = data.request_body || {};
           window.KsqDashboard.openAfterOrder(

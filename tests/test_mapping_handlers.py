@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ksq.robot import mapping, mapping_objects, service as robot
+
 import io
 import json
 import unittest
@@ -26,11 +28,11 @@ class MappingHandlerTests(unittest.TestCase):
     ROUTE = "/api/map/mapping"
 
     def setUp(self) -> None:
-        self.get_status = self._mock(handlers.robot_mapping_api, "get_status")
-        self.export_map = self._mock(handlers.robot_mapping_api, "export_map")
-        self.execute = self._mock(handlers.robot_mapping_api, "execute")
-        self.list_objects = self._mock(handlers.robot_mapping_objects, "list_objects")
-        self.current_base = self._mock(handlers.robot_map_api, "require_current_base_url")
+        self.get_status = self._mock(mapping, "get_status")
+        self.export_map = self._mock(mapping, "export_map")
+        self.execute = self._mock(mapping, "execute")
+        self.list_objects = self._mock(mapping_objects, "list_objects")
+        self.current_base = self._mock(robot, "require_current_base_url")
         self.current_base.return_value = self.BASE_URL
 
     def _mock(self, module, name: str) -> Mock:
@@ -115,7 +117,7 @@ class MappingHandlerTests(unittest.TestCase):
         self.list_objects.assert_called_once_with(self.BASE_URL)
 
     def test_objects_does_not_read_a_changed_robot(self) -> None:
-        self.current_base.side_effect = handlers.RobotApiError("robot changed", 409)
+        self.current_base.side_effect = robot.RobotApiError("robot changed", 409)
         _, response = self._request("GET", self._url("/objects"))
         self.assertEqual(response["status"], 409)
         self.assertEqual(response["data"], {"error": "robot changed"})
@@ -123,7 +125,7 @@ class MappingHandlerTests(unittest.TestCase):
 
     def test_objects_discards_result_when_robot_changes_during_read(self) -> None:
         self.current_base.side_effect = [
-            self.BASE_URL, handlers.RobotApiError("robot changed during read", 409)
+            self.BASE_URL, robot.RobotApiError("robot changed during read", 409)
         ]
         self.list_objects.return_value = {
             "objects": [{"id": 7, "type": "wall", "name": "old robot object"}],
@@ -208,7 +210,7 @@ class MappingHandlerTests(unittest.TestCase):
         for method, url, payload, mocked in routes:
             for status in (409, 423, 504):
                 with self.subTest(method=method, url=url, status=status):
-                    mocked.side_effect = handlers.RobotApiError("chassis failure", status)
+                    mocked.side_effect = robot.RobotApiError("chassis failure", status)
                     _, response = self._request(method, url, payload)
                     self.assertEqual(response["status"], status)
                     self.assertEqual(response["data"], {"error": "chassis failure"})

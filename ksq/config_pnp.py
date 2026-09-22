@@ -1,16 +1,16 @@
-"""Parse ``config_pnp/config.py`` via AST to locate KSQ data files.
+"""Parse ``config_pnp/config.py`` via AST for data paths and location restrictions.
 
 The device-side ``config_pnp/config.py`` uses ``config.scene.<key> =
 config_pnp_path("<filename>")`` assignments to point at data files whose names
 may change (e.g. date-stamped CSVs).  Instead of executing that file — which
 carries sandbox-escape risk via ``__builtins__`` access — this module parses it
-with :mod:`ast` and extracts only the four keys KSQ cares about: ``shelves``,
-``tool_mapping``, ``unavailable``, ``pick_strategy``.
+with :mod:`ast` and extracts ``shelves``, ``tool_mapping``, ``unavailable``,
+``pick_strategy`` paths plus literal shelf/level/bin restrictions.
 
 The source code is **never executed** (no ``exec`` / ``eval`` / ``compile``),
-so arbitrary code in ``config.py`` cannot run.  Any failure (missing file,
-syntax error, etc.) returns an empty dict so callers transparently fall back
-to the existing hard-coded defaults — zero regression.
+so arbitrary code in ``config.py`` cannot run. Path lookup failures fall back
+to existing defaults. Invalid location restrictions raise an error so a
+reload cannot silently remove the current unavailable list.
 """
 
 from __future__ import annotations
@@ -32,6 +32,40 @@ SCENE_KEY_MAP: Dict[str, str] = {
     "unavailable_obj": "unavailable",
     "pick_strategy_obj": "pick_strategy",
 }
+
+UNAVAILABLE_SCENE_KEYS = (
+    "unavailable_shelf_list",
+    "unavailable_shelf_unit",
+    "cannot_process_bin_unit_list",
+)
+
+
+def load_config_pnp_unavailable(config_pnp_dir: Path | None) -> dict[str, list[str]]:
+    """Read literal location restrictions without executing device Python code."""
+    if config_pnp_dir is None or not (config_pnp_dir / "config.py").is_file():
+        return {}
+    config_py = config_pnp_dir / "config.py"
+    try:
+        tree = ast.parse(config_py.read_text(encoding="utf-8-sig"))
+    except (OSError, SyntaxError, UnicodeError) as error:
+        raise ValueError("无法解析 config.py 的不可处理配置，请检查文件。") from error
+    result: dict[str, list[str]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        key = _scene_attr_key(node.targets[0])
+        if key not in UNAVAILABLE_SCENE_KEYS:
+            continue
+        try:
+            values = ast.literal_eval(node.value)
+        except (ValueError, TypeError, SyntaxError) as error:
+            raise ValueError(f"config.scene.{key} 必须直接填写列表。") from error
+        if not isinstance(values, (list, tuple)) or any(
+            type(value) not in (str, int) for value in values
+        ):
+            raise ValueError(f"config.scene.{key} 必须是字符串或整数列表。")
+        result[key] = [str(value).strip() for value in values if str(value).strip()]
+    return result
 
 
 def _scene_attr_key(node: ast.AST) -> str | None:

@@ -2,71 +2,20 @@
 
 from __future__ import annotations
 
-import html
 from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Tuple
+import html
 
-from ksq.constants import (
-    APP_VERSION,
-    BASE_COLUMNS,
-    DEFAULT_KNOWLEDGE,
-    DEFAULT_KNOWLEDGE_ROOT,
-    PACKAGE_DIRECTORY,
-)
+from ksq.constants import APP_VERSION, BASE_COLUMNS, PACKAGE_DIRECTORY
+from ksq.data import state as state
+from ksq.data.paths import configured_path_field_values
 from ksq.display import display_value
 from ksq.models import Dataset, ShelfEntry
-from ksq.side_data import (
-    resolve_closed_loop_label,
-    resolve_tool_name,
-    resolve_unavailable_label,
-)
-from ksq.web import state
+from ksq.side_data import resolve_closed_loop_label, resolve_tool_name, resolve_unavailable_label
+
 
 TEMPLATES_DIRECTORY = PACKAGE_DIRECTORY / "web" / "templates"
 STATIC_DIRECTORY = PACKAGE_DIRECTORY / "web" / "static"
-
-
-def path_field_bases() -> Tuple[Optional[Path], Optional[Path]]:
-    # In the mounted-root layout the root, rather than the current target
-    # directory, is the base for all relative scene paths.
-    knowledge_base = state.configured_knowledge_root
-    if knowledge_base is None:
-        knowledge_base = state._cli_config_paths.get("knowledge")
-    if knowledge_base is None and state.configured_vfm_app is not None:
-        knowledge_base = state.configured_vfm_app / "model/templates"
-    if knowledge_base is None and state.configured_knowledge == DEFAULT_KNOWLEDGE:
-        knowledge_base = DEFAULT_KNOWLEDGE_ROOT
-    return knowledge_base, state.configured_config_pnp
-
-
-def path_field_display(path: Optional[Path], base: Optional[Path]) -> str:
-    if path is None:
-        return ""
-    if base is not None:
-        try:
-            return str(path.resolve().relative_to(base.resolve()))
-        except ValueError:
-            pass
-    return str(path)
-
-
-def configured_path_field_values() -> Dict[str, str]:
-    knowledge_base, config_base = path_field_bases()
-    return {
-        "knowledge": path_field_display(
-            state.configured_knowledge, knowledge_base
-        ),
-        "shelves": path_field_display(state.configured_shelves, config_base),
-        "unavailable": path_field_display(
-            state.configured_unavailable, config_base
-        ),
-        "tool_mapping": path_field_display(
-            state.configured_tool_mapping, config_base
-        ),
-        "pick_strategy": path_field_display(
-            state.configured_pick_strategy, config_base
-        ),
-    }
 
 
 def _read_template(name: str) -> str:
@@ -137,7 +86,7 @@ def format_status_html(
         else (
             "<p class='status-alert'>knowledge 字典为空："
             + html.escape(knowledge_source)
-            + " 中没有 JSON 文件。在架 SKU 仍可查询与下单，但所有 knowledge 字段均为 -。"
+            + " 中未找到可用的药品 Knowledge 记录。在架 SKU 仍可查询与下单，但所有 knowledge 字段均为 -。"
             + "请确认路径是否正确（容器部署时还需确认挂载目录未失效）。</p>"
         )
     )
@@ -203,18 +152,9 @@ def format_status_html(
             + f"（共 {len(report.conflicting_knowledge_ids)} 个）"
         )
     if report.ignored_knowledge_files:
-        preview = ", ".join(
-            html.escape(item) for item in report.ignored_knowledge_files[:5]
-        )
-        more = (
-            ""
-            if len(report.ignored_knowledge_files) <= 5
-            else f" 等 {len(report.ignored_knowledge_files)} 个"
-        )
         dictionary_notes.append(
-            "已忽略非 knowledge 文件（如编辑器 .swp / 备份 .bak，不影响加载）："
-            + preview
-            + more
+            f"已跳过辅助或无药品标识的文件（{len(report.ignored_knowledge_files)} 个）："
+            + ", ".join(html.escape(item) for item in report.ignored_knowledge_files)
         )
     notes_html = (
         ""
@@ -296,6 +236,7 @@ def _order_lines(item_id: str, entries: tuple[ShelfEntry, ...]) -> List[Dict[str
                 "barcode": entry.sku_code or item_id,
                 "sku_id": sku_id,
                 "location_code": entry.location,
+                "customer_location_code": entry.customer_location_code,
                 "name": entry.name if entry.name != "未命名" else "",
                 "shelf_attribute": entry.shelf_attribute or "",
                 "baffle_height": entry.baffle_height or "",

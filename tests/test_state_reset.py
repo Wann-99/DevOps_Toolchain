@@ -316,11 +316,11 @@ class SaveDashboardSettingsMarkerPreservationTests(unittest.TestCase):
 
         self.patches = [
             patch(
-                "ksq.web.dashboard_api.DASHBOARD_SETTINGS_FILE",
+                "ksq.dashboard.settings.DASHBOARD_SETTINGS_FILE",
                 self.settings_file,
             ),
             patch(
-                "ksq.web.dashboard_api.ROBOT_KEYBOARD_ENV_FILE",
+                "ksq.dashboard.settings.ROBOT_KEYBOARD_ENV_FILE",
                 self.keyboard_env_file,
             ),
         ]
@@ -333,7 +333,7 @@ class SaveDashboardSettingsMarkerPreservationTests(unittest.TestCase):
         self._tmpdir.cleanup()
 
     def test_marker_preserved_across_settings_save(self) -> None:
-        from ksq.web import dashboard_api
+        from ksq.dashboard import service as dashboard_api
 
         initial = {
             "keyboard_device": "/dev/input/event1",
@@ -357,7 +357,7 @@ class SaveDashboardSettingsMarkerPreservationTests(unittest.TestCase):
         self.assertTrue(saved.get("auto_confirm"))
 
     def test_no_marker_added_when_absent(self) -> None:
-        from ksq.web import dashboard_api
+        from ksq.dashboard import service as dashboard_api
 
         initial = {
             "keyboard_device": "/dev/input/event1",

@@ -183,6 +183,7 @@ def public_item(item: Dict[str, str]) -> Dict[str, str]:
         "sku_id": item.get("sku_id", ""),
         "out_item_id": item.get("out_item_id", ""),
         "location_code": item.get("location_code", ""),
+        "customer_location_code": item.get("customer_location_code", ""),
         "location_display": location_display,
         "sku_code": item.get("sku_code", ""),
         "name": item.get("name", ""),
@@ -263,6 +264,7 @@ def load_candidates(
                     "sku_id": sku_id,
                     "out_item_id": (row.get("out_item_id") or "").strip(),
                     "location_code": loc,
+                    "customer_location_code": (row.get("customer_location_code") or "").strip(),
                     "sku_code": sku,
                     "name": (row.get("name") or "").strip(),
                     "推荐工具": tool,
@@ -669,6 +671,10 @@ def _import_identifiers(row: Dict[str, str]) -> Dict[str, str]:
         if field == "location_code":
             value = normalize_import_location(value)
         values[field] = value
+    if not values["location_code"] and all(
+        (row.get(field) or "").strip() for field in ("shelf_number", "level", "bin_unit")
+    ):
+        values["location_code"] = location_code(row)
     return values
 
 
@@ -915,6 +921,8 @@ def parse_import_csv_full(
                 continue
             if warning:
                 errors.append(f"第 {index} 行：{warning}")
+            if "customer_location_code" in display:
+                item["customer_location_code"] = display["customer_location_code"]
             item["display"] = dict(display)
             if group_field:
                 item["group_id"] = display.get(group_field, "")
