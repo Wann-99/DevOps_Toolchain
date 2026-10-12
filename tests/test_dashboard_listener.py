@@ -77,9 +77,9 @@ class DashboardListenerTests(unittest.TestCase):
 
         with patch.object(order_store, "DASHBOARD_ACTIVE_ORDER_FILE", state_file):
             fresh = dashboard_api._reconcile_pending_confirmation(
-                _prompt_snapshot(order)
+                {"order": dashboard_api._public_order(order), "keyboard": _prompt_snapshot(order)}
             )
-            self.assertTrue(fresh["needs_confirm"])
+            self.assertTrue(fresh["keyboard"]["needs_confirm"])
             self.assertIn("pending_confirm", order_store._ACTIVE_ORDER)
 
             # Simulate a backend process restart: only the state file survives.
@@ -97,18 +97,20 @@ class DashboardListenerTests(unittest.TestCase):
                 "confirm_closed": False,
                 "current_item": None,
             }
+            gap["keyboard"] = {"needs_confirm": False, "confirm_closed": False}
             restored = dashboard_api._reconcile_pending_confirmation(gap)
-            self.assertTrue(restored["needs_confirm"])
-            self.assertEqual(restored["await_line"], "等待按下目标按键")
+            self.assertTrue(restored["keyboard"]["needs_confirm"])
+            self.assertEqual(restored["status"], "processing")
+            self.assertEqual(restored["keyboard"]["await_line"], "等待按下目标按键")
             self.assertEqual(
-                restored["confirm_fingerprint"],
-                fresh["confirm_fingerprint"],
+                restored["keyboard"]["confirm_fingerprint"],
+                fresh["keyboard"]["confirm_fingerprint"],
             )
 
             closed = deepcopy(gap)
-            closed["confirm_closed"] = True
+            closed["keyboard"] = {"needs_confirm": False, "confirm_closed": True}
             result = dashboard_api._reconcile_pending_confirmation(closed)
-            self.assertFalse(result["needs_confirm"])
+            self.assertFalse(result["keyboard"]["needs_confirm"])
             self.assertNotIn("pending_confirm", active_orders.get_active_order())
             persisted = json.loads(state_file.read_text(encoding="utf-8"))
             self.assertNotIn("pending_confirm", persisted)

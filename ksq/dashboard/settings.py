@@ -164,6 +164,23 @@ def _parse_feishu_link(raw: object) -> Tuple[str, str]:
     return app_token, table_id
 
 
+def _normalize_feishu_page_url(raw: object) -> str:
+    value = str(raw or "").strip()
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    if (
+        len(value) > 2048 or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        or parsed.scheme != "https" or parsed.username or parsed.password
+        or parsed.netloc.lower() not in {host, host + ":443"}
+        or not any(host == domain or host.endswith("." + domain) for domain in ("feishu.cn", "larksuite.com"))
+    ):
+        raise ValueError("请填写有效的 HTTPS 飞书表单链接。")
+    if re.fullmatch(r"/share/base/form/[A-Za-z0-9_-]+/?", parsed.path):
+        return value
+    _parse_feishu_link(value)
+    return value
+
+
 def _canonical_feishu_link(app_token: str, table_id: str) -> str:
     return "https://feishu.cn/base/%s?table=%s" % (
         quote(app_token, safe=""),
@@ -172,7 +189,7 @@ def _canonical_feishu_link(app_token: str, table_id: str) -> str:
 
 
 def _normalize_feishu_forms(raw: object, strict: bool = False) -> List[Dict[str, str]]:
-    """Configured forms: a pasted Feishu link plus one registered payload rule."""
+    """Keep native form links and read legacy Bitable targets without losing settings."""
     forms: List[Dict[str, str]] = []
     seen = set()
     seen_names = set()
@@ -188,7 +205,9 @@ def _normalize_feishu_forms(raw: object, strict: bool = False) -> List[Dict[str,
         table_id = ""
         if link:
             try:
-                app_token, table_id = _parse_feishu_link(link)
+                link = _normalize_feishu_page_url(link)
+                if not urlparse(link).path.startswith("/share/base/form/"):
+                    app_token, table_id = _parse_feishu_link(link)
             except ValueError:
                 if strict:
                     raise
@@ -201,9 +220,9 @@ def _normalize_feishu_forms(raw: object, strict: bool = False) -> List[Dict[str,
                 link = _canonical_feishu_link(app_token, table_id)
         name = str(entry.get("name") or "").strip()
         form_id = str(entry.get("id") or "").strip() or name
-        if not form_id or not name or not app_token or not table_id:
+        if not form_id or not name or not link:
             if strict:
-                raise ValueError("请完整填写表单名称和飞书多维表格链接。")
+                raise ValueError("请完整填写表单名称和飞书表单链接。")
             continue
         if form_id in seen or name in seen_names:
             if strict:
@@ -270,8 +289,6 @@ def _normalize_feishu_settings(
     if str(current.get("selected_form") or "") not in known:
         current["selected_form"] = str(current["forms"][0]["id"]) if current["forms"] else ""
     if strict and current["enabled"]:
-        if not str(current.get("app_id") or "").strip() or not str(current.get("app_secret") or "").strip():
-            raise ValueError("启用飞书表单前请配置 App ID 和 App Secret。")
         if not current["forms"]:
             raise ValueError("启用飞书表单前请新增并选择一个表单。")
     return current

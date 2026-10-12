@@ -640,6 +640,8 @@ async function checkDriving() {
     const initiallyBlocked = p.mapping.blocksNavigation();
     dispatch(p, p.drive("forward"), "pointerdown"); await flush();
     assert.equal(driveCommands(p, "drive-start").length, 1, phase);
+    assert.equal(driveCommands(p, "drive-start")[0].payload.linear_speed, 0.5, phase);
+    assert.equal(driveCommands(p, "drive-start")[0].payload.angular_speed, 0.5, phase);
     assert.equal(driveCommands(p, "move").length, 1, phase);
     assert(p.mapping.blocksNavigation(), `${phase}: manual driving must block navigation without SLAM mapping`);
     const stopped = deferred();
@@ -1033,6 +1035,13 @@ async function check() {
   assert(initial.get("stop").disabled && initial.get("object-type").disabled);
   assert.equal(initial.requests.length, 0);
   await checkObjectLoading();
+
+  for (const name of ["实际地图", "药房 / 1F", ""]) {
+    const p = page(); await p.load(snapshot({ name }));
+    assert.equal(p.select("[data-build-map-name]")[0].textContent, name || "--");
+    p.command("rename").click();
+    assert.equal(p.get("dialog-form").elements.namedItem("name").value, name);
+  }
 
   const active = page();
   await active.load(snapshot({ mapping_enabled: true, phase: "active", teleop_supported: false, teleop_reason: "Firmware does not support teleop" }));

@@ -247,7 +247,14 @@ def _order_is_queue_terminal(order: Optional[Dict[str, object]]) -> bool:
     lifecycle = order.get("lifecycle")
     if not isinstance(lifecycle, dict):
         return False
-    return str(lifecycle.get("broker_status") or "").strip() in _BROKER_ORDER_TERMINAL
+    if str(lifecycle.get("broker_status") or "").strip() in _BROKER_ORDER_TERMINAL:
+        return True
+    # Robot-side item failure ends the local order even when Broker has not
+    # returned its terminal status yet; otherwise a failed order blocks queue promotion.
+    return bool(
+        (lifecycle.get("ended") or lifecycle.get("closed"))
+        and str(lifecycle.get("end_reason") or "").strip() == "items_failed"
+    )
 
 
 _TERMINAL_ITEM_STATUSES = frozenset({"success", "failed", "skipped"})

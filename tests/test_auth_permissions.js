@@ -33,7 +33,7 @@ async function page(role) {
   assert.equal(requests.length, 0, "Rejected map writes must never reach fetch, including keyboard controls");
   for (const url of ["/api/map/health", "/api/map/pose", "/api/map/mapping/export"])
     assert.equal((await viewer.fetch(url)).status, 200);
-  for (const url of ["/api/files/upload", "/api/terminal/create", "/api/order/create", "/arm-api/arm/read"])
+  for (const url of ["/api/files/upload", "/api/terminal/create", "/api/order/create", "/arm-api/arm/read", "/api/upgrade/check", "/api/upgrade/start"])
     assert.equal((await viewer.fetch(url, { method: "POST" })).status, 200);
   const { context: admin, requests: writes } = await page("admin");
   assert.equal((await admin.fetch("/api/map/mapping", { method: "POST" })).status, 200);

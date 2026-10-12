@@ -1736,8 +1736,12 @@
       return data;
     }
 
-    async function ensureOrderCreationAllowed() {
-      const response = await fetch("/api/order/preflight", { method: "POST" });
+    async function ensureOrderCreationAllowed(items) {
+      const response = await fetch("/api/order/preflight", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: items || [], mode: dashboardMode() }),
+      });
       const data = await response.json();
       if (!response.ok) {
         throw await reportOrderApiError(
@@ -1792,6 +1796,8 @@
           customer_location_code: line.customer_location_code || "",
           barcode: line.barcode || "",
           name: line.name || "",
+          specifications: line.specifications || "",
+          manufacturer: line.manufacturer || "",
           quantity: 1,
         });
       });
@@ -1824,10 +1830,10 @@
       if (button) button.disabled = true;
       setStatus(tokenReady ? "下单中..." : "获取 Token 并下单...");
       try {
-        await ensureOrderCreationAllowed();
         // PUT invalidates the server-side token cache. Save the current form
         // first, then always obtain a token for exactly that configuration.
         await saveOrderConfig();
+        await ensureOrderCreationAllowed(items);
         await ensureToken({ skipSave: true });
         const mode = dashboardMode();
         const response = await fetch("/api/order/create", {

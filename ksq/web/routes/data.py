@@ -13,7 +13,6 @@ from ksq.data import workspace as edit_workspace
 from ksq.data.imports import import_uploaded_files
 from ksq.data.loader import CLOUD_SHELVES_URL, apply_configured_paths_reload, load_uploaded_zip, parse_shelves_source
 from ksq.data.paths import configured_path_field_values
-from ksq.order import active as active_orders
 from ksq.web.pages import build_missing_rows, format_status_html, home_page_html, order_page_html, query_page_html, records_payload
 from ksq.web.request_utils import read_form, _drain_request_body, _mark_request_body_consumed, _request_content_length, read_json_body
 
@@ -59,7 +58,8 @@ def handle_get(handler, session) -> bool:
                 else "",
                 "data_revision": state.data_revision,
                 "dashboard_mode": dashboard_settings.resolve_dashboard_mode(""),
-                "active_order_keys": active_orders.active_order_blocking_keys(),
+                # Broker decides whether another order can be accepted.
+                "active_order_keys": [],
             },
         )
         return True

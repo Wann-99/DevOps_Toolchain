@@ -1415,6 +1415,19 @@
     }
   }
 
+  function readOrderFields() {
+    const body = el("f1-body");
+    if (!body) return {};
+    try {
+      const parsed = JSON.parse(body.value || "{}");
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed
+        : {};
+    } catch (_error) {
+      return {};
+    }
+  }
+
   async function ensureToken(items) {
     const mode = dashboardMode();
     const response = await fetch(
@@ -1448,6 +1461,8 @@
       customer_location_code: item.customer_location_code || "",
       barcode: item.sku_code,
       name: item.name,
+      specifications: item.specifications || "",
+      manufacturer: item.manufacturer || "",
       quantity: 1,
       group_id: item.group_id || "",
       group_field: item.group_id ? groupField : "",
@@ -1458,6 +1473,12 @@
   async function createOrder(items) {
     const preflightResponse = await fetch("/api/order/preflight", {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        items: items,
+        order_fields: readOrderFields(),
+        mode: dashboardMode(),
+      }),
     });
     const preflightData = await preflightResponse.json();
     if (!preflightResponse.ok) {
@@ -1472,7 +1493,11 @@
     const response = await fetch("/api/order/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ items: items, mode: dashboardMode() }),
+      body: JSON.stringify({
+        items: items,
+        order_fields: readOrderFields(),
+        mode: dashboardMode(),
+      }),
     });
     const data = await response.json();
     if (!response.ok) {
@@ -1583,9 +1608,7 @@
   }
 
   function openDashboardAfterOrder(data, items) {
-    if (data.order_session && data.order_session.queued) {
-      setStatus("下单成功，已排队；仪表板继续显示当前单。");
-    }
+    setStatus("下单成功，已提交 Broker；仪表板显示最新订单。");
     if (global.KsqDashboard && global.KsqDashboard.openAfterOrder) {
       const requestBody = data.request_body || {};
       global.KsqDashboard.openAfterOrder(

@@ -50,7 +50,7 @@
 .map-chassis-health-reasons li + li { margin-top:4px; }
 #map-chassis-health.is-error { color:var(--danger); background:#fff0ed; }
 #map-chassis-health.is-warning { color:#94601b; background:#fff2db; }
-.map-chassis-pose { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin:0 0 12px; }
+.map-chassis-pose { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin:0 0 12px; }
 .map-chassis-pose > div { min-width:0; }
 .map-chassis-pose dt { color:var(--muted); }
 .map-chassis-pose dd { display:flex; align-items:baseline; flex-wrap:wrap; gap:4px; margin:4px 0 0; overflow-wrap:anywhere; }

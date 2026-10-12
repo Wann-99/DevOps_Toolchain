@@ -122,6 +122,26 @@ class ApplyBrokerItemDetailsTests(unittest.TestCase):
         self.assertEqual(tasks[0]["sku_id"], "P000019273")
         self.assertEqual(tasks[0]["name"], "复方氯己定含漱液")
 
+    def test_broker_missing_barcode_uses_sku_id_for_display(self) -> None:
+        entry = dict(REAL_ITEM, barcode="")
+        tasks = [{"code": "P000019273", "sku_id": "P000019273"}]
+
+        da._apply_broker_item_details(tasks, broker([entry]))
+
+        self.assertEqual(tasks[0]["barcode"], "P000019273")
+
+    def test_same_broker_item_is_not_rendered_twice_from_barcode_and_sku_id(self) -> None:
+        tasks = [
+            {"code": "6958152200066", "barcode": "6958152200066", "status": "pending"},
+            {"code": "P000019273", "sku_id": "P000019273", "status": "success"},
+        ]
+
+        da._apply_broker_item_details(tasks, broker([REAL_ITEM]))
+
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["barcode"], "6958152200066")
+        self.assertEqual(tasks[0]["status"], "success")
+
     def test_matches_by_sku_id_and_item_id_too(self) -> None:
         for key, value in (("sku_id", "P000019273"), ("item_id", "761")):
             with self.subTest(key=key):
@@ -144,7 +164,7 @@ class ApplyBrokerItemDetailsTests(unittest.TestCase):
         self.assertEqual(tasks[0]["name"], "复方氯己定含漱液")
         self.assertEqual(tasks[0]["location_code"], "00530302")
 
-    def test_never_blanks_existing_value_when_broker_is_empty(self) -> None:
+    def test_display_fields_follow_broker_even_when_empty(self) -> None:
         entry = dict(REAL_ITEM, item_name="", common_name="", location_code="")
         entry["locations"] = []
         entry.pop("alias", None)
@@ -154,18 +174,16 @@ class ApplyBrokerItemDetailsTests(unittest.TestCase):
 
         da._apply_broker_item_details(tasks, broker([entry]))
 
-        self.assertEqual(tasks[0]["name"], "本地名")
-        self.assertEqual(tasks[0]["location_code"], "520701")
-        # Broker 侧 barcode 非空，仍应以它为准
+        self.assertEqual(tasks[0]["name"], "")
+        self.assertEqual(tasks[0]["location_code"], "")
         self.assertEqual(tasks[0]["barcode"], "6958152200066")
 
-    def test_unmatched_task_is_left_untouched(self) -> None:
+    def test_unmatched_task_is_removed_when_broker_has_items(self) -> None:
         tasks = [{"barcode": "699999999", "name": "", "location_code": ""}]
 
         da._apply_broker_item_details(tasks, broker([REAL_ITEM]))
 
-        self.assertEqual(tasks[0]["name"], "")
-        self.assertNotIn("broker_matched", tasks[0])
+        self.assertEqual(tasks, [])
 
 
 class FocusMatchFieldsTests(unittest.TestCase):

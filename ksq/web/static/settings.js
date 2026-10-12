@@ -35,24 +35,7 @@
   }
 
   function parseFeishuLink(value) {
-    const raw = String(value || "").trim();
-    let parsed;
-    try {
-      parsed = new URL(raw);
-    } catch (_error) {
-      throw new Error("飞书多维表格链接无效，应包含 /base/{app_token}?table={table_id}。");
-    }
-    if (!/^https?:$/.test(parsed.protocol)) {
-      throw new Error("飞书多维表格链接无效，应使用 http 或 https 地址。");
-    }
-    const parts = parsed.pathname.split("/").filter(Boolean);
-    const baseIndex = parts.indexOf("base");
-    const appToken = baseIndex >= 0 ? decodeURIComponent(parts[baseIndex + 1] || "") : "";
-    const tableId = String(parsed.searchParams.get("table") || "").trim();
-    if (!appToken || !tableId) {
-      throw new Error("飞书多维表格链接无效，应包含 /base/{app_token}?table={table_id}。");
-    }
-    return { app_token: appToken.trim(), table_id: tableId };
+    return global.KsqFeishuForm.validateUrl(value);
   }
 
   function feishuLinkFor(item) {
@@ -174,7 +157,6 @@
   }
 
   let feishuFormCounter = 0;
-  let feishuRules = [{ id: "robot_test", name: "机器人测试表单", default: true }];
 
   function fillFeishuFormSelect(selected) {
     const select = el("settings-feishu-selected-form");
@@ -203,22 +185,12 @@
     const row = document.createElement("div");
     row.className = "feishu-form-row";
     row.dataset.formId = String(item.id || `form-${Date.now()}-${++feishuFormCounter}`);
-    const selectedRule = String(item.rule || feishuRules.find((rule) => rule.default)?.id || "robot_test");
     row.innerHTML =
       '<label class="path-field"><span>表单名称</span><input data-field="name" placeholder="例如：机器人测试表单" value="' +
       escapeHtml(String(item.name || "")) +
-      '"></label><label class="path-field"><span>飞书多维表格链接</span><input data-field="url" placeholder="粘贴飞书多维表格链接" value="' +
+      '"></label><label class="path-field"><span>原表单链接</span><input data-field="url" placeholder="粘贴飞书表单分享链接" value="' +
       escapeHtml(feishuLinkFor(item)) +
-      '"><small class="feishu-link-status" data-link-status></small></label><label class="path-field"><span>填写规则</span><select data-field="rule">' +
-      feishuRules
-        .map(
-          (rule) =>
-            '<option value="' + escapeHtml(rule.id) + '"' +
-            (rule.id === selectedRule ? " selected" : "") + ">" +
-            escapeHtml(rule.name) + "</option>"
-        )
-        .join("") +
-      '</select></label><button class="secondary feishu-form-delete" type="button" title="删除表单" aria-label="删除表单">×</button>';
+      '"><small class="feishu-link-status" data-link-status></small></label><button class="secondary feishu-form-delete" type="button" title="删除表单" aria-label="删除表单">×</button>';
     row.querySelector('[data-field="name"]').addEventListener("input", () => fillFeishuFormSelect());
     const linkInput = row.querySelector('[data-field="url"]');
     if (linkInput) {
@@ -231,11 +203,9 @@
           return;
         }
         try {
-          const target = parseFeishuLink(value);
-          row.dataset.appToken = target.app_token;
-          row.dataset.tableId = target.table_id;
+          parseFeishuLink(value);
           row.classList.add("is-valid");
-          if (status) status.textContent = "链接已识别，可自动读取 app_token 和 table_id";
+          if (status) status.textContent = "链接有效，将在工具内打开原表单";
         } catch (error) {
           row.classList.add("is-invalid");
           if (status) status.textContent = error.message || "链接无效";
@@ -270,17 +240,14 @@
       const name = value("name");
       const url = value("url");
       if (!name && !url) return;
-      if (!name || !url) throw new Error("请完整填写表单名称和飞书多维表格链接。");
-      const target = parseFeishuLink(url);
+      if (!name || !url) throw new Error("请完整填写表单名称和飞书表单链接。");
+      parseFeishuLink(url);
       if (names.has(name)) throw new Error(`表单名称“${name}”重复。`);
       names.add(name);
       forms.push({
         id: String(row.dataset.formId || name),
         name: name,
         url: url,
-        app_token: target.app_token,
-        table_id: target.table_id,
-        rule: value("rule") || "robot_test",
       });
     });
     return forms;
@@ -289,55 +256,18 @@
   function applyFeishuSettings(feishu) {
     const cfg = feishu && typeof feishu === "object" ? feishu : {};
     const enabled = el("settings-feishu-enabled");
-    const appId = el("settings-feishu-app-id");
-    const appSecret = el("settings-feishu-app-secret");
-    const ai = cfg.ai && typeof cfg.ai === "object" ? cfg.ai : {};
-    const aiEnabled = el("settings-feishu-ai-enabled");
-    const aiEndpoint = el("settings-feishu-ai-endpoint");
-    const aiModel = el("settings-feishu-ai-model");
-    const aiApiKey = el("settings-feishu-ai-api-key");
     if (enabled) enabled.checked = !!cfg.enabled;
-    if (appId) appId.value = String(cfg.app_id || "");
-    if (aiEnabled) aiEnabled.checked = !!ai.enabled;
-    if (aiEndpoint) aiEndpoint.value = String(ai.endpoint || "");
-    if (aiModel) aiModel.value = String(ai.model || "gpt-4o-mini");
-    if (aiApiKey) {
-      aiApiKey.value = "";
-      aiApiKey.placeholder = ai.has_api_key ? "已配置（内容隐藏，留空不改）" : "未配置（可选）";
-    }
-    if (appSecret) {
-      appSecret.value = "";
-      appSecret.placeholder = cfg.has_app_secret
-        ? "已配置（内容隐藏，留空不改）"
-        : "未配置";
-    }
-    if (Array.isArray(cfg.form_rules) && cfg.form_rules.length) feishuRules = cfg.form_rules;
-    renderFeishuForms(cfg.forms, String(cfg.selected_form || ""));
-    const aiOptions = el("settings-feishu-ai-options");
-    if (aiOptions) aiOptions.open = !!ai.enabled;
+    renderFeishuForms(cfg.forms || [], cfg.selected_form || "");
   }
 
   function collectFeishuSettings() {
     const enabled = el("settings-feishu-enabled");
-    const appId = el("settings-feishu-app-id");
-    const appSecret = el("settings-feishu-app-secret");
-    const aiApiKey = el("settings-feishu-ai-api-key");
     const forms = collectFeishuForms();
     if (enabled && enabled.checked && !forms.length) throw new Error("启用飞书表单前请先新增表单。");
     return {
       enabled: !!(enabled && enabled.checked),
-      app_id: appId ? appId.value.trim() : "",
-      app_secret: appSecret ? appSecret.value : "",
       forms: forms,
-      selected_form: el("settings-feishu-selected-form")
-        ? String(el("settings-feishu-selected-form").value || "")
-        : "",
-      ai: {
-        enabled: !!(el("settings-feishu-ai-enabled") && el("settings-feishu-ai-enabled").checked),
-        endpoint: el("settings-feishu-ai-endpoint") ? el("settings-feishu-ai-endpoint").value.trim() : "",
-        model: el("settings-feishu-ai-model") ? el("settings-feishu-ai-model").value.trim() : "",
-        api_key: aiApiKey ? aiApiKey.value : "",
-      },
+      selected_form: String(el("settings-feishu-selected-form")?.value || ""),
     };
   }
 
@@ -404,7 +334,7 @@
   }
 
   let feishuSaveBusy = false;
-  let feishuSubmitBusy = false;
+  let feishuOpenBusy = false;
 
   async function saveFeishuSettings(options) {
     const opts = options && typeof options === "object" ? options : {};
@@ -442,38 +372,25 @@
     }
   }
 
-  async function submitFeishuManual() {
+  async function openFeishuForm() {
     const status = el("settings-feishu-status");
-    const submitBtn = el("settings-feishu-submit");
-    if (feishuSubmitBusy) return;
-    feishuSubmitBusy = true;
-    if (submitBtn) submitBtn.disabled = true;
-    setStatus(status, "提交中…");
+    const button = el("settings-feishu-submit");
+    if (feishuOpenBusy) return;
+    feishuOpenBusy = true;
+    if (button) button.disabled = true;
+    setStatus(status, "正在打开原表单…");
     try {
-      const response = await fetch("/api/dashboard/feishu/submit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}",
-      });
-      const data = await readJsonResponse(response, "提交失败");
-      if (!response.ok) throw new Error(data.error || "提交失败");
-      if (data.ok && !data.skipped) {
-        setStatus(status, "已提交飞书 · record_id " + (data.record_id || ""));
-      } else if (data.skipped) {
-        const reason = data.reason || "skipped";
-        const message =
-          reason === "disabled"
-            ? "飞书表单未启用，请打开“启用”并保存配置后再提交。"
-            : "已跳过：" + reason;
-        setStatus(status, message, reason === "disabled");
-      } else {
-        setStatus(status, data.error || "提交失败", true);
-      }
+      const response = await fetch("/api/dashboard/feishu/preview", { cache: "no-store" });
+      const data = await readJsonResponse(response, "打开表单失败");
+      if (!response.ok) throw new Error(data.error || "打开表单失败");
+      if (!data.form) throw new Error("请先配置并保存飞书表单链接。");
+      global.KsqFeishuForm.open(data.form);
+      setStatus(status, "请在弹窗内填写，点击原表单的提交按钮。");
     } catch (error) {
       setStatus(status, error.message || String(error), true);
     } finally {
-      feishuSubmitBusy = false;
-      if (submitBtn) submitBtn.disabled = false;
+      feishuOpenBusy = false;
+      if (button) button.disabled = false;
     }
   }
 
@@ -535,6 +452,16 @@
       el("settings-cfg-client-id").value = data.client_id || "";
       applyClientSecret(data);
       el("settings-cfg-store-id").value = data.store_id || "";
+      const sourceSelect = el("settings-cfg-order-source");
+      if (sourceSelect) {
+        sourceSelect.innerHTML = '<option value="">默认</option>' +
+          (data.order_sources || []).map((item) =>
+            '<option value="' + escapeHtml(String(item.value || "")) + '">' +
+            escapeHtml(String(item.value || "") + " — " + String(item.cn || "")) +
+            '</option>'
+          ).join("");
+        sourceSelect.value = data.order_source || "";
+      }
       const storeSelect = el("settings-cfg-store-select");
       storeSelect.innerHTML = '<option value="">— 未配置门店 —</option>';
       if (data.store_id) {
@@ -578,6 +505,7 @@
             client_id: el("settings-cfg-client-id").value.trim(),
             client_secret: el("settings-cfg-client-secret").value,
             store_id: el("settings-cfg-store-id").value.trim(),
+            order_source: (el("settings-cfg-order-source") || {}).value || "",
             store_name:
               option && option.dataset.storeName ? option.dataset.storeName : "",
           }),
@@ -723,6 +651,7 @@
     setFoldOpen(el("settings-fold-mode"), false);
     setFoldOpen(el("settings-fold-keyboard"), false);
     setFoldOpen(el("settings-fold-feishu"), false);
+    if (global.KsqUpgrade) global.KsqUpgrade.activate();
     await loadRuntimeSettings();
     await loadOrderConfig();
   }
@@ -765,7 +694,7 @@
       });
     }
 
-    ["settings-feishu-enabled", "settings-feishu-ai-enabled"].forEach((id) => {
+    ["settings-feishu-enabled"].forEach((id) => {
       const toggle = el(id);
       if (toggle) {
         toggle.addEventListener("change", () => saveFeishuSettings());
@@ -830,7 +759,7 @@
     }
     const feishuSubmit = el("settings-feishu-submit");
     if (feishuSubmit) {
-      feishuSubmit.addEventListener("click", () => submitFeishuManual());
+      feishuSubmit.addEventListener("click", () => openFeishuForm());
     }
   }
 

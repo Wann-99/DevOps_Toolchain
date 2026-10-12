@@ -78,6 +78,8 @@ if [[ "${ACTION}" == start || "${ACTION}" == stop ]] \
         exit 0
     fi
 
+    # Keep the deployment account's Python/PATH/display environment during unattended upgrades.
+    if [[ "${KSQ_ONLINE_UPGRADE:-}" != 1 || ! -f "${UNIT}" ]]; then
     unit_file="$(mktemp)"
     trap 'rm -f "${unit_file}"' EXIT
     "${HOST_PYTHON}" - "${HOST_USER}" "${SCRIPT_DIR}/host-files.sh" "${APP_BIN}" "${SOCKET_DIR}" "${HOST_PYTHON}" > "${unit_file}" <<'PY'
@@ -107,6 +109,7 @@ PY
     "${privilege[@]}" install -m 644 "${unit_file}" "${UNIT}"
     "${privilege[@]}" systemctl daemon-reload
     "${privilege[@]}" systemctl enable "${SERVICE}"
+    fi
     "${privilege[@]}" systemctl restart "${SERVICE}"
     for attempt in {1..50}; do
         if run_agent status >/dev/null 2>&1; then

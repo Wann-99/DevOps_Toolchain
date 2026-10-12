@@ -372,6 +372,7 @@
     const orientation = pose.orientation && typeof pose.orientation === "object" ? pose.orientation : {};
     const x = firstFinite(pose.x, position.x, translation.x);
     const y = firstFinite(pose.y, position.y, translation.y);
+    const z = firstFinite(pose.z, position.z, translation.z);
     if (x === null || y === null) return null;
     let yaw = firstFinite(pose.yaw, pose.theta, pose.heading, orientation.yaw);
     if (yaw === null) {
@@ -383,7 +384,7 @@
         yaw = Math.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz));
       }
     }
-    return { x, y, yaw: yaw === null ? 0 : yaw };
+    return { x, y, z, yaw: yaw === null ? 0 : yaw };
   }
 
   function angleInRadians(value, source) {
@@ -3207,9 +3208,11 @@
   }
 
   function renderChassisPose(pose, status) {
-    ["x", "y", "yaw"].forEach((key) => {
+    ["x", "y", "z", "yaw"].forEach((key) => {
       const value = document.getElementById("map-chassis-pose-" + key);
-      if (value) value.textContent = pose ? (key === "yaw" ? pose.yaw * 180 / Math.PI : pose[key]).toFixed(3) : "--";
+      if (!value) return;
+      const number = pose && typeof pose[key] === "number" && Number.isFinite(pose[key]) ? pose[key] : null;
+      value.textContent = number === null ? "--" : (key === "yaw" ? number * 180 / Math.PI : number).toFixed(3);
     });
     const message = document.getElementById("map-chassis-pose-status");
     if (message) message.textContent = status;

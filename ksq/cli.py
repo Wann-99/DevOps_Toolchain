@@ -119,9 +119,7 @@ def serve(arguments: Optional[List[str]] = None) -> None:
     LOGGER.info("默认不可处理列表：%s", state.configured_unavailable or "未提供")
     LOGGER.info("默认工具映射：%s", state.configured_tool_mapping or "未提供")
     LOGGER.info("默认闭环吸取列表：%s", state.configured_pick_strategy or "未提供")
-    # Reset state files when the application version changes (e.g. after
-    # a .bin update).  This runs before the HTTP server starts so there is
-    # no concurrent access to the state files.  Must not block startup.
+    # Record the running version; upgrades preserve device configuration and state.
     reset_state_if_version_changed()
 
     LOGGER.info("数据尚未加载，请在页面中按需加载。")

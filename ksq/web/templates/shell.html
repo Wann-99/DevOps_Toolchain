@@ -105,7 +105,13 @@
       <div class="arm-toolbar actions">
         <button id="arm-refresh" class="secondary" type="button">刷新</button>
       </div>
-      <iframe id="arm-frame" title="机械臂示教器" allow="fullscreen" sandbox="allow-scripts allow-same-origin allow-forms allow-downloads allow-popups"></iframe>
+      <div class="arm-content">
+        <div id="arm-loading" class="app-boot" role="status" aria-live="polite">
+          <div class="app-boot-spinner" aria-hidden="true"></div>
+          <p class="app-boot-text">机械臂页面加载中…</p>
+        </div>
+        <iframe id="arm-frame" title="机械臂示教器" allow="fullscreen" referrerpolicy="no-referrer" sandbox="allow-scripts allow-forms allow-downloads allow-popups"></iframe>
+      </div>
     </section>
     <section id="view-dashboard" class="view" hidden>
       <div class="dash-top">
@@ -131,7 +137,7 @@
             <span class="dash-order-source-label" id="dash-order-source-label">来源</span>
           </div>
           <div class="dash-order-copy">
-            <p class="dash-order-kicker">当前工单</p>
+            <p class="dash-order-kicker">最新订单</p>
             <h2 class="dash-order-no" id="dash-order-no">—</h2>
             <p class="meta compact mono" id="dash-order-task">task_id —</p>
             <div class="dash-order-tags">
@@ -814,6 +820,7 @@
                 <option value="dashenlin">大参林</option>
                 <option value="yaoshibang">药师帮</option>
                 <option value="shuyu">漱玉</option>
+                <option value="lzgzdyf">桂中大药房</option>
                 <option value="noematrix">穹彻智能</option>
               </datalist>
             </label>
@@ -823,6 +830,7 @@
               <select id="settings-cfg-store-select"><option value="">— 手动填写 store_id 或先获取门店 —</option></select>
             </label>
             <label class="path-field"><span>store_id</span><input id="settings-cfg-store-id" placeholder="门店 ID"></label>
+            <label class="path-field"><span>订单来源</span><select id="settings-cfg-order-source"><option value="">默认</option></select></label>
           </div>
           <div class="actions">
             <button id="settings-save-mode" class="primary" type="button">保存配置</button>
@@ -867,7 +875,7 @@
             <span class="settings-fold-chevron" aria-hidden="true"></span>
             <span class="settings-fold-title">飞书表单</span>
           </button>
-          <label class="dash-switch" title="播报人工确认/打包/报错时自动提交">
+          <label class="dash-switch" title="订单结束后打开原表单，由人工填写提交">
             <input id="settings-feishu-enabled" type="checkbox">
             <span class="dash-switch-ui" aria-hidden="true"></span>
             <span class="dash-switch-text">启用</span>
@@ -876,17 +884,8 @@
         <div class="settings-fold-body" data-fold-body hidden>
           <div class="feishu-settings-stack">
             <fieldset class="feishu-settings-group">
-              <legend>连接凭据</legend>
-              <p class="feishu-settings-help">只需配置一次，用于调用飞书接口。</p>
-              <div class="path-fields order-config-grid">
-                <label class="path-field"><span>App ID</span><input id="settings-feishu-app-id" placeholder="cli_xxx"></label>
-                <label class="path-field"><span>App Secret</span><input id="settings-feishu-app-secret" type="password" placeholder="已保存则留空不改"></label>
-              </div>
-            </fieldset>
-
-            <fieldset class="feishu-settings-group">
               <legend>表单管理</legend>
-              <p class="feishu-settings-help">填写表单名称并粘贴飞书多维表格链接，系统会自动读取 app_token 和 table_id；字段不同的表单可选择对应填写规则。</p>
+              <p class="feishu-settings-help">粘贴飞书原表单的分享链接。开启后，订单结束时弹出填写窗口，填写完成后点击原表单中的提交按钮。</p>
               <div class="feishu-form-list" id="settings-feishu-form-list"></div>
               <div class="feishu-form-actions">
                 <button id="settings-feishu-add-form" class="secondary" type="button" title="新增表单">+ 新增表单</button>
@@ -896,23 +895,32 @@
                 <select id="settings-feishu-selected-form"><option value="">请先新增表单</option></select>
               </label>
             </fieldset>
-
-            <details class="feishu-optional-group" id="settings-feishu-ai-options">
-              <summary>可选：异常 AI 分析</summary>
-              <p class="feishu-settings-help">仅异常场景调用 AI；未配置时 AI 字段留空，其余确定性字段仍可提交。</p>
-              <label class="inline-check feishu-ai-toggle"><input id="settings-feishu-ai-enabled" type="checkbox"><span>启用异常 AI 分析（仅 Warning/失败调用）</span></label>
-              <div class="path-fields order-config-grid">
-                <label class="path-field"><span>AI 接口（OpenAI 兼容，可选）</span><input id="settings-feishu-ai-endpoint" placeholder="留空使用默认接口"></label>
-                <label class="path-field"><span>AI 模型</span><input id="settings-feishu-ai-model" placeholder="gpt-4o-mini"></label>
-                <label class="path-field"><span>AI API Key</span><input id="settings-feishu-ai-api-key" type="password" placeholder="已保存则留空不改"></label>
-              </div>
-            </details>
           </div>
           <div class="actions">
-            <button id="settings-feishu-submit" class="secondary" type="button">提交当前工单</button>
+            <button id="settings-feishu-submit" class="secondary" type="button">打开原表单</button>
             <button id="settings-feishu-save" class="primary" type="button">保存配置</button>
           </div>
           <p class="meta compact" id="settings-feishu-status" hidden></p>
+        </div>
+      </div>
+      <div class="card settings-fold" id="settings-fold-upgrade" data-fold="upgrade">
+        <div class="settings-fold-head">
+          <button type="button" class="settings-fold-toggle" data-fold-toggle aria-expanded="true">
+            <span class="settings-fold-chevron" aria-hidden="true"></span><span class="settings-fold-title">系统升级</span>
+          </button>
+        </div>
+        <div class="settings-fold-body" data-fold-body>
+          <p class="meta">所有已登录用户均可升级。配置和数据保留，升级失败自动恢复。</p>
+          <p>当前版本：<strong id="settings-upgrade-current">__APP_VERSION__</strong>　最新版本：<strong id="settings-upgrade-latest">尚未检查</strong></p>
+          <p class="meta">发布源：<a id="settings-upgrade-repository" href="https://github.com/Wann-99/DevOps_Toolchain" target="_blank" rel="noopener noreferrer">Wann-99/DevOps_Toolchain</a></p>
+          <pre class="upgrade-notes" id="settings-upgrade-notes" hidden></pre>
+          <div class="actions">
+            <button id="settings-upgrade-check" class="secondary" type="button">检查更新</button>
+            <button id="settings-upgrade-start" class="primary" type="button" disabled>立即升级</button>
+            <a id="settings-upgrade-login" href="/login" hidden>重新登录查看升级结果</a>
+          </div>
+          <progress id="settings-upgrade-progress" aria-label="升级执行进度" hidden></progress>
+          <p class="meta compact" id="settings-upgrade-status" role="status">正在读取升级状态…</p>
         </div>
       </div>
     </section>
@@ -1082,6 +1090,7 @@
                 <dl class="map-chassis-pose">
                   <div><dt>X</dt><dd><strong id="map-chassis-pose-x">--</strong><span>m</span></dd></div>
                   <div><dt>Y</dt><dd><strong id="map-chassis-pose-y">--</strong><span>m</span></dd></div>
+                  <div><dt>Z</dt><dd><strong id="map-chassis-pose-z">--</strong><span>m</span></dd></div>
                   <div><dt>航向</dt><dd><strong id="map-chassis-pose-yaw">--</strong><span>&deg;</span></dd></div>
                 </dl>
                 <button type="button" class="map-build-button secondary map-build-wide" id="map-btn-get-pose" disabled><span class="map-build-icon map-build-icon-refresh" aria-hidden="true"></span>获取底盘位姿</button>
@@ -1092,8 +1101,8 @@
                 <div class="map-build-section-heading"><h3>移动控制</h3><span class="map-build-chip" id="map-build-drive-state">--</span></div>
                 <h3>遥控速度上限</h3>
                 <div class="map-build-number-fields">
-                  <label class="map-build-field" for="map-build-linear-speed"><span>线速度上限</span><span class="map-build-input-unit"><input id="map-build-linear-speed" type="number" inputmode="decimal" min="0.01" step="0.01" value="0.20" required disabled><span>m/s</span></span></label>
-                  <label class="map-build-field" for="map-build-angular-speed"><span>角速度上限</span><span class="map-build-input-unit"><input id="map-build-angular-speed" type="number" inputmode="decimal" min="0.01" step="0.01" value="0.30" required disabled><span>rad/s</span></span></label>
+                  <label class="map-build-field" for="map-build-linear-speed"><span>线速度上限</span><span class="map-build-input-unit"><input id="map-build-linear-speed" type="number" inputmode="decimal" min="0.01" step="0.01" value="0.5" required disabled><span>m/s</span></span></label>
+                  <label class="map-build-field" for="map-build-angular-speed"><span>角速度上限</span><span class="map-build-input-unit"><input id="map-build-angular-speed" type="number" inputmode="decimal" min="0.01" step="0.01" value="0.5" required disabled><span>rad/s</span></span></label>
                 </div>
                 <p class="map-build-safety">遥控无自动避障</p>
                 <p class="map-build-status map-build-teleop-note" id="map-build-teleop-note" role="status" hidden></p>
@@ -1353,6 +1362,19 @@
     </div>
   </div>
 </div>
+<dialog id="feishu-form-dialog" class="ksq-dialog feishu-form-dialog" aria-labelledby="feishu-form-title" hidden>
+  <div class="ksq-dialog-panel feishu-form-panel">
+    <header class="feishu-form-header">
+      <div><span class="feishu-form-eyebrow">飞书表单</span><h2 id="feishu-form-title">填写表单</h2><p class="meta" id="feishu-form-order"></p></div>
+      <button id="feishu-form-close" class="secondary" type="button" aria-label="关闭表单窗口">关闭</button>
+    </header>
+    <div class="feishu-form-content">
+      <p id="feishu-form-loading" class="feishu-form-loading" role="status">正在加载原表单…</p>
+      <iframe id="feishu-form-frame" title="飞书原表单" src="about:blank" sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer"></iframe>
+    </div>
+    <footer class="feishu-form-footer"><span>填写完成后，请点击表单中的提交按钮。</span><a id="feishu-form-link" target="_blank" rel="noopener noreferrer">在飞书中打开</a></footer>
+  </div>
+</dialog>
 <script src="/static/dialog.js?v=__APP_VERSION__"></script>
 <script src="/static/status.js?v=__APP_VERSION__"></script>
 <script src="/static/auth.js?v=__APP_VERSION__"></script>
@@ -1366,10 +1388,12 @@
 <script src="/static/catalog.js?v=__APP_VERSION__"></script>
 <script src="/static/test-order.js?v=__APP_VERSION__"></script>
 <script src="/static/logs.js?v=__APP_VERSION__"></script>
+<script src="/static/feishu-form.js?v=__APP_VERSION__"></script>
 <script src="/static/dashboard.js?v=__APP_VERSION__"></script>
 <script src="/static/map.js?v=__APP_VERSION__"></script>
 <script src="/static/mapping.js?v=__APP_VERSION__"></script>
 <script src="/static/order-ops.js?v=__APP_VERSION__"></script>
+<script src="/static/upgrade.js?v=__APP_VERSION__"></script>
 <script src="/static/settings.js?v=__APP_VERSION__"></script>
 <script src="/static/app-init.js?v=__APP_VERSION__"></script>
 </body>

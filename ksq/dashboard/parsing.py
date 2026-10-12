@@ -27,6 +27,13 @@ _TS_RE = re.compile(
 )
 
 
+_TASK_SCOPE_RE = re.compile(
+    r"\b(?:Locked task|task id:|Task unknown error:|Successfully update task:)\s*"
+    r"(?P<task_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
+    re.I,
+)
+
+
 _ITEM_TASK_RE = re.compile(
     r"MedicinePickUpTaskItem\(code=([^,\s]+),\s*task_id=([^,\s]+),\s*seq_id=([^)]+)\)"
 )
@@ -35,7 +42,7 @@ _ITEM_TASK_RE = re.compile(
 _SEQ_ID_RE = re.compile(
     r"(?P<seq>\d+(?:\.\d+)?-"
     r"(?P<parent>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})-"
-    r"(?P<code>\d+)-(?P<idx>\d+))",
+    r"(?P<code>[^\s]+?)-(?P<idx>\d+))",
     re.I,
 )
 
@@ -110,6 +117,7 @@ _KEY_WAIT_RE = re.compile(
 
 _ERROR_CONFIRM_PATTERNS = (
     "报错，请求人工处理",
+    "料框异常，请求人工处理",
     "工单已被取消",
     "工单已被人工抢占",
     "数据录入问题",
@@ -207,9 +215,7 @@ def _append_event(
         del events[:-30]
 
 
-_LIVE_ITEM_STATUSES = frozenset(
-    {"started", "processing", "await_confirm", "await_error"}
-)
+_RUNNING_ITEM_STATUSES = frozenset({"started", "processing"})
 
 
 def _finalize_item_timing(item: Dict[str, object], now: datetime) -> None:
@@ -224,7 +230,7 @@ def _finalize_item_timing(item: Dict[str, object], now: datetime) -> None:
         end_dt = None
     status = str(item.get("status") or "pending")
     timing_end = await_dt or end_dt
-    if status in _LIVE_ITEM_STATUSES:
+    if status in _RUNNING_ITEM_STATUSES:
         timing_end = now
     # Do not wipe timestamps when the start line has rolled out of the log window.
     if start_dt is not None:
@@ -255,7 +261,7 @@ def _refresh_live_elapsed(
     now = order_model._parse_ts(str(polled_at or "")) or datetime.now(timezone.utc)
     for task in tasks:
         status = str(task.get("status") or "pending")
-        if status not in _LIVE_ITEM_STATUSES:
+        if status not in _RUNNING_ITEM_STATUSES:
             continue
         start_dt = order_model._parse_ts(str(task.get("started_at") or ""))
         if start_dt is None:
@@ -278,12 +284,21 @@ def _discover_log_tasks(
     codes_by_task: Dict[str, List[str]] = {}
     seen_by_task: Dict[str, set] = {}
     last_seen_by_task: Dict[str, datetime] = {}
+    scope_task_id = ""
     for line in text.splitlines():
         if not line.strip():
             continue
         match = _TS_RE.match(line)
         body = match.group("body") if match is not None else line
         line_ts = order_model._parse_ts(match.group("ts")) if match is not None else None
+        scope_match = _TASK_SCOPE_RE.search(body or "")
+        if scope_match is not None:
+            scope_task_id = scope_match.group("task_id").strip()
+            latest_task_id = scope_task_id
+            if line_ts is not None:
+                previous_seen = last_seen_by_task.get(scope_task_id)
+                if previous_seen is None or line_ts > previous_seen:
+                    last_seen_by_task[scope_task_id] = line_ts
         item_task = _ITEM_TASK_RE.search(body or "")
         parent = ""
         code = ""
@@ -293,12 +308,18 @@ def _discover_log_tasks(
         else:
             seq_match = _SEQ_ID_RE.search(body or "")
             if seq_match is None:
-                continue
-            code = seq_match.group("code").strip()
-            parent = seq_match.group("parent").strip()
+                item_start = _ITEM_START_RE.search(body or "")
+                if item_start is None or not scope_task_id:
+                    continue
+                code = item_start.group(1).strip()
+                parent = scope_task_id
+            else:
+                code = seq_match.group("code").strip()
+                parent = seq_match.group("parent").strip()
         code = aliases.get(code, code)
         if not parent or not code:
             continue
+        scope_task_id = parent
         latest_task_id = parent
         if line_ts is not None:
             if line_ts.tzinfo is None:
@@ -382,8 +403,9 @@ def _merged_code_aliases(
                 continue
             sku_id = str(item.get("sku_id") or "").strip()
             barcode = str(item.get("barcode") or "").strip()
-            if sku_id and barcode:
-                persisted[sku_id] = barcode
+            if barcode:
+                if sku_id and sku_id != barcode:
+                    persisted[sku_id] = barcode
         raw = order.get("code_aliases")
         if isinstance(raw, dict):
             persisted.update({str(k): str(v) for k, v in raw.items()})
@@ -428,6 +450,42 @@ def _match_log_task_for_order(
     return active or latest_task_id
 
 
+def parse_keyboard_wait(raw_logs: str) -> Dict[str, object]:
+    """Read the robot's latest key wait, independently of the displayed order."""
+    result: Dict[str, object] = {"needs_confirm": False, "confirm_closed": False}
+    task_id = ""
+    code = ""
+    for line in _strip_ansi(raw_logs).splitlines():
+        match = _TS_RE.match(line)
+        body = match.group("body") if match else line
+        at = match.group("ts") if match else None
+        scope = _TASK_SCOPE_RE.search(body)
+        item = _ITEM_TASK_RE.search(body)
+        if scope:
+            task_id = scope.group("task_id")
+        if item:
+            task_id, code = item.group(2), item.group(1)
+        resume = _match_any(body, _RESUME_PATTERNS)
+        if resume:
+            result = {"needs_confirm": False, "confirm_closed": True,
+                      "task_id": task_id, "event_at": at}
+            continue
+        error = _match_any(body, _ERROR_CONFIRM_PATTERNS)
+        key_wait = _KEY_WAIT_RE.search(body)
+        if error or key_wait or _match_any(body, _CONFIRM_PATTERNS):
+            kind = "error" if error else (
+                "pack" if key_wait or _match_any(body, _PACK_CONFIRM_PATTERNS) else "confirm"
+            )
+            if kind == "pack" and result.get("needs_confirm") and result.get("await_kind") == "error":
+                kind = "error"
+            result = {"needs_confirm": True, "confirm_closed": False,
+                      "task_id": task_id, "active_code": code,
+                      "status": "await_error" if kind == "error" else "await_confirm",
+                      "await_kind": kind, "await_at": at, "event_at": at,
+                      "await_line": body.strip()[:240]}
+    return result
+
+
 def parse_robot_log_text(
     raw_logs: str,
     focus_task_id: str = "",
@@ -454,11 +512,16 @@ def parse_robot_log_text(
     current_code = ""
     scope_task_id = ""
     saw_any_task = False
+    fresh_scope_seen = False
     in_focus_scope = not bool(focus_task_id)
     # Codes seen on stale (previous-order) / fresh task marker lines.  Lines
     # about a code that only appears under a stale task belong to the previous
     # order and must not update the new order's state.
-    stale_marker_codes: set = set()
+    stale_marker_codes: set = {
+        code
+        for task_id in stale_tasks
+        for code in codes_by_task.get(task_id, [])
+    }
     fresh_marker_codes: set = set()
     order_events: List[Dict[str, object]] = []
     human_confirm_seen = False
@@ -485,6 +548,8 @@ def parse_robot_log_text(
     def _accept_code(code: str) -> bool:
         if not code:
             return False
+        if scope_task_id and scope_task_id in stale_tasks:
+            return False
         if code in allowed_codes:
             if code in stale_marker_codes and code not in fresh_marker_codes:
                 return False
@@ -504,6 +569,15 @@ def parse_robot_log_text(
         else:
             ts = order_model._parse_ts(match.group("ts"))
             body = match.group("body") or ""
+
+        scope_match = _TASK_SCOPE_RE.search(body or "")
+        if scope_match is not None:
+            scope_task_id = scope_match.group("task_id").strip()
+            saw_any_task = True
+            in_focus_scope = _in_scope(scope_task_id)
+            if scope_task_id not in stale_tasks:
+                fresh_scope_seen = True
+                fresh_marker_codes.update(codes_by_task.get(scope_task_id, []))
 
         item_task = _ITEM_TASK_RE.search(body)
         if item_task is not None:
@@ -560,6 +634,8 @@ def parse_robot_log_text(
             location = start_object.group(2).strip()
             item = _ensure_item(items, code)
             item["location_code"] = location
+            if scope_task_id and scope_task_id not in stale_tasks:
+                item["parent_task_id"] = scope_task_id
             # Do not rewind a finished item if an older start line is still in the tail.
             if item.get("status") not in {"success", "failed"}:
                 # A new SKU started: drop stale order-level pack wait from prior item.
@@ -596,6 +672,8 @@ def parse_robot_log_text(
                 current_code = ""
                 continue
             item = _ensure_item(items, code)
+            if scope_task_id and scope_task_id not in stale_tasks:
+                item["parent_task_id"] = scope_task_id
             if item.get("status") == "pending":
                 item["status"] = "started"
             if item.get("status") not in {"success", "failed"}:
@@ -707,7 +785,7 @@ def parse_robot_log_text(
         error_hit = _match_any(body, _ERROR_CONFIRM_PATTERNS)
         pack_hit = _match_any(body, _PACK_CONFIRM_PATTERNS) or key_wait_hit
         if confirm_hit or error_hit:
-            if stale_marker_codes and not fresh_marker_codes:
+            if stale_marker_codes and not fresh_marker_codes and not fresh_scope_seen:
                 # Only a previous order's execution is visible in the tail; its
                 # confirm/pack prompts must not surface on the new order.
                 continue

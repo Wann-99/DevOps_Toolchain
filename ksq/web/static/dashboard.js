@@ -3,7 +3,9 @@
   // 用 setInterval 会让请求首尾相接、服务端常态满载，且每轮重绘会把按钮
   // 节点销毁重建。改为每轮结束后再排下一次，并按忙/闲切换间隔。
   const ACTIVE_POLL_MS = 1000;
-  const IDLE_POLL_MS = 4000;
+  const IDLE_POLL_MS = 2000;
+  // ponytail: interpolate at most 10s; a stalled status feed must not tick forever.
+  const CLOCK_MAX_ADVANCE_MS = 10000;
   // 必须明显小于服务端 _TASK_LIST_CACHE_SECONDS（20s），否则每次轮询都撞上
   // 刚过期的缓存，每次都要跨公网拉全量任务（4~7s）。
   const ORDER_LIST_POLL_MS = 8000;
@@ -95,6 +97,8 @@
 
   let timerId = 0;
   let orderListTimerId = 0;
+  let clockTimerId = 0;
+  let snapshotReceivedAt = 0;
   let busy = false;
   let confirmBusy = false;
   // active = 全页面常驻确认监听；dashboardVisible = 是否渲染仪表板明细。
@@ -181,7 +185,7 @@
     // Receiving the next order must show "—", not a premature 0s.
     if (Number.isNaN(startMs)) return null;
 
-    // Latched after first active human-gate speak; ignore invalid 0s latch.
+    // A confirmed stop at 0s is also a valid frozen timer.
     if (
       (life.timer_stop_reason === "human_prompt" ||
         life.timer_stop_reason === "confirm" ||
@@ -189,7 +193,7 @@
         life.timer_stop_reason === "order_ended") &&
       life.frozen_elapsed_seconds != null &&
       !Number.isNaN(Number(life.frozen_elapsed_seconds)) &&
-      Number(life.frozen_elapsed_seconds) > 0
+      Number(life.frozen_elapsed_seconds) >= 0
     ) {
       return Number(life.frozen_elapsed_seconds);
     }
@@ -201,6 +205,39 @@
     }
     const endMs = parseIsoMs(data.polled_at) || Date.now();
     return Math.max(0, (endMs - startMs) / 1000);
+  }
+
+  function clockAdvanceSeconds(data) {
+    const life = data.order_lifecycle || (data.order && data.order.lifecycle) || {};
+    if (!data.polled_at || !data.service_running || data.log_available === false ||
+        life.ended || life.closed || life.timer_stop_reason || data.needs_confirm ||
+        !["started", "processing"].includes(focusStatus(data))) return 0;
+    return Math.min(CLOCK_MAX_ADVANCE_MS, Math.max(0, Date.now() - snapshotReceivedAt)) / 1000;
+  }
+
+  function itemElapsedSeconds(task, advance) {
+    const finished = ["success", "failed"].includes(task.status);
+    const value = finished && task.duration_seconds != null ? task.duration_seconds : task.elapsed_seconds;
+    if (value == null) return null;
+    const running = ["started", "processing"].includes(task.status) &&
+      !task.ended_at && !task.needs_confirm;
+    return Number(value) + (running ? advance : 0);
+  }
+
+  function renderClocks(data) {
+    const advance = clockAdvanceSeconds(data);
+    const orderElapsed = el("dash-order-elapsed");
+    const elapsed = el("dash-elapsed");
+    const orderSeconds = orderElapsedSeconds(data);
+    if (orderElapsed) orderElapsed.textContent = formatSeconds(
+      orderSeconds == null ? null : orderSeconds + advance
+    );
+    if (elapsed) elapsed.textContent = formatSeconds(itemElapsedSeconds(data.current_item || data, advance));
+    const list = el("dash-task-list");
+    if (list) list.querySelectorAll(".dash-task-time").forEach((node, index) => {
+      const task = (data.tasks || [])[index];
+      if (task) node.textContent = formatSeconds(itemElapsedSeconds(task, advance));
+    });
   }
 
   function shortTime(iso) {
@@ -513,6 +550,7 @@
     const active = Number(progress.active || 0);
     const previousTaskId = currentOrderTaskId;
     const previousMode = currentDashboardMode;
+    const previousBrokerStatus = currentBrokerStatus;
     const brokerTaskId = String(
       (broker && broker.ok && broker.task_id) || ""
     ).trim();
@@ -524,10 +562,9 @@
         broker.order_no ||
         ""
     );
-    currentBrokerStatus = String(broker.status || "");
+    currentBrokerStatus = broker.ok ? String(broker.status || "").trim() : "";
     currentDashboardMode = String(data.dashboard_mode || "test");
     renderOrderSource(order, broker);
-    syncCurrentOrderListStatus(broker);
     if (orderNo) {
       const taskId =
         brokerTaskId || (order && order.task_id) || data.task_id || focusTaskId || "";
@@ -578,8 +615,6 @@
         " · 共 " +
         total +
         " 个子任务";
-      const queuedCount = Number((data.order_queue || {}).queued_count || 0);
-      if (queuedCount) progressMeta.textContent += " · 等待 " + queuedCount + " 单";
     }
     if (bar) {
       const finished = done + failed + skipped;
@@ -588,26 +623,12 @@
     }
     if (
       (previousTaskId !== currentOrderTaskId ||
-        previousMode !== currentDashboardMode) &&
+        previousMode !== currentDashboardMode ||
+        previousBrokerStatus !== currentBrokerStatus) &&
       lastOrderListData
     ) {
       renderOrderList(lastOrderListData);
     }
-  }
-
-  function syncCurrentOrderListStatus(broker) {
-    if (!broker || !broker.ok || !currentOrderTaskId || !lastOrderListData) return;
-    const status = String(broker.status || "").trim();
-    if (!status || !Array.isArray(lastOrderListData.tasks)) return;
-    const index = lastOrderListData.tasks.findIndex(
-      (task) => task && String(task.task_id || "") === currentOrderTaskId
-    );
-    if (index < 0 || String(lastOrderListData.tasks[index].status || "") === status) {
-      return;
-    }
-    const tasks = lastOrderListData.tasks.slice();
-    tasks[index] = Object.assign({}, tasks[index], { status: status });
-    renderOrderList(Object.assign({}, lastOrderListData, { tasks: tasks }));
   }
 
   function taskDetailNode(task) {
@@ -696,7 +717,14 @@
     lastOrderListData = data;
     const body = el("dash-order-list-body");
     const meta = el("dash-order-list-meta");
-    const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+    const sameMode = !data.mode || String(data.mode) === currentDashboardMode;
+    // 当前行统一读 Broker 详情状态，避免列表缓存轮询把状态和按钮改回旧值。
+    const tasks = (Array.isArray(data.tasks) ? data.tasks : []).map((task) =>
+      sameMode && currentBrokerStatus && task &&
+      String(task.task_id || "") === currentOrderTaskId
+        ? Object.assign({}, task, { status: currentBrokerStatus })
+        : task
+    );
     orderListHasMore = !!data.has_more;
     orderListPage = Number(data.page || orderListPage || 1);
     orderListTotalPages = Math.max(1, Number(data.total_pages || 1));
@@ -743,17 +771,17 @@
         const taskId = String(task.task_id || "");
         const orderNo = String(task.order_no || detail.order_no || "");
         const source = String(task.order_source || detail.order_source || "");
-        // 订单状态直出 Broker 原值，不做本地覆盖。
+        // 状态来自 Broker：当前工单读详情，其余工单读列表。
         const status = String(task.status || "");
         const businessMode = String(
           task.business_mode_code || detail.business_mode_code || ""
         );
-        const isCurrent = !!taskId && taskId === currentOrderTaskId;
+        const isCurrent = sameMode && !!taskId && taskId === currentOrderTaskId;
         return (
           "<tr>" +
           "<td>" + escapeHtml(task.create_time || task.order_time || "—") + "</td>" +
           "<td>" + escapeHtml(orderNo || "—") +
-          (isCurrent ? '<span class="dash-order-list-current">当前</span>' : "") +
+          (isCurrent ? '<span class="dash-order-list-current">运行中</span>' : "") +
           "</td>" +
           "<td>" + sourceBadge(source) + "</td>" +
           "<td>" + statusBadge(status) + "</td>" +
@@ -1041,7 +1069,7 @@
     list.innerHTML = tasks
       .map((task, index) => {
         const code = String(task.code || task.barcode || "");
-        const barcode = String(task.barcode || task.code || task.sku_code || "—");
+        const barcode = String(task.barcode || task.sku_id || "");
         const groupId = String(task.group_id || "");
         const groupField = String(task.group_field || "组合");
         const groupKey = groupId ? groupField + "\u0000" + groupId : "";
@@ -1057,13 +1085,10 @@
             : "";
         previousGroup = groupKey;
         const status = String(task.status || "pending");
-        const name = String(task.name || barcode || code || "未命名商品");
+        const name = String(task.name || "—");
         const location = String(task.location_code || "—");
         const label = String(task.status_label || KIND_LABELS[status] || status);
-        const elapsed =
-          status === "success" || status === "failed"
-            ? formatSeconds(task.duration_seconds || task.elapsed_seconds)
-            : formatSeconds(task.elapsed_seconds);
+        const elapsed = formatSeconds(itemElapsedSeconds(task, clockAdvanceSeconds(data)));
         const classes = ["dash-task-card"];
         if (code && code === activeCode) classes.push("is-active");
         if (status === "await_confirm") classes.push("is-await");
@@ -1186,8 +1211,6 @@
     const pollMeta = el("dash-poll-meta");
     const statusLabel = el("dash-status-label");
     const currentItem = el("dash-current-item");
-    const orderElapsed = el("dash-order-elapsed");
-    const elapsed = el("dash-elapsed");
     const status = focusStatus(data);
     const current = data.current_item || {};
     lastStatus = status;
@@ -1217,7 +1240,7 @@
         : current.status_label || data.status_label || status || "—";
     }
     if (currentItem) {
-      const name = current.name || current.code || data.object_hint || "";
+      const name = current.name || "";
       const location = current.location_code || "";
       if (name) {
         currentItem.textContent =
@@ -1230,26 +1253,12 @@
         currentItem.textContent = "尚未开始处理商品";
       }
     }
-    if (orderElapsed) {
-      orderElapsed.textContent = formatSeconds(orderElapsedSeconds(data));
-    }
-    if (elapsed) {
-      elapsed.textContent = formatSeconds(
-        current.elapsed_seconds != null
-          ? current.elapsed_seconds
-          : data.elapsed_seconds
-      );
-    }
-
     updateLiveDot(status, !!data.service_running);
     updateSteps(status);
-    updateConfirmUi({
-      needs_confirm: data.needs_confirm,
-      status: status,
-      service_running: data.service_running,
-    });
+    updateConfirmUi(data.keyboard || data);
     renderOrder(data);
     renderTasks(data);
+    renderClocks(data);
     renderEvents(data.events);
 
     if (data.error) setDetail(data.error, true, false);
@@ -1270,22 +1279,12 @@
       if (!response.ok) throw new Error(data.error || "确认失败");
       handledFingerprint = lastFingerprint;
       hideModal();
-      const feishu = data.feishu || {};
-      if (feishu.ok && !feishu.skipped) {
-        setDetail("飞书表单已提交", false);
-      } else if (feishu.error) {
-        setDetail("飞书提交失败：" + feishu.error, true);
-      }
       await refresh();
     } catch (error) {
       setDetail(error.message || String(error), true);
     } finally {
       confirmBusy = false;
-      updateConfirmUi({
-        needs_confirm: lastStatus === "await_confirm" || lastStatus === "await_error",
-        status: lastStatus,
-        service_running: true,
-      });
+      updateConfirmUi((lastStatusData && lastStatusData.keyboard) || lastStatusData || {});
     }
   }
 
@@ -1319,28 +1318,34 @@
       }
       const wasBrokerConfigured = brokerConfigured;
       brokerConfigured = data.broker_configured !== false;
+      if (!lastStatusData || data.polled_at !== lastStatusData.polled_at ||
+          data.task_id !== lastStatusData.task_id) snapshotReceivedAt = Date.now();
       lastStatusData = data;
       if (dashboardVisible) {
+        const previousTaskId = currentOrderTaskId;
         render(data);
-        if (brokerConfigured && (!orderListLoaded || !wasBrokerConfigured)) {
+        const newOrder = !!currentOrderTaskId && currentOrderTaskId !== previousTaskId;
+        if (brokerConfigured && (newOrder || !orderListLoaded || !wasBrokerConfigured)) {
           orderListLoaded = true;
-          refreshOrderList(forceOrderList);
+          // A new order bypasses the history cache once; normal polling is unchanged.
+          refreshOrderList(newOrder || forceOrderList);
         } else if (!brokerConfigured) {
           orderListLoaded = false;
           showBrokerNotConfigured();
         }
       }
-      const fp = fingerprint(data);
+      const confirmation = data.keyboard || data;
+      const fp = fingerprint(confirmation);
       lastFingerprint = fp;
-      const serverDismissed = String(data.dismissed_fingerprint || "");
+      const serverDismissed = String(confirmation.dismissed_fingerprint || "");
       if (serverDismissed && serverDismissed === fp) {
         handledFingerprint = serverDismissed;
       }
-      if (data.needs_confirm && fp !== handledFingerprint) {
+      if (confirmation.needs_confirm && fp !== handledFingerprint) {
         const autoOn = autoConfirmEnabled();
         // Always show the popup first; auto-confirm clicks through after a short show.
         if (!modalOpen) {
-          showModal(data);
+          showModal(confirmation);
         }
         if (autoOn) {
           await new Promise((resolve) => {
@@ -1350,17 +1355,21 @@
             await injectConfirm();
           }
         }
-      } else if (!data.needs_confirm) {
+      } else if (!confirmation.needs_confirm) {
         // 提示消失分两种：被确认/关闭（confirm_closed，日志出现「继续」类行）
         // —— 记录指纹防复弹；以及提示行短暂滚出解析窗口（闪烁）——不记录，
         // 否则同一提示恢复时会被误判为已处理而永不再弹。
-        if (data.confirm_closed) {
+        if (confirmation.confirm_closed) {
           handledFingerprint = fp;
         }
         hideModal();
-      } else if (data.needs_confirm && fp === handledFingerprint && modalOpen) {
+      } else if (confirmation.needs_confirm && fp === handledFingerprint && modalOpen) {
         // Dismissed (e.g. 3s close) or already auto-confirmed: keep modal shut.
         hideModal();
+      }
+      if (global.KsqFeishuForm) {
+        const blocked = !!confirmation.needs_confirm || !!document.querySelector("dialog[open], .ksq-dialog:not([hidden])");
+        global.KsqFeishuForm.update(data.feishu, blocked);
       }
     } catch (error) {
       if (dashboardVisible && (!error || error.name !== "AbortError")) {
@@ -1384,9 +1393,9 @@
     }
   }
 
-  // 轮询间隔：活跃时 1s，空闲/终态时 4s。
+  // 轮询间隔：活跃时 1s，空闲/终态时 2s。
   function pollDelayFor(data) {
-    if (!data || data.needs_confirm) return ACTIVE_POLL_MS;
+    if (!data || data.needs_confirm || (data.keyboard && data.keyboard.needs_confirm)) return ACTIVE_POLL_MS;
     const order = data.order || {};
     if (ACTIVE_BROKER_STATUSES.has(String(order.status || ""))) {
       return ACTIVE_POLL_MS;
@@ -1430,6 +1439,9 @@
 
   function activate(options) {
     dashboardVisible = true;
+    if (!clockTimerId) clockTimerId = global.setInterval(() => {
+      if (dashboardVisible && lastStatusData) renderClocks(lastStatusData);
+    }, 1000);
     start();
     if (options && options.taskId) focusTaskId = String(options.taskId);
     orderListPage = 1;
@@ -1448,6 +1460,8 @@
 
   function deactivate() {
     dashboardVisible = false;
+    if (clockTimerId) global.clearInterval(clockTimerId);
+    clockTimerId = 0;
     stopOrderListPoll();
     if (orderListAbortController) orderListAbortController.abort();
   }

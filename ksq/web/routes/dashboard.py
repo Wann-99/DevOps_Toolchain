@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlparse
 
 from ksq.dashboard import service as dashboard_api
 from ksq.feishu.client import FeishuApiError
+from ksq.feishu import forms as feishu_forms
 from ksq.order import active as active_orders
 from ksq.robot import keyboard as keyboard
 from ksq.robot.logs import LogServiceError
@@ -84,7 +85,7 @@ def handle_post(handler, session) -> bool:
     if path == "/api/dashboard/confirm":
         _drain_request_body(handler)
         try:
-            result = dashboard_api.confirm_and_maybe_submit_feishu()
+            result = dashboard_api.confirm_keyboard()
         except LogServiceError as error:
             handler._send_json(
                 HTTPStatus(error.status_code),
@@ -116,6 +117,10 @@ def handle_post(handler, session) -> bool:
             )
             return True
         handler._send_json(HTTPStatus.OK, result)
+        return True
+    if path == "/api/dashboard/feishu/dismiss":
+        payload = read_json_body(handler)
+        handler._send_json(HTTPStatus.OK, feishu_forms.dismiss_form(payload.get("id")))
         return True
     if path == "/api/dashboard/feishu/submit":
         _drain_request_body(handler)
@@ -169,4 +174,4 @@ def handle_post(handler, session) -> bool:
     return False
 
 # Explicit FastAPI registration; existing parsing preserves the HTTP contract.
-ROUTES = {'GET': ('/api/dashboard/status', '/api/dashboard/keyboard', '/api/dashboard/feishu/preview'), 'POST': ('/api/dashboard/order', '/api/dashboard/confirm', '/api/dashboard/feishu/preview', '/api/dashboard/feishu/submit', '/api/dashboard/dismiss', '/api/dashboard/keyboard')}
+ROUTES = {'GET': ('/api/dashboard/status', '/api/dashboard/keyboard', '/api/dashboard/feishu/preview'), 'POST': ('/api/dashboard/order', '/api/dashboard/confirm', '/api/dashboard/feishu/preview', '/api/dashboard/feishu/submit', '/api/dashboard/feishu/dismiss', '/api/dashboard/dismiss', '/api/dashboard/keyboard')}

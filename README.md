@@ -8,7 +8,7 @@ DevOps Toolchain 是面向药房自动化现场的数据查询与运维工具，
 - 仪表板：查看当前工单、门店任务列表、子任务进度和实时事件，并处置当前测试工单；子任务名称与库位以 Broker 带回的下单信息为准，日志只提供处理状态与用时。
 - 数据加载：一键解析设备 `config_pnp` 目录加载数据，也支持本机路径手工指定、ZIP 数据包或单独配置文件导入；统一复制到 `data/current`，显示进度并备份上一份数据。
 - 数据查询：按药品、库位等条件查询和导出，仅库位、货架属性、挡板高度支持编辑；Knowledge、工具、不可处理、闭环吸取配置只读。
-- 药品下单：选择药品或扫码下单，最多保留 10 单（当前单 1 单、等待单最多 9 单）；等待单创建后显示“已排队”，当前单经 Broker 确认结束后自动切换。队列随状态文件保存，保留重复商品和待人工确认拦截，并查看工单状态和结构化失败详情。
+- 药品下单：测试模式下选择药品或扫码下单，接单与并发由 Broker 判断；成功后仪表板显示最新订单，支持提交预检、工单状态和结构化失败详情。生产模式禁止创建订单，当前主流程不使用旧的本地 10 单队列。
 - 测试下单：生成、宽松 CSV 导入（不要求行在候选数据中存在）、导出和提交测试药品列表，按批次统计订单量。
 - 订单操作：逐项调用 Broker 接口处置工单任务与门店业务配置，并查看原始响应；写操作仅测试模式可用。
 - 日志查询：通过 SSE 实时跟随 `docker logs -f`，并执行启动、停止、重启操作；历史日志损坏时自动跳过并继续获取新日志。
@@ -16,8 +16,9 @@ DevOps Toolchain 是面向药房自动化现场的数据查询与运维工具，
 - 机械臂：登录用户通过工具页面访问 `192.168.11.18` 的示教器，支持刷新。浏览器只需能访问工具服务；工具主机仍须能访问机械臂的 80、8090、8060 端口。网页、接口和实时连接均由工具转发。
 - 文件管理：左右卡片分别展示独立操作的宿主机文件目录与交互终端；目录互不跟随，断开后清空终端。Docker 部署通过本机连接进程访问宿主机，使用启动部署脚本的系统账号。登录用户可预览文本与图片、上传文件/目录、下载文件/目录 ZIP；可连接已部署的浏览器远程桌面。
 - 设置：维护工作模式、下单接口、虚拟键盘和飞书表单配置。
+- 在线升级：所有登录用户可在「设置 → 系统升级」检查 GitHub Releases 并安装；失败自动恢复升级前版本，保留配置和数据。
 
-完整功能操作见 [软件使用说明](docs/manual/使用手册.md)。
+当前功能、权限与使用边界见 [项目功能清单](docs/项目功能清单.md)；具体操作见 [软件使用说明](docs/manual/使用手册.md)。
 
 ## 账号与权限
 
@@ -115,6 +116,7 @@ python3 deploy/build_app_bin.py v1.3.1
 
 ```text
 deploy/dist/knowledge_shelf_query_v1.3.1.bin
+deploy/dist/ksq_release.json
 ```
 
 应用启动时会读取 `.bin` 内的构建元数据，侧栏显示的版本号与构建参数自动保持一致。
@@ -158,11 +160,30 @@ bash start.sh version
 bash start.sh rollback
 ```
 
-`update` 更新应用包时会先将四个运行状态文件（`test_order_state.json`、`dashboard_active_order.json`、`order_config.json`、`order_config.prod.json`）备份到 `config/.backup/`，再重置为干净初始值；应用版本变化后的首次启动也会由 `.bin` 内置逻辑自动执行同样的重置，不依赖设备上 `start.sh` 的版本。`dashboard_settings.json` 与 `users.json` 始终保留。也可随时手动重置：
+更新应用包及版本变化后的首次启动均保留已保存的配置、账号、当前工单、测试单状态和数据，仅更新版本标记。需要主动清空四个运行状态文件时，可手动执行（重置前备份至 `config/.backup/`）：
 
 ```bash
 bash start.sh reset-state
 ```
+
+启用网页在线升级，首次必须同步新版完整部署包中的 `.bin`、`start.sh`、`host-files.sh`、`upgrade.sh` 和 `docker-compose.yml`，保留原部署的 `config/`、`data/`、`logs/`、`.env` 与 `robot_keyboard.env`，在设备当前部署目录执行：
+
+```bash
+bash start.sh restart
+bash start.sh upgrade install
+```
+
+在线升级需要宿主机运行 systemd，安装一次需要 sudo 权限。之后管理员与普通用户均可在「设置 → 系统升级」操作；独立宿主机升级服务会在网页服务重启期间继续运行，设备重启后自动启动。默认发布源为 [Wann-99/DevOps_Toolchain](https://github.com/Wann-99/DevOps_Toolchain)。每个正式 Release 的标签必须与构建版本一致，同时上传 `.bin` 和本次构建的 `ksq_release.json`；仅推送源码不构成可安装版本。升级不提供网页回滚入口。
+
+仓库包含 [自动发布工作流](.github/workflows/release.yml)。将项目源码与工作流提交到 GitHub 后，推送正式版本标签会自动构建、校验并上传两个升级附件，附件齐全后发布 Release。无需手工上传附件或配置发布用的个人 Token，使用 GitHub 自带的 `GITHUB_TOKEN`；仓库须允许 Actions 运行及该工作流的 Contents 写权限。失败后可重新运行以继续发布草稿，已正式发布的版本不会被覆盖。
+
+```bash
+# 先将本次源码和工作流提交并推送到仓库，再创建新的版本标签
+git tag v1.3.3
+git push origin v1.3.3
+```
+
+标签只支持 `v主版本.次版本.修订号`，例如 `v1.3.3`；结果在仓库 Actions 和 Releases 查看。此工作流发布应用增量包，首次启用及部署脚本、镜像变化时仍需完整部署包。
 
 完整的在线、离线部署说明见 [部署与更新操作文档](docs/manual/部署操作文档.md)。
 
@@ -175,7 +196,7 @@ bash start.sh reset-state
 - `order_config.prod.example.json`
 - `devOps/.env.example`
 
-飞书表单规则维护在 `ksq/feishu/rules.json`。新增表单规则时复制一个规则节点，修改规则 ID、显示名称、飞书字段别名和选项映射，然后重新生成部署包。完整部署包会将它复制为 `config/feishu_rules.json` 并挂载到容器 `/app/feishu_rules.json`；现场直接替换该文件后执行 `bash start.sh restart` 即可生效。规则文件在服务启动时严格校验，格式错误会阻止服务启动并在启动日志中说明原因。
+飞书表单使用飞书原生表单页面：在「设置 → 飞书表单」配置表单分享链接并开启，订单结束后在工具内弹出填写窗口，由用户填写并点击原表单的提交按钮。同一订单关闭提示后不重复弹出，连续订单依次提示；原有自动填写、自动提交入口已停用。操作说明见 `docs/manual/使用手册.md` 的「飞书表单」一节。
 
 部署包的 `config/` 初始为干净值（空状态 + 默认账号），由 `deploy/make_package.sh` 写入、首次启动时 `start.sh` 补齐；运行时配置、账号文件 `users.json`、密码、Token、生成的 `.bin` 和部署压缩包均被 `.gitignore` 排除，不应提交到仓库。
 

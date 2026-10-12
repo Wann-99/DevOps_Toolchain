@@ -6,7 +6,7 @@ set -euo pipefail
 #   ./start.sh                           部署并启动（默认）
 #   ./start.sh start                     部署并启动
 #   bash start.sh restart               重建容器并启动
-#   bash start.sh update <应用包.bin>   更新应用包并重建容器（自动重置状态）
+#   bash start.sh update <应用包.bin>   更新应用包并重建容器（保留配置和数据）
 #   bash start.sh rollback              回滚到上一个应用包
 #   bash start.sh version               查看当前应用包版本
 #   bash start.sh stop                  停止
@@ -331,7 +331,6 @@ case "${ACTION}" in
         ensure_docker
         ensure_paths
         ensure_runtime_image
-        reset_state
         update_app_bin "${2:-}"
         ;;
     rollback)
@@ -350,6 +349,9 @@ case "${ACTION}" in
         ;;
     host-files)
         bash "${SCRIPT_DIR}/host-files.sh" "${2:-status}" "${APP_BIN}" "${SCRIPT_DIR}/host-files"
+        ;;
+    upgrade)
+        bash "${SCRIPT_DIR}/upgrade.sh" "${2:-status}" "${SCRIPT_DIR}/${APP_BIN}"
         ;;
     desktop)
         [[ "${2:-}" == install ]] || die "用法: bash start.sh desktop install"
@@ -372,6 +374,6 @@ case "${ACTION}" in
         docker pull "${RUNTIME_IMAGE}"
         ;;
     *)
-        die "用法: bash start.sh {start|restart|update <应用包.bin>|rollback|version|stop|host-files [start|stop|status|serve]|desktop install|logs|runtime-logs|pull-runtime|reset-state}"
+        die "用法: bash start.sh {start|restart|update <应用包.bin>|rollback|version|stop|host-files [start|stop|status|serve]|upgrade [install|status|stop]|desktop install|logs|runtime-logs|pull-runtime|reset-state}"
         ;;
 esac

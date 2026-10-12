@@ -11,12 +11,15 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 from ksq.order import broker
 from ksq.order import config as order_config
+from ksq.order import payload as order_payload
 from ksq.order.payload import build_create_task_body
 from ksq.web import auth
 from ksq.dashboard import service as dashboard_api
@@ -85,6 +88,7 @@ class ConfigurationDefaultsTests(unittest.TestCase):
                 {"value": "dashenlin", "cn": "大参林"},
                 {"value": "yaoshibang", "cn": "药师帮"},
                 {"value": "shuyu", "cn": "漱玉"},
+                {"value": "lzgzdyf", "cn": "桂中大药房"},
                 {"value": "noematrix", "cn": "穹彻智能"},
             ],
         )
@@ -106,29 +110,21 @@ class ConfigurationDefaultsTests(unittest.TestCase):
         )
         self.assertEqual(custom["order_source"], "legacy-source")
 
-    def test_order_source_is_generated_independently_from_customer(self) -> None:
-        def choose_value(values: object) -> str:
-            if isinstance(values, list):
-                return "jd"
-            return str(values)[0]
-
-        with patch(
-            "ksq.order.payload.secrets.choice", side_effect=choose_value
-        ) as choose:
-            body = build_create_task_body(
-                {
-                    "store_id": "store-1",
-                    "customer": "桂中大药房",
-                    "order_source": "桂中大药房",
-                },
-                [{"item_id": "item-1", "location_code": "A-01"}],
-            )
-
-        self.assertEqual(
-            choose.call_args_list[0].args[0], ["meituan", "eleme", "jd", "dy"]
+    def test_order_source_uses_customer_config(self) -> None:
+        body = build_create_task_body(
+            {"store_id": "store-1", "customer": "lzgzdyf", "order_source": "jd"},
+            [{"item_id": "item-1", "location_code": "A-01"}],
         )
+
         self.assertEqual(body["order_source"], "jd")
         self.assertTrue(str(body["platform_order_no"]).startswith("JD"))
+
+    def test_order_source_rejects_customer_mismatch(self) -> None:
+        with self.assertRaisesRegex(ValueError, "不支持订单来源"):
+            build_create_task_body(
+                {"store_id": "store-1", "customer": "shuyu", "order_source": "dsl"},
+                [{"item_id": "item-1", "location_code": "A-01"}],
+            )
 
     def test_feishu_default_is_disabled(self) -> None:
         self.assertFalse(dashboard_settings._default_feishu_settings()["enabled"])
@@ -140,6 +136,36 @@ class ConfigurationDefaultsTests(unittest.TestCase):
         order_config.validate_order_config(config, require_store=False)
         with self.assertRaisesRegex(ValueError, "store_id"):
             order_config.validate_order_config(config)
+
+
+class OrderNumberTests(unittest.TestCase):
+    def test_datetime_to_seconds_is_used_in_the_outgoing_body(self) -> None:
+        now = datetime(2026, 10, 9, 10, 45, 30, 123456)
+        with (
+            patch.object(order_payload, "_LAST_ORDER_NO_TIME", None),
+            patch.object(order_payload, "datetime") as clock,
+        ):
+            clock.now.return_value = now
+            body = build_create_task_body(
+                {"store_id": "store-1", "customer": "noematrix"},
+                [{"item_id": "item-1", "location_code": "A01"}],
+            )
+        self.assertEqual(body["order_no"], "20261009104530")
+        self.assertEqual(body["retail_order_id"], "RO20261009104530")
+
+    def test_concurrent_generation_rolls_over_midnight_without_duplicates(self) -> None:
+        with (
+            patch.object(order_payload, "_LAST_ORDER_NO_TIME", None),
+            patch.object(order_payload, "datetime") as clock,
+            ThreadPoolExecutor(max_workers=4) as pool,
+        ):
+            clock.now.return_value = datetime(2026, 12, 31, 23, 59, 59)
+            numbers = list(pool.map(lambda _: order_payload.generate_order_no(), range(4)))
+            self.assertEqual(sorted(numbers), [
+                "20261231235959", "20270101000000", "20270101000001", "20270101000002",
+            ])
+            clock.now.return_value = datetime(2026, 12, 31, 23, 59, 58)
+            self.assertEqual(order_payload.generate_order_no(), "20270101000003")
 
 
 class StoreListingTests(unittest.TestCase):
@@ -247,6 +273,23 @@ class TaskListTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         order_api.clear_task_list_cache()
+
+    def test_latest_tasks_bypass_history_cache_and_read_only_first_page(self) -> None:
+        with (
+            patch.object(order_api, "load_order_config", return_value=VALID_CONFIG),
+            patch.object(order_api, "_ensure_token", return_value="token"),
+            patch.object(order_api, "_fetch_all_tasks", side_effect=AssertionError("Must not scan history")),
+            patch.object(order_api.broker, "list_robot_tasks", side_effect=[
+                (200, {"data": {"tasks": [{"task_id": "new"}], "has_more": True, "next_cursor": "older"}}),
+                (200, {"data": {"tasks": [{"task_id": "newer"}], "has_more": True, "next_cursor": "older"}}),
+            ]) as upstream,
+        ):
+            first = order_api.list_latest_tasks("test")
+            second = order_api.list_latest_tasks("test")
+        self.assertEqual(first["tasks"][0]["task_id"], "new")
+        self.assertEqual(second["tasks"][0]["task_id"], "newer")
+        self.assertEqual(upstream.call_count, 2)
+        self.assertEqual(upstream.call_args.args[3:], (50, "desc", "", "Asia/Shanghai"))
 
     def test_uses_cursor_and_returns_distinct_local_pages_with_total(self) -> None:
         upstream_pages = [
@@ -989,6 +1032,84 @@ class CreateOrderBusinessCodeTests(unittest.TestCase):
         self.assertNotEqual(first_body["order_no"], second_body["order_no"])
         self.assertEqual(result[1]["data"]["task_id"], "t-2")
 
+    def test_preflight_validates_the_same_payload_as_create(self) -> None:
+        with (
+            patch.object(
+                active_orders, "ensure_order_queue_capacity", return_value=None
+            ),
+            patch.object(
+                active_orders, "active_order_blocking_keys", return_value=[]
+            ),
+            patch.object(
+                order_api, "load_order_config", return_value=dict(self.CONFIG)
+            ),
+            patch.object(order_api, "_ensure_token") as ensure_token,
+            patch.object(order_api.broker, "create_robot_task") as create,
+        ):
+            result = order_api.preflight_order(
+                {
+                    "mode": "test",
+                    "items": self.ITEMS,
+                    "order_fields": {"recipient_name": "测试收货人"},
+                }
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "ok": True,
+                "mode": "test",
+                "order_source": "meituan",
+                "item_count": 1,
+                "unavailable_items": [],
+            },
+        )
+        ensure_token.assert_not_called()
+        create.assert_not_called()
+
+    def test_transport_timeout_recovers_task_without_retrying_create(self) -> None:
+        captured = {}
+
+        def create_with_timeout(_server, _token, body):
+            captured["order_no"] = body["order_no"]
+            raise broker.OrderBrokerError("timed out", 0, {"error": "timed out"})
+
+        with (
+            patch.object(
+                active_orders, "ensure_order_queue_capacity", return_value=None
+            ),
+            patch.object(
+                active_orders, "active_order_blocking_keys", return_value=[]
+            ),
+            patch.object(
+                order_api, "load_order_config", return_value=dict(self.CONFIG)
+            ),
+            patch.object(order_api, "_ensure_token", return_value="token"),
+            patch.object(
+                order_api.broker,
+                "create_robot_task",
+                side_effect=create_with_timeout,
+            ) as create,
+            patch.object(
+                order_api,
+                "_fetch_all_tasks",
+                side_effect=lambda *_args: [
+                    {
+                        "task_id": "recovered-task",
+                        "params": {"order_no": captured["order_no"]},
+                    }
+                ],
+            ) as fetch_tasks,
+        ):
+            result = order_api.create_order(
+                {"mode": "test", "items": self.ITEMS}
+            )
+
+        self.assertEqual(result[1]["data"]["task_id"], "recovered-task")
+        self.assertTrue(result[1]["recovered_after_timeout"])
+        create.assert_called_once()
+        fetch_tasks.assert_called_once()
+
     def test_non_retryable_code_raises_with_message(self) -> None:
         with self.assertRaises(broker.OrderBrokerError) as ctx:
             self._create(
@@ -1025,23 +1146,11 @@ class CreateOrderBusinessCodeTests(unittest.TestCase):
 
         register.assert_not_called()
 
-    def test_unresolved_previous_prompt_is_rejected_before_broker_request(self) -> None:
-        with (
-            patch.object(
-                active_orders,
-                "active_order_requires_manual_completion",
-                return_value=True,
-            ),
-            patch.object(order_api, "load_order_config") as load_config,
-            self.assertRaises(order_api.OrderQueueConflict) as raised,
-        ):
-            order_api.create_order({"mode": "test", "items": self.ITEMS})
-
-        self.assertEqual(
-            raised.exception.code, "PREVIOUS_ORDER_REQUIRES_COMPLETION"
-        )
-        self.assertIn("完成上一单", raised.exception.hint)
-        load_config.assert_not_called()
+    def test_previous_prompt_does_not_block_broker_request(self) -> None:
+        with patch.object(active_orders, "active_order_requires_manual_completion", return_value=True):
+            result, create, _clear = self._create([(200, {"code": 0, "data": {"task_id": "new-task"}})])
+        self.assertEqual(result[1]["data"]["task_id"], "new-task")
+        create.assert_called_once()
 
 
 @unittest.skipIf(QueryHandler is None, "HTTP handlers require Python 3.12 or older")

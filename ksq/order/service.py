@@ -22,7 +22,7 @@ from ksq.order import broker
 from ksq.order import cache as order_cache
 from ksq.order import model as order_model
 from ksq.order.config import load_order_config, merge_config_update, public_order_config, save_order_config, validate_order_config
-from ksq.order.payload import build_create_task_body, generate_order_no
+from ksq.order.payload import OrderPayloadError, build_create_task_body, generate_order_no
 from ksq.runtime_logging import get_logger
 from ksq.side_data import resolve_unavailable_label
 
@@ -282,21 +282,70 @@ def _unwrap_task(payload: object) -> Optional[Dict[str, object]]:
 
 
 def _task_order_no(task: Dict[str, object]) -> str:
-    direct = str(task.get("order_no") or "").strip()
-    if direct:
-        return direct
-    params = task.get("params")
-    if not isinstance(params, dict):
+    candidates = [task]
+    detail = task.get("task_detail")
+    if isinstance(detail, dict):
+        candidates.append(detail)
+    for candidate in candidates:
+        direct = str(candidate.get("order_no") or "").strip()
+        if direct:
+            return direct
+        params = candidate.get("params")
+        if not isinstance(params, dict):
+            continue
+        nested = str(params.get("order_no") or "").strip()
+        if nested:
+            return nested
+        metadata = params.get("metadata")
+        if isinstance(metadata, dict):
+            nested = str(metadata.get("order_no") or "").strip()
+            if nested:
+                return nested
+    return ""
+
+
+def _task_id_from_list_item(task: object) -> str:
+    if not isinstance(task, dict):
         return ""
-    nested = str(params.get("order_no") or "").strip()
-    if nested:
-        return nested
-    metadata = params.get("metadata")
-    return (
-        str(metadata.get("order_no") or "").strip()
-        if isinstance(metadata, dict)
-        else ""
-    )
+    task_id = str(task.get("task_id") or "").strip()
+    if task_id:
+        return task_id
+    detail = task.get("task_detail")
+    if isinstance(detail, dict):
+        return str(detail.get("task_id") or "").strip()
+    return ""
+
+
+def _recover_created_task_after_timeout(
+    config: Dict[str, object], mode: str, body: Dict[str, object]
+) -> str:
+    """Find an accepted create request by its unique order number.
+
+    A transport timeout leaves the Broker result unknown.  Listing tasks once
+    (and once more after a short propagation window) prevents a blind retry
+    from creating a duplicate order.
+    """
+    expected_order_no = str(body.get("order_no") or "").strip()
+    store_id = str(config.get("store_id") or "").strip()
+    if not expected_order_no or not store_id:
+        return ""
+    for attempt in range(2):
+        try:
+            tasks = _fetch_all_tasks(
+                config, mode, store_id, "desc", "", "Asia/Shanghai"
+            )
+        except (broker.OrderBrokerError, ValueError, OSError):
+            tasks = []
+        for task in tasks:
+            if _task_order_no(task) != expected_order_no:
+                continue
+            task_id = _task_id_from_list_item(task)
+            if task_id:
+                clear_task_list_cache()
+                return task_id
+        if attempt == 0:
+            time.sleep(0.2)
+    return ""
 
 
 def list_stores(mode: object = "test") -> Dict[str, object]:
@@ -420,19 +469,44 @@ def _ensure_broker_response_succeeded(
 
 
 def ensure_order_creation_allowed() -> None:
-    active_orders.promote_queued_order_if_ready()
-    if active_orders.active_order_requires_manual_completion():
-        raise OrderQueueConflict(
-            "上一单仍在等待人工确认，当前机器人流程可能已无法继续。",
-            "PREVIOUS_ORDER_REQUIRES_COMPLETION",
-            "请先到「仪表板 → 门店任务列表」完成上一单，再重新下单。",
-        )
-    try:
-        active_orders.ensure_order_queue_capacity()
-    except ValueError as error:
-        raise OrderQueueConflict(
-            str(error), "ORDER_QUEUE_FULL", "请等待当前单结束，仪表板会自动切换到等待单。"
-        ) from error
+    """Legacy preflight: acceptance and concurrency limits belong to Broker."""
+
+
+def _prepare_order_request(
+    payload: Dict[str, object],
+    *,
+    validate_config: bool = False,
+) -> Tuple[str, Dict[str, object], object, Dict[str, object]]:
+    """Run the same local checks for preflight and the actual create call."""
+    mode = dashboard_settings.resolve_dashboard_mode(payload.get("mode"))
+    if mode == "prod":
+        raise ProductionOrderWriteForbidden("生产模式不允许创建订单。")
+    ensure_order_creation_allowed()
+    raw_items = payload.get("items")
+    config = load_order_config(config_file_for_mode(mode))
+    # 实际创建在获取 Token 时再次校验；preflight 提前反馈凭据配置问题。
+    if validate_config:
+        validate_order_config(config)
+    body = build_create_task_body(
+        config, raw_items, payload.get("order_fields")
+    )
+    return mode, config, raw_items, body
+
+
+def preflight_order(payload: Dict[str, object]) -> Dict[str, object]:
+    """Validate a create request without requesting a token or writing upstream."""
+    if not isinstance(payload, dict):
+        raise ValueError("下单请求必须是对象。")
+    mode, _config, raw_items, body = _prepare_order_request(
+        payload, validate_config=True
+    )
+    return {
+        "ok": True,
+        "mode": mode,
+        "order_source": body.get("order_source", ""),
+        "item_count": len(body.get("items") or []),
+        "unavailable_items": unavailable_order_items(raw_items),
+    }
 
 
 def unavailable_order_items(raw_items: object) -> List[Dict[str, str]]:
@@ -474,28 +548,7 @@ def unavailable_order_items(raw_items: object) -> List[Dict[str, str]]:
 
 
 def create_order(payload: Dict[str, object]) -> Tuple[int, object, Dict[str, object]]:
-
-    mode = dashboard_settings.resolve_dashboard_mode(payload.get("mode"))
-    ensure_order_creation_allowed()
-    blocking = set(active_orders.active_order_blocking_keys())
-    raw_items = payload.get("items")
-    if blocking and isinstance(raw_items, list):
-        conflicts = []
-        for raw in raw_items:
-            if not isinstance(raw, dict):
-                continue
-            for key_name in ("sku_id", "item_id", "barcode", "code", "sku_code"):
-                value = str(raw.get(key_name) or "").strip()
-                if value and value in blocking:
-                    conflicts.append(value)
-                    break
-        if conflicts:
-            unique = ", ".join(dict.fromkeys(conflicts))
-            raise ValueError(
-                f"当前工单仍在处理中，请勿重复下单：{unique}"
-            )
-    config = load_order_config(config_file_for_mode(mode))
-    body = build_create_task_body(config, payload.get("items"))
+    mode, config, raw_items, body = _prepare_order_request(payload)
     token = _ensure_token(config, mode)
     token_retried = False
     duplicate_retried = False
@@ -503,6 +556,24 @@ def create_order(payload: Dict[str, object]) -> Tuple[int, object, Dict[str, obj
         try:
             status, data = broker.create_robot_task(str(config["server"]), token, body)
         except broker.OrderBrokerError as error:
+            if error.status_code in {0, 408, 504}:
+                recovered_task_id = _recover_created_task_after_timeout(
+                    config, mode, body
+                )
+                if recovered_task_id:
+                    return 200, {
+                        "code": 0,
+                        "data": {"task_id": recovered_task_id},
+                        "recovered_after_timeout": True,
+                    }, _local_request_body(body, raw_items)
+                raise broker.OrderBrokerError(
+                    "创建订单请求超时，已查询任务列表但未确认订单是否创建，请勿重复提交。",
+                    504,
+                    {
+                        "error": "create_timeout_unconfirmed",
+                        "order_no": body.get("order_no", ""),
+                    },
+                ) from error
             # HTTP 401/403 与业务码 4014（client token is invalid）都刷新凭据重试一次
             if (
                 error.status_code in {401, 403} or _business_code(error.body) == 4014
@@ -538,7 +609,7 @@ def create_order(payload: Dict[str, object]) -> Tuple[int, object, Dict[str, obj
 def create_registered_order(
     payload: Dict[str, object], source: str = "order"
 ) -> Tuple[int, object, Dict[str, object], Dict[str, object]]:
-    """Serialize Broker creation and local queue registration."""
+    """Submit to Broker and remember the newly created order for display."""
 
     with _ORDER_CREATE_LOCK:
         status, data, body = create_order(payload)
@@ -547,12 +618,9 @@ def create_registered_order(
             raise broker.OrderBrokerError(
                 "Broker 响应缺少 task_id，下单结果无法注册。", status, data
             )
-        try:
-            session = active_orders.register_created_order(task_id, body, source)
-        except ValueError as error:
-            # Capacity was checked while holding _ORDER_CREATE_LOCK; this only
-            # protects against an unrelated manual dashboard overwrite.
-            raise OrderQueueConflict(str(error)) from error
+        session = active_orders.set_active_order_from_create(task_id, body, source)
+        session.update(queue_position=0, queued=False)
+        clear_task_list_cache()
     return status, data, body, session
 
 
@@ -733,6 +801,22 @@ def _start_background_task_list_refresh(
     return True
 
 
+def list_latest_tasks(mode: str) -> Dict[str, object]:
+    """Read only the newest Broker page; card updates must not wait for history."""
+    config = load_order_config(config_file_for_mode(mode))
+    validate_order_config(config)
+    status, data = _request_with_token_retry(
+        config,
+        mode,
+        lambda token: broker.list_robot_tasks(
+            str(config["server"]), token, str(config.get("store_id") or "").strip(),
+            _TASK_LIST_UPSTREAM_PAGE_SIZE, "desc", "", "Asia/Shanghai",
+        ),
+    )
+    _ensure_broker_response_succeeded("查询最新任务", status, data)
+    return _task_list_payload(data)
+
+
 def list_tasks(
     mode: object,
     page: object = 1,
@@ -882,38 +966,64 @@ def _current_task_context() -> Tuple[Dict[str, object], str, Dict[str, object], 
     return config, task_id, task, order_no
 
 
+def _execute_order_action(
+    config: Dict[str, object],
+    mode: str,
+    action: str,
+    *,
+    task_id: str = "",
+    order_no: str = "",
+    cancel_reason: object = "",
+    cancel_type: object = "user",
+) -> Tuple[int, object]:
+    """Send every manual/cancel action through one Broker path."""
+    action_value = str(action or "").strip().lower()
+    if action_value == "cancel":
+        reason = str(cancel_reason or "").strip()
+        if not task_id:
+            raise ValueError("task_id 不能为空。")
+        if not reason:
+            raise ValueError("cancel_reason 不能为空。")
+        return _request_with_token_retry(
+            config,
+            mode,
+            lambda token: broker.cancel_robot_task(
+                str(config["server"]),
+                token,
+                task_id,
+                str(cancel_type or "").strip() or "user",
+                reason,
+            ),
+        )
+    if action_value not in {"manual_claim", "manual_complete"}:
+        raise ValueError("不支持的订单操作。")
+    if not order_no:
+        raise ValueError("order_no 不能为空。")
+    request = (
+        broker.manual_claim_order
+        if action_value == "manual_claim"
+        else broker.manual_complete_order
+    )
+    return _request_with_token_retry(
+        config,
+        mode,
+        lambda token: request(str(config["server"]), token, order_no),
+    )
+
+
 def operate_current_order(action: str, cancel_reason: object = "") -> Dict[str, object]:
     action_value = str(action or "").strip().lower()
     if action_value not in {"cancel", "manual_claim", "manual_complete"}:
         raise ValueError("不支持的当前工单操作。")
     config, task_id, task, order_no = _current_task_context()
-    if action_value == "cancel":
-        reason = str(cancel_reason or "").strip()
-        if not reason:
-            raise ValueError("cancel_reason 不能为空。")
-        status_code, data = _request_with_token_retry(
-            config,
-            "test",
-            lambda token: broker.cancel_robot_task(
-                str(config["server"]), token, task_id, "user", reason
-            ),
-        )
-    elif action_value == "manual_claim":
-        status_code, data = _request_with_token_retry(
-            config,
-            "test",
-            lambda token: broker.manual_claim_order(
-                str(config["server"]), token, order_no
-            ),
-        )
-    else:
-        status_code, data = _request_with_token_retry(
-            config,
-            "test",
-            lambda token: broker.manual_complete_order(
-                str(config["server"]), token, order_no
-            ),
-        )
+    status_code, data = _execute_order_action(
+        config,
+        "test",
+        action_value,
+        task_id=task_id,
+        order_no=order_no,
+        cancel_reason=cancel_reason,
+    )
     _ensure_task_action_succeeded(action_value, status_code, data)
     clear_task_list_cache()
 
@@ -959,38 +1069,17 @@ def operate_task(
     if returned_task_id != task_id_value:
         raise TaskOperationConflict("Broker 返回的任务与请求的 task_id 不一致。")
     order_no = _task_order_no(task)
-    if action_value == "cancel":
-        reason = str(cancel_reason or "").strip()
-        if not reason:
-            raise ValueError("cancel_reason 不能为空。")
-        cancel_type_value = str(cancel_type or "").strip() or "user"
-        status_code, data = _request_with_token_retry(
-            config,
-            mode,
-            lambda token: broker.cancel_robot_task(
-                str(config["server"]), token, task_id_value, cancel_type_value, reason
-            ),
-        )
-    elif action_value == "manual_claim":
-        if not order_no:
-            raise TaskOperationConflict("任务缺少 order_no。")
-        status_code, data = _request_with_token_retry(
-            config,
-            mode,
-            lambda token: broker.manual_claim_order(
-                str(config["server"]), token, order_no
-            ),
-        )
-    else:
-        if not order_no:
-            raise TaskOperationConflict("任务缺少 order_no。")
-        status_code, data = _request_with_token_retry(
-            config,
-            mode,
-            lambda token: broker.manual_complete_order(
-                str(config["server"]), token, order_no
-            ),
-        )
+    if action_value != "cancel" and not order_no:
+        raise TaskOperationConflict("任务缺少 order_no。")
+    status_code, data = _execute_order_action(
+        config,
+        mode,
+        action_value,
+        task_id=task_id_value,
+        order_no=order_no,
+        cancel_reason=cancel_reason,
+        cancel_type=cancel_type,
+    )
     _ensure_task_action_succeeded(action_value, status_code, data)
     clear_task_list_cache()
     order_cache.invalidate_broker_order_cache(task_id_value)
@@ -1072,16 +1161,11 @@ def operate_order_action(action: str, order_no: str) -> Dict[str, object]:
     if not order_no_value:
         raise ValueError("order_no 不能为空。")
     config, mode = _test_mode_write_config()
-    status, data = _request_with_token_retry(
+    status, data = _execute_order_action(
         config,
         mode,
-        lambda token: (
-            broker.manual_claim_order(str(config["server"]), token, order_no_value)
-            if action_value == "manual_claim"
-            else broker.manual_complete_order(
-                str(config["server"]), token, order_no_value
-            )
-        ),
+        action_value,
+        order_no=order_no_value,
     )
     _ensure_task_action_succeeded(action_value, status, data)
     clear_task_list_cache()

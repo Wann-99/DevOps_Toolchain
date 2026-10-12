@@ -370,7 +370,7 @@
   $("dialog").addEventListener("cancel", (event) => { if (busy) event.preventDefault(); });
   $("dialog").addEventListener("close", cancelPick);
 
-  const nameField = (label = "地图名称") => ({ name: "name", label, value: state && state.name || "当前地图" });
+  const nameField = (label = "地图名称") => ({ name: "name", label, value: state && state.name || "" });
   const backupField = () => ({ name: "backup", label: "同时备份当前地图（可选）", type: "checkbox" });
   const confirms = {
     new: ["新建地图", "将清空当前运行地图，保留备份后可恢复。", () => [Object.assign(nameField(), { value: "未命名地图" }), backupField()]],

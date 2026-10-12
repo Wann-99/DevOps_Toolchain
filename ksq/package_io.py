@@ -26,6 +26,8 @@ def save_package(dataset: Dataset, package_file: Path) -> None:
                     "out_item_id": entry.out_item_id,
                     "sku_code": entry.sku_code,
                     "customer_location_code": entry.customer_location_code,
+                    "manufacturer": entry.manufacturer,
+                    "specifications": entry.specifications,
                 }
                 for entry in entries
             ]
@@ -120,6 +122,8 @@ def load_package(package_file: Path) -> Dataset:
                             customer_location_code=str(
                                 item.get("customer_location_code") or ""
                             ).strip(),
+                            manufacturer=str(item.get("manufacturer") or "").strip(),
+                            specifications=str(item.get("specifications") or "").strip(),
                         )
                     )
                 else:

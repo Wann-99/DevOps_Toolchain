@@ -17,7 +17,81 @@ ORDER_SOURCES = [
     {"value": "eleme", "prefix": "ELEM", "cn": "淘宝闪购"},
     {"value": "jd", "prefix": "JD", "cn": "京东"},
     {"value": "dy", "prefix": "DY", "cn": "抖音"},
+    {"value": "dsl", "prefix": "DSL", "cn": "大参林健康"},
+    {"value": "elemzb", "prefix": "ELEMZB", "cn": "淘宝闪购滋补店"},
+    {"value": "qjw", "prefix": "QJW", "cn": "企健网"},
+    {"value": "zheb", "prefix": "ZHEB", "cn": "智慧E保"},
+    {"value": "ss", "prefix": "SS", "cn": "漱玉小程序"},
 ]
+
+_COMMON_SOURCES = tuple(item["value"] for item in ORDER_SOURCES[:4])
+_DASHENLIN_SOURCES = _COMMON_SOURCES + ("dsl", "elemzb", "qjw", "zheb")
+
+# Customer differences stay declarative; the request builder remains shared.
+CUSTOMER_ORDER_PROFILES: Dict[str, Dict[str, object]] = {
+    "": {
+        "sources": _COMMON_SOURCES,
+        "item_fields": ("item_id", "location_code", "quantity", "barcode", "common_name"),
+        "item_map": {"common_name": "common_name"},
+        "include_order_amounts": True,
+        "require_location": True,
+        "need_retail_order_id": False,
+    },
+    "dashenlin": {
+        "sources": _DASHENLIN_SOURCES,
+        "item_fields": (
+            "item_id", "common_name", "quantity", "spec", "barcode",
+            "location_code", "batch_number", "expiry_date", "retail_price",
+            "item_amount", "discount_amount", "manufacturer", "dosage",
+            "approval_number", "production_place",
+        ),
+        "item_map": {"common_name": "common_name", "spec": "specifications"},
+        "include_order_amounts": True,
+        "require_location": True,
+        "need_retail_order_id": False,
+    },
+    "yaoshibang": {
+        "sources": _COMMON_SOURCES,
+        "item_fields": (
+            "item_id", "common_name", "quantity", "spec", "barcode",
+            "location_code", "manufacturer", "approval_number",
+        ),
+        "item_map": {"common_name": "common_name", "spec": "specifications"},
+        "include_order_amounts": True,
+        "require_location": True,
+        "need_retail_order_id": True,
+    },
+    "shuyu": {
+        "sources": _COMMON_SOURCES[:3] + ("ss", "dy"),
+        "item_fields": ("item_id", "item_name", "specification", "quantity"),
+        "item_map": {"item_name": "common_name", "specification": "specifications"},
+        "include_order_amounts": False,
+        "require_location": False,
+        "need_retail_order_id": False,
+    },
+    "lzgzdyf": {
+        "sources": _COMMON_SOURCES,
+        "item_fields": (
+            "item_id", "common_name", "quantity", "spec", "barcode",
+            "location_code", "manufacturer", "approval_number",
+        ),
+        "item_map": {"common_name": "common_name", "spec": "specifications"},
+        "include_order_amounts": True,
+        "require_location": True,
+        "need_retail_order_id": False,
+    },
+    "noematrix": {
+        "sources": _COMMON_SOURCES,
+        "item_fields": (
+            "item_id", "common_name", "quantity", "spec", "barcode",
+            "location_code", "manufacturer", "approval_number",
+        ),
+        "item_map": {"common_name": "common_name", "spec": "specifications"},
+        "include_order_amounts": True,
+        "require_location": True,
+        "need_retail_order_id": True,
+    },
+}
 
 CUSTOMER_DEFAULTS: Dict[str, Dict[str, object]] = {
     "": {
@@ -40,6 +114,10 @@ CUSTOMER_DEFAULTS: Dict[str, Dict[str, object]] = {
         "need_image_upload": True,
         "business_mode_code": "MODE_PICK",
     },
+    "lzgzdyf": {
+        "need_image_upload": False,
+        "business_mode_code": "MODE_PICK",
+    },
 }
 
 # Only these fields are filled by the operator; the rest are auto-generated.
@@ -49,6 +127,7 @@ MANUAL_CONFIG_KEYS = (
     "client_id",
     "client_secret",
     "store_id",
+    "order_source",
 )
 
 _STRING_CONFIG_KEYS = frozenset(
@@ -93,6 +172,11 @@ def apply_customer_defaults(config: Dict[str, object]) -> Dict[str, object]:
         for key, value in defaults.items():
             merged[key] = value
     return merged
+
+
+def customer_order_profile(customer: object) -> Dict[str, object]:
+    value = str(customer or "").strip()
+    return deepcopy(CUSTOMER_ORDER_PROFILES.get(value, CUSTOMER_ORDER_PROFILES[""]))
 
 
 def load_order_config(config_file: Path) -> Dict[str, object]:
@@ -179,11 +263,16 @@ def public_order_config(
         "order_source": config.get("order_source", ""),
         "need_image_upload": bool(config.get("need_image_upload")),
         "business_mode_code": config.get("business_mode_code", ""),
+        "order_sources": [
+            item for item in ORDER_SOURCES
+            if item["value"] in customer_order_profile(config.get("customer"))["sources"]
+        ],
         "customers": [
             {"value": "", "cn": "—"},
             {"value": "dashenlin", "cn": "大参林"},
             {"value": "yaoshibang", "cn": "药师帮"},
             {"value": "shuyu", "cn": "漱玉"},
+            {"value": "lzgzdyf", "cn": "桂中大药房"},
             {"value": "noematrix", "cn": "穹彻智能"},
         ],
     }

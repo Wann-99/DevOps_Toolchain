@@ -55,10 +55,11 @@ mkdir -p "${STAGE}/config" "${STAGE}/bin" "${STAGE}/data"
 # 1. 启动脚本与 compose
 cp "${SCRIPT_DIR}/standalone/start.sh" "${STAGE}/start.sh"
 cp "${SCRIPT_DIR}/standalone/host-files.sh" "${STAGE}/host-files.sh"
+cp "${SCRIPT_DIR}/standalone/upgrade.sh" "${STAGE}/upgrade.sh"
 cp "${SCRIPT_DIR}/standalone/docker-compose.yml" "${STAGE}/docker-compose.yml"
 chmod +x "${STAGE}/start.sh"
 
-# 2. 构建单文件应用包；该文件也是后续增量更新的唯一交付物
+# 2. 构建应用包和 GitHub Release 说明文件
 APP_BIN_DIST="${DIST_DIR}/knowledge_shelf_query_${TAG}.bin"
 python3 "${SCRIPT_DIR}/build_app_bin.py" "${TAG}" --output "${APP_BIN_DIST}"
 cp "${APP_BIN_DIST}" "${STAGE}/bin/knowledge_shelf_query.bin"
@@ -70,7 +71,7 @@ cp "${APP_BIN_DIST}" "${STAGE}/bin/knowledge_shelf_query.bin"
 
 # 4. 状态/配置文件：始终写入干净初始值（不携带项目根目录的历史状态）
 #    部署包应包含空白状态，设备首次启动时由 start.sh ensure_files 或
-#    state_reset.py 处理初始化。
+#    程序仅初始化缺失配置；版本变化不会清空设备配置和数据。
 printf '{}\n' > "${STAGE}/config/dashboard_settings.json"
 printf '{}\n' > "${STAGE}/config/dashboard_active_order.json"
 printf '{}\n' > "${STAGE}/config/test_order_state.json"
@@ -87,6 +88,7 @@ echo ""
 echo "════════ 完成 ════════"
 echo "部署包: ${DIST_DIR}/${PKG_NAME}.tar.gz"
 echo "增量包: ${APP_BIN_DIST}"
+echo "发布说明: ${DIST_DIR}/ksq_release.json（与增量包一同上传 GitHub Release）"
 du -h "${PKG_NAME}.tar.gz" | awk '{print "大小:   " $1}'
 echo ""
 echo "目标设备使用:"

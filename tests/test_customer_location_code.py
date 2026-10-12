@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ksq.dataset import build_dataset
 from ksq.naming import classify_import_kind
-from ksq.order.payload import build_create_task_body, normalize_order_items
+from ksq.order.payload import OrderPayloadError, build_create_task_body, normalize_order_items
 from ksq.package_io import load_package, save_package
 from ksq.shelves import parse_shelf_locations
 from ksq.test_order_select import load_candidates, parse_import_csv_full, public_item
@@ -15,9 +15,9 @@ from ksq.web.pages import records_payload
 
 
 CSV = (
-    "sku_id,out_item_id,sku_code,name,shelf_number,level,bin_unit,customer_location_code\n"
-    "P000067355,5473,6923099206433,多酶片,0014,02,06,140206\n"
-    "P000067355,5473,6923099206433,多酶片,0015,02,02,150202\n"
+    "sku_id,out_item_id,sku_code,name,manufacturer,specifications,shelf_number,level,bin_unit,customer_location_code\n"
+    "P000067355,5473,6923099206433,多酶片,测试厂家,测试规格,0014,02,06,140206\n"
+    "P000067355,5473,6923099206433,多酶片,测试厂家,测试规格,0015,02,02,150202\n"
 )
 
 
@@ -39,6 +39,8 @@ class CustomerLocationCodeTests(unittest.TestCase):
             for current in (dataset, load_package(package)):
                 lines = records_payload(current, None, None, None)["records"][0]["order_lines"]
                 self.assertEqual([line["location_code"] for line in lines], ["0014-02-06", "0015-02-02"])
+                self.assertEqual([line["manufacturer"] for line in lines], ["测试厂家", "测试厂家"])
+                self.assertEqual([line["specifications"] for line in lines], ["测试规格", "测试规格"])
                 body = build_create_task_body({"store_id": "6"}, lines)
                 self.assertEqual([item["location_code"] for item in body["items"]], ["140206", "150202"])
                 self.assertTrue(all(item["item_id"] == "5473" for item in body["items"]))
@@ -82,6 +84,105 @@ class CustomerLocationCodeTests(unittest.TestCase):
         self.assertEqual(parsed.entries["sku"][0].customer_location_code, "150202")
         self.assertEqual(len(parsed.merge_conflicts), 1)
         self.assertIn("客户库位", parsed.merge_conflicts[0])
+
+    def test_customer_profiles_map_available_fields_and_generate_retail_id(self):
+        item = {
+            "item_id": "1783",
+            "customer_location_code": "270104",
+            "quantity": 1,
+            "name": "测试药品",
+            "specifications": "10mg*7片",
+            "manufacturer": "测试厂家",
+            "approval_number": "国药准字TEST",
+            "barcode": "6920587904956",
+        }
+        yaoshi = build_create_task_body(
+            {
+                "store_id": "6",
+                "customer": "yaoshibang",
+                "order_source": "meituan",
+                "need_image_upload": True,
+            },
+            [item],
+            {
+                "store_phone": "020-12345678",
+                "recipient_name": "测试收货人",
+                "unknown_field": "不应透传",
+            },
+        )
+        self.assertEqual(
+            yaoshi["items"][0],
+            {
+                "item_id": "1783",
+                "common_name": "测试药品",
+                "quantity": 1,
+                "spec": "10mg*7片",
+                "barcode": "6920587904956",
+                "location_code": "270104",
+                "manufacturer": "测试厂家",
+                "approval_number": "国药准字TEST",
+            },
+        )
+        self.assertTrue(str(yaoshi["retail_order_id"]).startswith("RO"))
+        self.assertEqual(yaoshi["store_phone"], "020-12345678")
+        self.assertEqual(yaoshi["recipient_name"], "测试收货人")
+        self.assertNotIn("unknown_field", yaoshi)
+        self.assertTrue(yaoshi["need_image_upload"])
+
+        shuyu = build_create_task_body(
+            {"store_id": "B877", "customer": "shuyu", "order_source": "meituan"},
+            [{key: value for key, value in item.items() if key != "customer_location_code"}],
+        )
+        self.assertEqual(
+            shuyu["items"][0],
+            {
+                "item_id": "1783",
+                "item_name": "测试药品",
+                "specification": "10mg*7片",
+                "quantity": 1,
+            },
+        )
+        self.assertNotIn("location_code", shuyu["items"][0])
+        lzgzdyf = build_create_task_body(
+            {"store_id": "lzgzdyf_test", "customer": "lzgzdyf"},
+            [item],
+        )
+        self.assertEqual(lzgzdyf["items"][0]["spec"], "10mg*7片")
+        self.assertEqual(lzgzdyf["items"][0]["manufacturer"], "测试厂家")
+        self.assertNotIn("total_price", shuyu)
+        self.assertIn("total_price", lzgzdyf)
+
+        dashenlin = build_create_task_body(
+            {"store_id": "dsl_test", "customer": "dashenlin"}, [item]
+        )
+        self.assertEqual(dashenlin["items"][0]["common_name"], "测试药品")
+        self.assertEqual(dashenlin["items"][0]["spec"], "10mg*7片")
+        self.assertEqual(dashenlin["items"][0]["location_code"], "270104")
+        self.assertIn("total_price", dashenlin)
+        self.assertNotIn("retail_order_id", dashenlin)
+
+        noematrix = build_create_task_body(
+            {
+                "store_id": "noematrix_test",
+                "customer": "noematrix",
+                "need_image_upload": True,
+            },
+            [item],
+        )
+        self.assertEqual(noematrix["items"][0]["approval_number"], "国药准字TEST")
+        self.assertTrue(str(noematrix["retail_order_id"]).startswith("RO"))
+        self.assertTrue(noematrix["need_image_upload"])
+
+    def test_missing_item_fields_are_returned_together(self):
+        with self.assertRaises(OrderPayloadError) as raised:
+            normalize_order_items([{"item_id": ""}, {"item_id": "5473"}])
+        self.assertEqual(
+            raised.exception.missing_fields,
+            [
+                {"item_index": 0, "item_id": "", "fields": ["item_id", "location_code"]},
+                {"item_index": 1, "item_id": "5473", "fields": ["location_code"]},
+            ],
+        )
 
 
 if __name__ == "__main__":

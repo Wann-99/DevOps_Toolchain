@@ -117,6 +117,33 @@ class DashboardTerminalTimerTests(unittest.TestCase):
         self.assertEqual(lifecycle["end_reason"], "broker_cancel")
         self.assertFalse(tasks[0]["active"])
 
+    def test_failed_item_ends_order_before_broker_terminal(self) -> None:
+        order, task = lifecycle_input("dispatched")
+        task["status"] = "failed"
+        task["status_label"] = "失败"
+        task["active"] = False
+        task["needs_confirm"] = False
+        broker = {
+            "ok": True,
+            "status": "dispatched",
+            "status_label": "已拆单",
+            "ended": False,
+            "terminal": False,
+        }
+        with (
+            patch.object(order_store, "_ACTIVE_ORDER", order),
+            patch.object(order_store, "_save_active_order_unlocked"),
+        ):
+            lifecycle, tasks, aggregate = dashboard_api._apply_order_lifecycle(
+                order, {}, broker, [task]
+            )
+
+        self.assertTrue(lifecycle["ended"])
+        self.assertFalse(lifecycle["closed"])
+        self.assertEqual(lifecycle["end_reason"], "items_failed")
+        self.assertEqual(aggregate, "failed")
+        self.assertTrue(order_model._order_is_queue_terminal({"lifecycle": lifecycle}))
+
     def test_log_prompt_remains_actionable_when_broker_is_terminal(self) -> None:
         order, task = lifecycle_input("success")
         task["status"] = "await_confirm"
@@ -257,6 +284,41 @@ class DashboardTerminalTimerTests(unittest.TestCase):
         order["lifecycle"]["broker_status"] = "manual_transferred"
         self.assertFalse(order_model._order_is_queue_terminal(order))
 
+    def test_manual_transfer_marks_stale_robot_items_unexecuted(self) -> None:
+        order = order_model._build_active_order(
+            {
+                "task_id": "task-1",
+                "order_no": "ORDER-task-1",
+                "items": [
+                    {"item_id": "690001", "barcode": "690001", "location_code": "010203", "quantity": 1},
+                    {"item_id": "690002", "barcode": "690002", "location_code": "010204", "quantity": 1},
+                ],
+            }
+        )
+        tasks = [
+            {"code": "690001", "status": "failed", "active": False, "needs_confirm": False},
+            {"code": "690002", "status": "processing", "active": True, "needs_confirm": False},
+        ]
+        broker = {
+            "ok": True,
+            "status": "manual_transferred",
+            "status_label": "人工转单",
+            "ended": True,
+            "terminal": False,
+        }
+        with (
+            patch.object(order_store, "_ACTIVE_ORDER", order),
+            patch.object(order_store, "_save_active_order_unlocked"),
+        ):
+            lifecycle, result, aggregate = dashboard_api._apply_order_lifecycle(
+                order, {}, broker, tasks
+            )
+
+        self.assertEqual([task["status"] for task in result], ["failed", "skipped"])
+        self.assertEqual(lifecycle["label"], "工单失败 · 已停止")
+        self.assertEqual(aggregate, "failed")
+        self.assertFalse(any(task.get("active") for task in result))
+
     def test_manual_complete_is_queue_terminal(self) -> None:
         order = order_model._build_active_order(order_payload("task-1", "690001"))
         order["lifecycle"]["broker_status"] = "manual_transferred_completed"
@@ -385,7 +447,7 @@ class BrokerTaskIdentityTests(unittest.TestCase):
             patch.object(order_store, "_save_active_order_unlocked"),
             patch.object(
                 order_api,
-                "list_tasks",
+                "list_latest_tasks",
                 return_value={
                     "tasks": [
                         {
@@ -420,7 +482,7 @@ class BrokerTaskIdentityTests(unittest.TestCase):
             patch.object(order_store, "_save_active_order_unlocked"),
             patch.object(
                 order_api,
-                "list_tasks",
+                "list_latest_tasks",
                 return_value={
                     "tasks": [
                         {
@@ -448,6 +510,7 @@ class BrokerTaskIdentityTests(unittest.TestCase):
                 "source": "order",
             }
         )
+        order["registered_at"] = "2026-08-17T10:00:00Z"
         with (
             patch.object(order_store, "_ACTIVE_ORDER", order),
             patch.object(order_store, "_save_active_order_unlocked"),
@@ -458,7 +521,7 @@ class BrokerTaskIdentityTests(unittest.TestCase):
             ),
             patch.object(
                 order_api,
-                "list_tasks",
+                "list_latest_tasks",
                 return_value={
                     "tasks": [
                         {
@@ -500,6 +563,115 @@ class BrokerTaskIdentityTests(unittest.TestCase):
         self.assertIn("old-robot-task", stale)
         self.assertNotIn("robot-task", stale)
 
+    def test_manual_held_active_order_promotes_new_running_order(self) -> None:
+        order = order_model._build_active_order(
+            {
+                "task_id": "old-task",
+                "order_no": "OLD-1",
+                "items": [],
+                "source": "order",
+            }
+        )
+        order["pending_confirm"] = {
+            "task_id": "old-task",
+            "status": "await_error",
+            "kind": "error",
+        }
+        order["queued_orders"] = [
+            order_model._build_active_order(
+                {
+                    "task_id": "new-task",
+                    "order_no": "NEW-1",
+                    "items": [{"item_id": "690123", "barcode": "690123"}],
+                    "source": "order",
+                }
+            ),
+            order_model._build_active_order(
+                {
+                    "task_id": "later-task",
+                    "order_no": "LATER-1",
+                    "items": [{"item_id": "690124", "barcode": "690124"}],
+                    "source": "order",
+                }
+            ),
+        ]
+        with (
+            patch.object(order_store, "_ACTIVE_ORDER", order),
+            patch.object(order_store, "_save_active_order_unlocked"),
+            patch.object(
+                order_api,
+                "_fetch_broker_order",
+                return_value={
+                    "ok": True,
+                    "status": "manual_transferred",
+                    "terminal": False,
+                },
+            ),
+            patch.object(
+                order_api,
+                "list_latest_tasks",
+                return_value={
+                    "tasks": [
+                        {
+                            "task_id": "new-task",
+                            "status": "running",
+                            "task_detail": {
+                                "order_no": "NEW-1",
+                                "items": [
+                                    {
+                                        "item_id": "123",
+                                        "barcode": "690123",
+                                        "item_name": "测试商品",
+                                    }
+                                ],
+                            },
+                        }
+                    ]
+                },
+            ),
+        ):
+            result = dashboard_api._promote_latest_broker_order(order, "test")
+
+        self.assertEqual(result["task_id"], "new-task")
+        self.assertEqual(result["pending_confirm"]["task_id"], "old-task")
+        self.assertNotIn("queued_orders", result)
+        self.assertFalse(result["lifecycle"].get("needs_confirm"))
+        self.assertEqual(result["items"][0]["barcode"], "690123")
+
+    def test_latest_selection_ignores_status_and_never_returns_to_older_order(self) -> None:
+        for mode in ("test", "prod"):
+            for status in ("pending", "running", "success", "error", "manual_cancel", "manual_transferred"):
+                with self.subTest(mode=mode, status=status):
+                    old = order_model._build_active_order(order_payload("old", "690001"))
+                    old["pending_confirm"] = {"task_id": "robot-old", "kind": "error"}
+                    with (
+                        patch.object(order_store, "_ACTIVE_ORDER", old),
+                        patch.object(order_store, "_save_active_order_unlocked"),
+                        patch.object(order_api, "list_latest_tasks", return_value={"tasks": [
+                            {"task_id": "new", "status": status},
+                            {"task_id": "old", "status": "running"},
+                        ]}) as listing,
+                    ):
+                        selected = dashboard_api._promote_latest_broker_order(old, mode)
+                        self.assertEqual(selected["task_id"], "new")
+                        self.assertEqual(selected["pending_confirm"]["task_id"], "robot-old")
+                        self.assertEqual(dashboard_api._promote_latest_broker_order(selected, mode)["task_id"], "new")
+                        listing.assert_called_with(mode)
+
+    def test_older_broker_list_cannot_replace_just_created_order(self) -> None:
+        current = order_model._build_active_order(
+            order_payload("new", "690002"), registered_at="2026-09-24T10:00:00Z"
+        )
+        with (
+            patch.object(order_store, "_ACTIVE_ORDER", current),
+            patch.object(order_store, "_save_active_order_unlocked") as save,
+            patch.object(order_api, "list_latest_tasks", return_value={"tasks": [
+                {"task_id": "old", "status": "running", "create_time": "2026-09-24T09:00:00Z"},
+            ]}),
+        ):
+            self.assertEqual(dashboard_api._promote_latest_broker_order(current, "test")["task_id"], "new")
+            save.assert_not_called()
+
     def test_order_payload_cannot_override_local_registration_time(self) -> None:
         payload = order_payload("task-1", "690001")
         payload["registered_at"] = "2000-01-01T00:00:00Z"
@@ -538,6 +710,45 @@ class BrokerTaskIdentityTests(unittest.TestCase):
         self.assertTrue(status["cloud_ok"])
         self.assertEqual(result["task_id"], "etm-task")
         self.assertEqual(result["registered_at"], "2026-08-17T10:16:28Z")
+
+    def test_etm_does_not_replace_selected_order_with_next_execution_task(self) -> None:
+        current = order_model._build_active_order(
+            {
+                "task_id": "old-task",
+                "order_no": "OLD-1",
+                "items": [{"item_id": "690001", "barcode": "690001"}],
+                "source": "order",
+            }
+        )
+        current["pending_confirm"] = {"task_id": "old-task", "kind": "error"}
+        current["lifecycle"]["broker_status"] = "manual_transferred"
+        with (
+            patch.object(order_store, "_ACTIVE_ORDER", current),
+            patch.object(order_store, "_save_active_order_unlocked"),
+            patch.object(
+                dashboard_api,
+                "_etm_get_json",
+                side_effect=[
+                    {"data": {"task_id": "new-task"}},
+                    {
+                        "data": {
+                            "task_id": "old-task",
+                            "status": "manual_transferred",
+                            "params": {
+                                "order_no": "NEW-1",
+                                "items": [{"item_id": "690002", "location_code": "010203"}],
+                            },
+                        }
+                    },
+                ],
+            ),
+        ):
+            result, _status = dashboard_api._sync_order_from_etm(
+                current, {"etm_base_url": "http://127.0.0.1:12005"}
+            )
+
+        self.assertEqual(result["task_id"], "old-task")
+        self.assertIn("pending_confirm", result)
 
 
 class CurrentAndWaitingOrderTests(unittest.TestCase):
@@ -612,27 +823,24 @@ class CurrentAndWaitingOrderTests(unittest.TestCase):
         self.assertTrue(again["queued"])
         self.assertEqual(active_orders.order_queue_status()["total"], 2)
 
-    def test_order_identity_recovery_preserves_the_waiting_order(self) -> None:
+    def test_display_switch_drops_legacy_queue_but_preserves_robot_prompt(self) -> None:
         self.register("task-1", "690001")
-        body = order_payload("task-2", "690002")
-        body["items"][0]["group_id"] = "group-2"
-        second = active_orders.register_created_order("task-2", body, "test-order")
-        active_orders.set_active_order(order_payload("task-1", "690001"))
-        self.assertEqual(active_orders.order_queue_status()["queued_count"], 1)
-        recovered = active_orders.set_active_order(order_payload("task-2", "690002"))
-        self.assertEqual(recovered["items"], second["items"])
-        self.assertEqual(recovered["registered_at"], second["registered_at"])
-        self.assertEqual(active_orders.order_queue_status()["queued_count"], 0)
+        self.register("task-2", "690002")
+        order_store._ACTIVE_ORDER["pending_confirm"] = {"task_id": "robot-1", "kind": "error"}
+        selected = active_orders.set_active_order(order_payload("task-2", "690002"))
+        self.assertEqual(selected["task_id"], "task-2")
+        self.assertNotIn("queued_orders", selected)
+        self.assertEqual(selected["pending_confirm"]["task_id"], "robot-1")
+        self.assertFalse(selected["lifecycle"].get("needs_confirm"))
 
-    def test_restart_does_not_advance_a_manual_held_order(self) -> None:
+    def test_manual_held_order_does_not_block_new_order_registration(self) -> None:
         self.register("task-1", "690001")
         order_store._ACTIVE_ORDER["lifecycle"].update(closed=True, broker_status="manual_transferred")
         self.register("task-2", "690002")
         order_store._ACTIVE_ORDER = None
         order_store._ACTIVE_ORDER_LOADED = False
         self.assertEqual(active_orders.get_active_order()["task_id"], "task-1")
-        with self.assertRaisesRegex(order_api.OrderQueueConflict, "等待人工确认"):
-            order_api.ensure_order_creation_allowed()
+        order_api.ensure_order_creation_allowed()
 
     def test_promotion_requires_broker_terminal_status_and_keeps_waiting_metadata(self) -> None:
         self.register("task-1", "690001")
@@ -647,7 +855,7 @@ class CurrentAndWaitingOrderTests(unittest.TestCase):
         order_store._ACTIVE_ORDER["lifecycle"]["broker_status"] = "success"
         self.assertFalse(active_orders.promote_queued_order_if_ready())
         dashboard_api._reconcile_pending_confirmation({
-            "task_id": "task-1", "confirm_closed": True,
+            "task_id": "task-1", "keyboard": {"confirm_closed": True, "needs_confirm": False},
         })
         self.assertTrue(active_orders.promote_queued_order_if_ready())
         current = active_orders.get_active_order()
@@ -658,61 +866,59 @@ class CurrentAndWaitingOrderTests(unittest.TestCase):
         self.assertFalse(active_orders.order_queue_status()["full"])
         self.assertEqual(json.loads(self.state_file.read_text())["task_id"], "task-2")
 
-    def test_error_prompt_survives_queue_refresh_restart_and_key_injection(self) -> None:
+    def test_latest_order_card_and_old_robot_prompt_are_independent(self) -> None:
         self.register("task-1", "690001")
-        self.register("task-2", "690002")
-        self.register("task-3", "690003")
         logs = "\n".join([
             "MedicinePickUpTaskItem(code=690001, task_id=task-1, seq_id=1)",
             "start process object{'code': '690001', 'location_code': '010203'}",
             "报错，请求人工处理",
         ])
-
         def broker_status(task_id, mode="test"):
-            terminal = task_id == "task-1"
-            return {"ok": True, "task_id": task_id, "status": "error" if terminal else "running", "ended": terminal, "terminal": terminal}
-
+            old = task_id == "task-1"
+            return {"ok": True, "task_id": task_id, "status": "error" if old else "pending", "ended": old, "terminal": old}
         with (
             patch.object(dashboard_settings, "load_dashboard_settings", return_value={"mode": "test", "auto_confirm": False}),
             patch.object(dashboard_api, "inspect_container", return_value={"running": True}),
             patch.object(dashboard_api, "fetch_logs", return_value={"logs": logs}) as fetch,
             patch.object(dashboard_api, "_reconcile_broker_task_id", side_effect=lambda order, mode: order),
+            patch.object(order_api, "list_latest_tasks", return_value={"tasks": [{"task_id": "task-1"}]}) as listing,
             patch.object(order_api, "_is_broker_configured", return_value=True),
             patch.object(order_api, "_fetch_broker_order", side_effect=broker_status),
             patch.object(dashboard_api.keyboard, "inject_confirm_key", return_value={"ok": True}) as inject,
+            patch("ksq.feishu.client.create_bitable_record") as feishu,
         ):
             waiting = dashboard_api.get_dashboard_snapshot(2500)
-            self.assertEqual(waiting["task_id"], "task-1")
-            self.assertTrue(waiting["needs_confirm"])
-            self.assertEqual(waiting["broker_order"]["status"], "error")
-            active_orders.ensure_order_queue_capacity()
-            active_orders.dismiss_await(waiting["confirm_fingerprint"])
-            dashboard_api.confirm_and_maybe_submit_feishu()
+            self.assertTrue(waiting["keyboard"]["needs_confirm"])
+            before = active_orders.get_active_order()
+            submitted = feishu.call_count
+            self.assertEqual(dashboard_api.confirm_keyboard(), {"ok": True})
             inject.assert_called_once()
-            self.assertFalse(active_orders.promote_queued_order_if_ready())
-
-            # A key-send response, dismissal, missing logs and restart cannot
-            # discard the robot's prompt or any later order.
+            self.assertEqual(feishu.call_count, submitted)
+            self.assertEqual(active_orders.get_active_order(), before)
+            listing.return_value = {"tasks": [
+                {"task_id": "task-2", "status": "pending", "task_detail": order_payload("task-2", "690002")},
+                {"task_id": "task-1", "status": "error"},
+            ]}
+            latest = dashboard_api.get_dashboard_snapshot(2500)
+            self.assertEqual(latest["order"]["task_id"], "task-2")
+            self.assertEqual(latest["task_id"], "task-2")
+            self.assertEqual(latest["broker_order"]["status"], "pending")
+            self.assertFalse(latest["needs_confirm"])
+            self.assertEqual([task["code"] for task in latest["tasks"]], ["690002"])
+            self.assertTrue(latest["keyboard"]["needs_confirm"])
+            self.assertEqual(latest["keyboard"]["task_id"], "task-1")
             order_store._ACTIVE_ORDER = None
             order_store._ACTIVE_ORDER_LOADED = False
-            restored = active_orders.get_active_order()
-            self.assertEqual(restored["task_id"], "task-1")
-            self.assertIn("pending_confirm", restored)
             fetch.return_value = {"logs": ""}
             gap = dashboard_api.get_dashboard_snapshot(2500)
-            self.assertTrue(gap["needs_confirm"])
-            self.assertEqual(gap["task_id"], "task-1")
-            self.assertEqual(active_orders.order_queue_status()["queued_count"], 2)
-
-            fetch.return_value = {"logs": logs + "\n确认成功，继续操作"}
+            self.assertEqual(gap["task_id"], "task-2")
+            self.assertTrue(gap["keyboard"]["needs_confirm"])
+            fetch.return_value = {"logs": "确认成功，继续操作"}
             resumed = dashboard_api.get_dashboard_snapshot(2500)
+            self.assertFalse(resumed["keyboard"]["needs_confirm"])
             self.assertEqual(resumed["task_id"], "task-2")
-            self.assertFalse(resumed["needs_confirm"])
-            current = active_orders.get_active_order()
-            self.assertNotIn("pending_confirm", current)
-            self.assertNotIn("690001", current["item_states"])
-            self.assertEqual([item["task_id"] for item in current["queued_orders"]], ["task-3"])
-            self.assertEqual(json.loads(self.state_file.read_text())["task_id"], "task-2")
+            self.assertEqual(resumed["broker_order"]["status"], "pending")
+            self.assertNotIn("pending_confirm", active_orders.get_active_order())
 
     def test_pending_prompt_blocks_replacement_and_restart_even_without_broker(self) -> None:
         prompts = (
@@ -764,9 +970,9 @@ class CurrentAndWaitingOrderTests(unittest.TestCase):
         self.register("task-1", "690001")
         order_store._ACTIVE_ORDER["pending_confirm"] = {"task_id": "task-1", "kind": "error"}
         current = active_orders.get_active_order()
-        with patch.object(order_api, "list_tasks") as listing:
+        with patch.object(order_api, "list_latest_tasks", return_value={"tasks": []}) as listing:
             self.assertEqual(dashboard_api._promote_latest_broker_order(current, "test"), current)
-        listing.assert_not_called()
+        listing.assert_called_once()
         with patch.object(dashboard_api, "_etm_get_json", side_effect=[
             {"data": {"task_id": "task-2"}},
             {"data": {"task_id": "task-1", "status": "error"}},
@@ -778,13 +984,13 @@ class CurrentAndWaitingOrderTests(unittest.TestCase):
         self.assertEqual(restored["task_id"], "task-1")
         self.assertIn("pending_confirm", restored)
 
-    def test_snapshot_switches_to_waiting_order_without_recovering_latest_list_row(self) -> None:
+    def test_snapshot_does_not_infer_latest_order_from_local_queue(self) -> None:
         self.register("task-1", "690001")
         self.register("task-2", "690002")
-        with patch.object(order_api, "list_tasks") as listing:
+        with patch.object(order_api, "list_latest_tasks", return_value={"tasks": []}) as listing:
             current = active_orders.get_active_order()
             self.assertEqual(dashboard_api._promote_latest_broker_order(current, "test"), current)
-        listing.assert_not_called()
+        listing.assert_called_once()
 
         def broker_status(task_id, mode="test"):
             terminal = task_id == "task-1"
@@ -797,14 +1003,15 @@ class CurrentAndWaitingOrderTests(unittest.TestCase):
             patch.object(dashboard_api, "_reconcile_broker_task_id", side_effect=lambda order, mode: order),
             patch.object(order_api, "_is_broker_configured", return_value=True),
             patch.object(order_api, "_fetch_broker_order", side_effect=broker_status),
+            patch.object(order_api, "list_latest_tasks", return_value={"tasks": []}),
         ):
             snapshot = dashboard_api.get_dashboard_snapshot(2500)
-        self.assertEqual(snapshot["task_id"], "task-2")
-        self.assertEqual(snapshot["order"]["task_id"], "task-2")
-        self.assertEqual([item["code"] for item in snapshot["tasks"]], ["690002"])
+        self.assertEqual(snapshot["task_id"], "task-1")
+        self.assertEqual(snapshot["order"]["task_id"], "task-1")
+        self.assertEqual([item["code"] for item in snapshot["tasks"]], ["690001"])
         self.assertFalse(snapshot["needs_confirm"])
 
-    def test_concurrent_creates_only_fill_the_last_waiting_slot(self) -> None:
+    def test_concurrent_creates_use_broker_acceptance_not_local_queue(self) -> None:
         for number in range(1, 10):
             self.register(f"task-{number}", f"6900{number:02d}")
         def create(code):
@@ -816,23 +1023,26 @@ class CurrentAndWaitingOrderTests(unittest.TestCase):
         with (
             patch.object(order_api, "load_order_config", return_value={"server": "https://broker.example.test", "store_id": "6"}),
             patch.object(order_api, "_ensure_token", return_value="test-token"),
-            patch.object(order_api.broker, "create_robot_task", return_value=(200, {"data": {"task_id": "task-10"}})) as broker_create,
+            patch.object(order_api.broker, "create_robot_task", side_effect=[(200, {"data": {"task_id": "task-10"}}), (200, {"data": {"task_id": "task-11"}})]) as broker_create,
             ThreadPoolExecutor(max_workers=2) as executor,
         ):
             results = list(executor.map(create, ("690010", "690011")))
-        self.assertCountEqual(results, ["created", "ORDER_QUEUE_FULL"])
-        self.assertEqual(broker_create.call_count, 1)
-        self.assertEqual(active_orders.get_active_order()["task_id"], "task-1")
-        self.assertEqual(active_orders.order_queue_status()["total"], 10)
+        self.assertEqual(results, ["created", "created"])
+        self.assertEqual(broker_create.call_count, 2)
+        self.assertEqual(active_orders.get_active_order()["task_id"], "task-11")
+        self.assertNotIn("queued_orders", active_orders.get_active_order())
 
-    def test_duplicate_current_sku_is_rejected_before_broker_request(self) -> None:
+    def test_same_sku_in_a_new_order_is_submitted_to_broker(self) -> None:
         self.register("task-1", "690001")
         with (
-            patch.object(order_api.broker, "create_robot_task") as create,
-            self.assertRaisesRegex(ValueError, "请勿重复下单"),
+            patch.object(order_api, "load_order_config", return_value={"server": "https://broker.example.test", "store_id": "6"}),
+            patch.object(order_api, "_ensure_token", return_value="test-token"),
+            patch.object(order_api.broker, "create_robot_task", return_value=(200, {"data": {"task_id": "task-2"}})) as create,
         ):
-            order_api.create_registered_order({"items": [{"item_id": "690001", "location_code": "010203"}]})
-        create.assert_not_called()
+            payload = {"mode": "test", "items": [{"item_id": "690001", "location_code": "010203"}]}
+            result = order_api.create_registered_order(payload)
+        create.assert_called_once()
+        self.assertEqual(result[3]["task_id"], "task-2")
 
     def test_grouped_duplicate_sku_keeps_both_dashboard_rows(self) -> None:
         body = order_payload("task-group", "690001")
@@ -860,15 +1070,14 @@ class CurrentAndWaitingOrderTests(unittest.TestCase):
         self.assertEqual([task["group_id"] for task in tasks], ["A01", "A02"])
         self.assertEqual([task["status"] for task in tasks], ["processing"] * 2)
 
-    def test_manual_transfer_requires_completion_before_next_order(self) -> None:
+    def test_manual_transfer_does_not_block_next_order(self) -> None:
         self.register("task-1", "690001")
         order_store._ACTIVE_ORDER["lifecycle"]["broker_status"] = "manual_transferred"
 
-        with self.assertRaisesRegex(order_api.OrderQueueConflict, "等待人工确认"):
-            order_api.ensure_order_creation_allowed()
+        order_api.ensure_order_creation_allowed()
         self.assertEqual(active_orders.get_active_order()["task_id"], "task-1")
 
-    def test_legacy_queued_broker_order_is_promoted_after_closed_log_order(self) -> None:
+    def test_reload_does_not_choose_display_order_from_legacy_queue(self) -> None:
         current = order_model._build_active_order(order_payload("robot-log", "690001"))
         current["source"] = "log"
         current["lifecycle"]["closed"] = True
@@ -884,15 +1093,8 @@ class CurrentAndWaitingOrderTests(unittest.TestCase):
 
         active = active_orders.get_active_order()
 
-        self.assertEqual(active["task_id"], "broker-task")
-        self.assertNotIn("queued_orders", json.loads(self.state_file.read_text(encoding="utf-8")))
-
-        order_store._ACTIVE_ORDER["lifecycle"][
-            "broker_status"
-        ] = "manual_transferred_completed"
-        self.register("task-2", "690002")
-        self.assertEqual(active_orders.get_active_order()["task_id"], "task-2")
-        self.assertEqual(active_orders.order_queue_status()["queued_count"], 0)
+        self.assertEqual(active["task_id"], "robot-log")
+        self.assertEqual(active["queued_orders"][0]["task_id"], "broker-task")
 
     def test_unresolved_item_prompt_requires_manual_completion(self) -> None:
         self.register("task-1", "690001")
@@ -920,15 +1122,19 @@ class CurrentAndWaitingOrderTests(unittest.TestCase):
 
         self.assertFalse(active_orders.active_order_requires_manual_completion())
 
-    def test_eleventh_order_is_rejected_before_broker_request(self) -> None:
+    def test_broker_concurrency_rejection_keeps_display_state(self) -> None:
         for number in range(1, 11):
             self.register(f"task-{number}", f"6900{number:02d}")
+        before = active_orders.get_active_order()
         with (
-            patch.object(order_api, "load_order_config") as load_config,
-            self.assertRaisesRegex(order_api.OrderQueueConflict, "当前已有10单"),
+            patch.object(order_api, "load_order_config", return_value={"server": "https://broker.example.test", "store_id": "6"}),
+            patch.object(order_api, "_ensure_token", return_value="test-token"),
+            patch.object(order_api.broker, "create_robot_task", return_value=(200, {"code": 4800, "msg": "并发任务数超限"})) as create,
+            self.assertRaisesRegex(order_api.broker.OrderBrokerError, "4800"),
         ):
-            order_api.create_order({"items": [], "mode": "test"})
-        load_config.assert_not_called()
+            order_api.create_registered_order({"items": [{"item_id": "690011", "location_code": "010203"}], "mode": "test"})
+        create.assert_called_once()
+        self.assertEqual(active_orders.get_active_order(), before)
 
 
 if __name__ == "__main__":

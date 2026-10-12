@@ -6,6 +6,8 @@ const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../ksq/web/static/arm-bridge.js"), "utf8");
 
 function page(origin) {
+  const armKey = "fixture-arm-key";
+  const storageWrites = [];
   class Element {
     setAttribute(name, value) { this[name] = value; }
   }
@@ -14,12 +16,21 @@ function page(origin) {
   }
   class XMLHttpRequest {
     open(...args) { this.args = args; }
+    send(...args) { this.sent = args; }
   }
   const context = {
     URL, Request, Element, XMLHttpRequest,
     WebSocket: Connection, EventSource: Connection,
-    location: new URL(origin), document: { baseURI: origin + "/arm/" },
-    fetch: (resource, options) => ({ resource, options }),
+    location: new URL(origin + "/arm/" + armKey + "/"),
+    document: { baseURI: origin + "/arm/" + armKey + "/" },
+    storageWrites,
+    fetch: (resource, options) => {
+      if (String(resource).endsWith("/__ksq_storage")) {
+        storageWrites.push(JSON.parse(options.body));
+        return Promise.resolve({ ok: true });
+      }
+      return { resource, options };
+    },
   };
   for (const [name, property] of [["HTMLImageElement", "src"], ["HTMLScriptElement", "src"],
     ["HTMLLinkElement", "href"], ["HTMLAnchorElement", "href"], ["HTMLFormElement", "action"]]) {
@@ -43,7 +54,9 @@ function page(origin) {
       ["js/login.js", "/arm/js/login.js"],
       ["/arm-api/upload", "/arm-api/upload"],
       ["/arm/js/login.js", "/arm/js/login.js"],
-    ]) assert.equal(p.fetch(input).resource, origin + output);
+    ]) assert.equal(p.fetch(input).resource, origin + output.replace(/^(\/arm(?:-api)?)/, "$1/fixture-arm-key"));
+    assert.equal(p.fetch(origin + "/arm/fixture-arm-key/js/app.js").resource,
+      origin + "/arm/fixture-arm-key/js/app.js");
     for (const url of ["data:image/png;base64,AA==", "blob:" + origin + "/fixture", "#login", "https://outside.example/help"]) {
       assert.equal(p.fetch(url).resource, url);
     }
@@ -51,32 +64,48 @@ function page(origin) {
 
     const bytes = new Uint8Array([0, 255, 42]);
     const options = { method: "POST", body: bytes };
-    assert.equal(p.fetch("http://192.168.11.18:8090/upload", options).options, options);
+    assert.deepEqual(p.fetch("http://192.168.11.18:8090/upload", options).options.body, bytes);
+    assert.equal(p.fetch("http://192.168.11.18:8090/upload", { credentials: "include" }).options.credentials, "omit");
     const request = new Request("http://192.168.11.18:8090/upload", {
       method: "PUT", body: bytes, headers: { "X-Device-Check": "fixture" },
     });
     const forwarded = p.fetch(request).resource;
-    assert.equal(forwarded.url, origin + "/arm-api/upload");
+    assert.equal(forwarded.url, origin + "/arm-api/fixture-arm-key/upload");
+    assert.equal(forwarded.credentials, "omit");
     assert.equal(forwarded.method, "PUT");
     assert.equal(forwarded.headers.get("X-Device-Check"), "fixture");
     assert.deepEqual(new Uint8Array(await forwarded.arrayBuffer()), bytes);
 
     const xhr = new p.XMLHttpRequest();
     xhr.open("POST", "http://192.168.11.18:8090/query", true);
-    assert.deepEqual(xhr.args, ["POST", origin + "/arm-api/query", true]);
+    assert.deepEqual(xhr.args, ["POST", origin + "/arm-api/fixture-arm-key/query", true]);
+    xhr.withCredentials = true;
+    xhr.send(bytes);
+    assert.equal(xhr.withCredentials, false);
     const ws = new p.WebSocket("ws://192.168.11.18:8060/events?x=1", ["binary"]);
-    assert.equal(ws.url, origin.replace(/^http/, "ws") + "/arm-ws/events?x=1");
+    assert.equal(ws.url, origin.replace(/^http/, "ws") + "/arm-ws/fixture-arm-key/events?x=1");
     assert.deepEqual(ws.options, ["binary"]);
-    assert.equal(new p.EventSource("/events").url, origin + "/arm/events");
+    assert.equal(new p.EventSource("/events").url, origin + "/arm/fixture-arm-key/events");
 
     const image = new p.HTMLImageElement();
     image.src = "/png/arm.png";
-    assert.equal(image.src, origin + "/arm/png/arm.png");
+    assert.equal(image.src, origin + "/arm/fixture-arm-key/png/arm.png");
     const link = new p.HTMLAnchorElement();
     link.setAttribute("href", "http://192.168.11.18/drag/file.txt");
-    assert.equal(link.href, origin + "/arm/drag/file.txt");
+    assert.equal(link.href, origin + "/arm/fixture-arm-key/drag/file.txt");
     link.setAttribute("title", "192.168.11.18");
     assert.equal(link.title, "192.168.11.18");
+    p.localStorage.setItem("device-state", "fixture");
+    assert.equal(p.localStorage.getItem("device-state"), "fixture");
+    assert.equal(p.sessionStorage.getItem("device-state"), null);
+    p.localStorage.removeItem("device-state");
+    assert.equal(p.localStorage.getItem("device-state"), null);
+    p.localStorage.setItem("device-state", "local-fixture");
+    p.sessionStorage.setItem("device-state", "session-fixture");
+    await new Promise(setImmediate);
+    assert.deepEqual(p.storageWrites.at(-1), {
+      "local:device-state": "local-fixture", "session:device-state": "session-fixture",
+    }, "Device storage writes must retain both isolated namespaces");
   }
   console.log("arm bridge: HTTP/HTTPS, API, WebSocket, binary uploads and assets passed");
 })().catch((error) => { console.error(error); process.exitCode = 1; });

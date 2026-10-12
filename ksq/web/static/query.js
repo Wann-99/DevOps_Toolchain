@@ -52,6 +52,13 @@ let selectedOrders = new Map();
 let storeOptions = [];
 let tokenReady = false;
 
+function dashboardMode() {
+  if (window.KsqApp && window.KsqApp.getDashboardMode) {
+    return window.KsqApp.getDashboardMode() || "test";
+  }
+  return "test";
+}
+
 const emptyPlaceholders = new Set([
   "",
   "-",
@@ -548,8 +555,12 @@ function setTokenDot(state) {
   if (state === "err") dot.classList.add("err");
 }
 
-async function ensureOrderCreationAllowed() {
-  const response = await fetch("/api/order/preflight", { method: "POST" });
+async function ensureOrderCreationAllowed(items) {
+  const response = await fetch("/api/order/preflight", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ items: items || [], mode: dashboardMode() }),
+  });
   const data = await response.json();
   if (response.ok) return;
   const error = new Error(data.error || "当前无法下单");
@@ -678,6 +689,8 @@ function buildOrderItems() {
       customer_location_code: line.customer_location_code || "",
       barcode: line.barcode || "",
       name: line.name || "",
+      specifications: line.specifications || "",
+      manufacturer: line.manufacturer || "",
       quantity: 1,
     });
   });
@@ -693,15 +706,15 @@ async function quickOrder() {
   quickOrderButton.disabled = true;
   reloadStatus.textContent = tokenReady ? "下单中..." : "获取 Token 并下单...";
   try {
-    await ensureOrderCreationAllowed();
     // Saving configuration clears the server-side token cache. Refresh it
     // after the save instead of relying on the stale local tokenReady flag.
     await saveOrderConfig();
+    await ensureOrderCreationAllowed(items);
     await ensureToken({ skipSave: true });
     const response = await fetch("/api/order/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ items: items }),
+      body: JSON.stringify({ items: items, mode: dashboardMode() }),
     });
     const data = await response.json();
     if (!response.ok) {

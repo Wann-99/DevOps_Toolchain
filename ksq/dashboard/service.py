@@ -16,7 +16,7 @@ from ksq.constants import DEFAULT_ETM_BASE_URL
 from ksq.dashboard import cache as dashboard_cache
 from ksq.dashboard import parsing as log_parser
 from ksq.dashboard import settings as dashboard_settings
-from ksq.feishu.submit import maybe_submit_feishu_form, preview_feishu_form, should_submit_on_confirm, should_submit_on_human_prompt
+from ksq.feishu import forms as feishu_forms
 from ksq.order import active as active_orders
 from ksq.order import model as order_model
 from ksq.order import service as order_api
@@ -50,7 +50,7 @@ _DASHBOARD_MONITOR_TAIL = 2500
 _DASHBOARD_MONITOR_ACTIVE_SECONDS = 1.0
 
 
-_DASHBOARD_MONITOR_IDLE_SECONDS = 4.0
+_DASHBOARD_MONITOR_IDLE_SECONDS = 2.0
 
 
 _DASHBOARD_REFRESH_LOCK = Lock()
@@ -196,7 +196,6 @@ def _resolve_active_order(
     )
 
     if latest_task_id and active_task_id and latest_task_id != active_task_id:
-        # Same order barcodes may continue under a remapped robot task_id.
         if matched == latest_task_id:
             order = _expand_order_items_from_log(order, codes_by_task, matched)
             return order
@@ -292,15 +291,7 @@ def _reconcile_broker_task_id(
         try:
             from ksq.order.broker import OrderBrokerError
 
-            result = order_api.list_tasks(
-                mode=mode,
-                page=1,
-                page_size=50,
-                order_by="desc",
-                status="",
-                timezone_name="Asia/Shanghai",
-                refresh=False,
-            )
+            result = order_api.list_latest_tasks(mode)
             candidates: List[Tuple[int, str]] = []
             for task in result.get("tasks", []) if isinstance(result, dict) else []:
                 if not isinstance(task, dict):
@@ -343,107 +334,57 @@ def _reconcile_broker_task_id(
     return updated
 
 
-def _promote_latest_broker_order(order: Optional[Dict[str, object]], mode: str) -> Optional[Dict[str, object]]:
-    """Recover a newer running Broker order when the persisted active order is terminal.
-
-    A network/process restart can happen after Broker creates an order but
-    before the local active-order file is updated.  In that case the UI keeps
-    pointing at the old completed order and blocks the new one.  Read-only
-    Broker list data is enough to repair the single-active-order pointer.
-    """
-    if mode != "test":
-        return order
-    if isinstance(order, dict) and (
-        order.get("queued_orders") or order_model._order_has_pending_confirmation(order)
-    ):
-        # Registered waiting orders advance after lifecycle reconciliation;
-        # recovering from the newest list row would lose their local metadata.
-        return order
+def _promote_latest_broker_order(
+    order: Optional[Dict[str, object]], mode: str, feishu: Optional[Dict[str, object]] = None,
+) -> Optional[Dict[str, object]]:
+    """Select the newest Broker order regardless of execution/confirmation state."""
     current_id = str(order.get("task_id") or "").strip() if isinstance(order, dict) else ""
-    current_broker: Dict[str, object] = {}
-    if current_id:
-        current_broker = order_api._fetch_broker_order(current_id, mode)
-        if current_broker.get("ok") and not current_broker.get("terminal"):
-            return order
-        if (
-            not current_broker.get("ok")
-            and str(order.get("source") or "").strip() != "log"
-        ):
-            return order
     try:
-
-        result = order_api.list_tasks(
-            mode=mode,
-            page=1,
-            page_size=50,
-            order_by="desc",
-            status="",
-            timezone_name="Asia/Shanghai",
-            refresh=False,
-        )
+        result = order_api.list_latest_tasks(mode)
     except Exception:
         return order
-    tasks = result.get("tasks", []) if isinstance(result, dict) else []
-    for task in tasks:
-        if not isinstance(task, dict):
-            continue
-        task_id = str(task.get("task_id") or "").strip()
-        status = str(task.get("status") or "").strip().lower()
-        if not task_id or task_id == current_id or status not in (
-            {"pending", "dispatched", "running", "awaiting_pack"}
-            | order_model._BROKER_MANUAL_HELD
-        ):
-            continue
-        promoted_order_no, promoted_platform_no = _list_task_identity(task)
-        detail = task.get("task_detail") if isinstance(task.get("task_detail"), dict) else {}
-        raw_items = detail.get("items") if isinstance(detail, dict) else None
-        if not isinstance(raw_items, list):
-            raw_items = task.get("items") if isinstance(task.get("items"), list) else []
-        items: List[Dict[str, object]] = []
-        for index, raw in enumerate(raw_items, 1):
-            if not isinstance(raw, dict):
-                continue
-            barcode = str(raw.get("barcode") or "").strip()
-            item_id = str(raw.get("item_id") or "").strip()
-            code = barcode or item_id
-            if not code:
-                continue
-            items.append(
-                {
-                    "index": index,
-                    "code": code,
-                    "item_id": item_id or code,
-                    "barcode": barcode or code,
-                    "name": str(raw.get("item_name") or raw.get("name") or "").strip(),
-                    "location_code": str(raw.get("location_code") or "").strip(),
-                    "quantity": raw.get("quantity") or 1,
-                }
-            )
-        candidate = order_model._build_active_order(
-            {
-                "task_id": task_id,
-                "order_no": promoted_order_no,
-                "platform_order_no": promoted_platform_no,
-                "items": items,
-                "source": "order",
-            },
-            registered_at=_recovered_order_registered_at(task),
-        )
-        with order_store._ACTIVE_ORDER_LOCK:
-
-            active_id = (
-                ""
-                if order_store._ACTIVE_ORDER is None
-                else str(order_store._ACTIVE_ORDER.get("task_id") or "").strip()
-            )
-            # A create request may replace the active order while Broker list is
-            # in flight. Never let that older refresh overwrite the new order.
-            if active_id != current_id:
-                return deepcopy(order_store._ACTIVE_ORDER) if order_store._ACTIVE_ORDER is not None else None
-            order_store._ACTIVE_ORDER = candidate
-            order_store._save_active_order_unlocked()
-        return candidate
-    return order
+    if not isinstance(result, dict) or result.get("stale"):
+        return order
+    tasks = result.get("tasks") or []
+    if not tasks or not isinstance(tasks[0], dict):
+        return order
+    if feishu is not None:
+        feishu_forms.observe_completed_orders(tasks, mode, feishu)
+        order = active_orders.get_active_order() or order
+    task = tasks[0]
+    task_id = str(task.get("task_id") or "").strip()
+    if not task_id or task_id == current_id:
+        return order
+    registered_at = _recovered_order_registered_at(task)
+    # A just-created order may not yet be visible in a cached Broker list.
+    current_time = order_model._parse_ts(str((order or {}).get("registered_at") or ""))
+    candidate_time = order_model._parse_ts(registered_at)
+    current_in_list = any(
+        isinstance(row, dict) and str(row.get("task_id") or "") == current_id
+        for row in tasks
+    )
+    if not current_in_list and current_time and candidate_time and candidate_time < current_time:
+        return order
+    order_no, platform_no = _list_task_identity(task)
+    items = _broker_order_items({"ok": True, "raw": task})
+    for item in items:
+        item["item_id"] = item.get("item_id") or item.get("sku_id") or item.get("barcode")
+    candidate = order_model._build_active_order(
+        {"task_id": task_id, "order_no": order_no, "platform_order_no": platform_no,
+         "items": items, "source": "order"},
+        registered_at=registered_at,
+    )
+    with order_store._ACTIVE_ORDER_LOCK:
+        active = order_store._ACTIVE_ORDER or {}
+        if str(active.get("task_id") or "").strip() != current_id:
+            return deepcopy(order_store._ACTIVE_ORDER)
+        # Keep the robot's keyboard prompt, without copying it into card status.
+        if active.get("pending_confirm"):
+            candidate["pending_confirm"] = deepcopy(active["pending_confirm"])
+        candidate["ui"] = deepcopy(active.get("ui") or candidate["ui"])
+        order_store._ACTIVE_ORDER = candidate
+        order_store._save_active_order_unlocked()
+    return candidate
 
 
 def _etm_get_json(base_url: str, path: str) -> Dict[str, object]:
@@ -549,6 +490,13 @@ def _broker_order_items(broker: Dict[str, object]) -> List[Dict[str, object]]:
 # 日志/本地条目与 Broker 条目对齐时可用的标识，任一命中即视为同一个商品。
 _ITEM_MATCH_FIELDS = ("item_id", "sku_id", "barcode", "code")
 
+_TASK_RUNTIME_FIELDS = (
+    "seq_id", "parent_task_id", "location_code", "status", "status_label",
+    "started_at", "await_at", "ended_at", "elapsed_to_await_seconds",
+    "elapsed_seconds", "duration_seconds", "await_kind", "await_line",
+    "start_line", "end_line", "events", "active", "needs_confirm",
+)
+
 
 def _broker_item_index(
     broker_items: List[Dict[str, object]]
@@ -572,31 +520,61 @@ def _match_broker_item(
     return None
 
 
+def _merge_task_runtime(
+    target: Dict[str, object], incoming: Dict[str, object]
+) -> None:
+    combined = _merge_item_state(target, incoming)
+    for key in _TASK_RUNTIME_FIELDS:
+        if key in combined:
+            target[key] = combined[key]
+
+
 def _apply_broker_item_details(
     tasks: List[Dict[str, object]], broker: Dict[str, object]
 ) -> None:
     """用 Broker 带回的条目信息覆盖子任务的标识与展示字段。
 
-    只在 Broker 给出非空值时覆盖，不会把已有数据抹成空。状态与计时仍由
-    日志解析提供，两边按 item_id / sku_id / 条码 任一命中对齐。
+    名称、库位和展示条码只使用 Broker 返回值；条码缺失时回退 Broker 的
+    sku_id。状态与计时仍由日志解析提供，两边按 item_id / sku_id / 条码任一命中对齐。
 
     barcode / sku_id / item_id 也按 Broker 为准覆盖：日志的 item 行编号可能是
     sku_id，而上游的 barcode/item_id 字段又会回退成那个编号，导致「69码」里装的
     是 sku_id。Broker 条目同时带真正的 barcode 和 sku_id，是这三个字段的权威来源，
     比依赖日志里 sku_id->69码 别名的出现时序可靠。
     """
-    index = _broker_item_index(_broker_order_items(broker))
+    broker_items = _broker_order_items(broker)
+    index = _broker_item_index(broker_items)
     if not index:
         return
+    matched_tasks: List[Dict[str, object]] = []
+    seen_broker_rows: Dict[Tuple[int, str, str], Dict[str, object]] = {}
     for task in tasks:
         matched = _match_broker_item(task, index)
         if matched is None:
             continue
-        for field in ("name", "location_code", "barcode", "sku_id", "item_id"):
-            value = str(matched.get(field) or "").strip()
-            if value:
-                task[field] = value
+        # 展示字段只认 Broker 明细；本地订单/CSV/日志只用于匹配和状态。
+        task["name"] = str(matched.get("name") or "").strip()
+        task["location_code"] = str(matched.get("location_code") or "").strip()
+        task["barcode"] = str(
+            matched.get("barcode") or matched.get("sku_id") or ""
+        ).strip()
+        task["sku_id"] = str(matched.get("sku_id") or "").strip()
+        task["item_id"] = str(matched.get("item_id") or "").strip()
         task["broker_matched"] = True
+        group_key = (
+            id(matched),
+            str(task.get("group_field") or "").strip(),
+            str(task.get("group_id") or "").strip(),
+        )
+        previous = seen_broker_rows.get(group_key)
+        if previous is not None:
+            _merge_task_runtime(previous, task)
+            continue
+        seen_broker_rows[group_key] = task
+        matched_tasks.append(task)
+    # Broker 已返回完整商品明细时，只保留能对应上的行，避免日志内部编码
+    # （例如 sku_id）在页面上另生成一张“未匹配”卡片。
+    tasks[:] = matched_tasks
 
 
 def _broker_from_etm_cloud(cloud: Dict[str, object], task_id: str) -> Dict[str, object]:
@@ -622,7 +600,7 @@ def _broker_from_etm_cloud(cloud: Dict[str, object], task_id: str) -> Dict[str, 
 def _sync_order_from_etm(
     order: Optional[Dict[str, object]], settings: Dict[str, object]
 ) -> Tuple[Optional[Dict[str, object]], Dict[str, object]]:
-    """Production mode: prefer Edge Task Manager next/cloud for order identity."""
+    """Enrich the selected order; use ETM next only when no order is selected."""
     base = dashboard_settings._normalize_etm_base_url(settings.get("etm_base_url"))
     etm: Dict[str, object] = {
         "ok": False,
@@ -643,11 +621,8 @@ def _sync_order_from_etm(
     if isinstance(next_data, dict):
         next_task_id = str(next_data.get("task_id") or "").strip()
         etm["next_task_id"] = next_task_id
-    if order_model._order_has_pending_confirmation(order):
-        next_task_id = ""
-    candidate = next_task_id
-    if not candidate and order is not None:
-        candidate = str(order.get("task_id") or "").strip()
+    current_id = str((order or {}).get("task_id") or "").strip()
+    candidate = current_id or next_task_id
     if not candidate:
         etm["ok"] = True
         return order, etm
@@ -671,7 +646,7 @@ def _sync_order_from_etm(
     platform_no = order_model._platform_order_no_from_task_dict(cloud)
     items = order_model._items_from_ob_params(cloud.get("params"))
     current_id = "" if order is None else str(order.get("task_id") or "").strip()
-    if next_task_id and next_task_id != current_id:
+    if next_task_id and not current_id:
         order = active_orders.set_active_order(
             {
                 "task_id": next_task_id,
@@ -698,7 +673,9 @@ def _sync_order_from_etm(
     # Enrich current session without wiping remembered item_states.
     with order_store._ACTIVE_ORDER_LOCK:
 
-        if order_store._ACTIVE_ORDER is not None:
+        if order_store._ACTIVE_ORDER is not None and str(
+            order_store._ACTIVE_ORDER.get("task_id") or ""
+        ) == current_id:
             if order_no and not order_store._ACTIVE_ORDER.get("order_no"):
                 order_store._ACTIVE_ORDER["order_no"] = order_no
             if platform_no and not order_store._ACTIVE_ORDER.get("platform_order_no"):
@@ -989,6 +966,8 @@ def _public_order(order: Optional[Dict[str, object]]) -> Optional[Dict[str, obje
     result.pop("feishu_log_cache", None)
     result.pop("pending_confirm", None)
     result.pop("queued_orders", None)
+    if isinstance(result.get("ui"), dict):
+        result["ui"].pop("feishu_forms", None)
     return result
 
 
@@ -1014,16 +993,37 @@ def _prune_stale_item_states(
         memory = order_store._ACTIVE_ORDER.get("item_states")
         if not isinstance(memory, dict):
             return
-        stale_keys = [
-            key
-            for key, value in memory.items()
-            if isinstance(value, dict)
-            and str(value.get("parent_task_id") or "").strip() in stale_task_ids
-        ]
+        registered_at = order_model._parse_ts(str(order.get("registered_at") or ""))
+        if registered_at is not None and registered_at.tzinfo is None:
+            registered_at = registered_at.replace(tzinfo=timezone.utc)
+        active_order_id = str(order.get("task_id") or "").strip()
+        stale_keys = []
+        for key, value in memory.items():
+            if not isinstance(value, dict):
+                continue
+            parent = str(value.get("parent_task_id") or "").strip()
+            is_stale = parent in stale_task_ids
+            if (
+                not is_stale
+                and parent == active_order_id
+                and str(value.get("status") or "") in {"started", "processing"}
+                and registered_at is not None
+            ):
+                started_at = order_model._parse_ts(str(value.get("started_at") or ""))
+                if started_at is not None:
+                    if started_at.tzinfo is None:
+                        started_at = started_at.replace(tzinfo=timezone.utc)
+                    is_stale = started_at < registered_at
+            if is_stale:
+                stale_keys.append(key)
         if not stale_keys:
             return
         for key in stale_keys:
             memory.pop(key, None)
+        local_memory = order.get("item_states")
+        if isinstance(local_memory, dict):
+            for key in stale_keys:
+                local_memory.pop(key, None)
         order_store._save_active_order_unlocked()
 
 
@@ -1071,19 +1071,28 @@ def _apply_order_lifecycle(
         or (needs_confirm and human_kind == "error")
         or (order_await and human_kind == "error")
     )
-    # Failure with no in-flight SKU: robot usually stopped; remaining pending
-    # will not run unless a later start line reopens the order.
-    stopped_on_failure = bool(
-        has_failure and not has_live_work and not needs_confirm
-    )
+    # Once an item is finally failed (the error confirmation is already
+    # handled), the whole order ends locally; later items must not keep it
+    # alive or block the next queued order.
+    stopped_on_failure = bool(has_failure and not needs_confirm)
+    if stopped_on_failure:
+        for task in tasks:
+            if str(task.get("status") or "") in {"pending", "started", "processing"}:
+                task["status"] = "skipped"
+                task["status_label"] = order_model._STATUS_LABELS["skipped"]
+                task["active"] = False
+                task["needs_confirm"] = False
+        has_robot_running = False
+        has_live_work = False
+        unfinished = False
 
-    # 订单 lifecycle（ended / closed / end_reason）只由 Broker 状态决定；
-    # 日志解析信号仅服务下方的展示层：label、aggregate、计时冻结与单品标记。
+    # Broker 状态负责正常的订单生命周期；已确认的机器人子任务失败是
+    # 本地终止条件，避免失败订单继续阻塞队列。
     now_iso = order_model._ts_to_iso(datetime.now(timezone.utc))
     now_dt = datetime.now(timezone.utc)
 
-    # Broker 订单状态是 lifecycle 的唯一来源：结束 = Broker 终态/人工持有态。
-    # manual_transferred is an operator-owned waiting state, not a terminal state:
+    # Broker 订单状态负责正常结束与人工持有态；manual_transferred is an
+    # operator-owned waiting state, not a terminal state:
     # keep it as the current order until manual-complete reaches the Broker.
     if broker_ended:
         lifecycle["ended"] = True
@@ -1109,6 +1118,12 @@ def _apply_order_lifecycle(
         lifecycle["closed"] = True
         if not lifecycle.get("closed_at"):
             lifecycle["closed_at"] = now_iso
+
+    if stopped_on_failure and not lifecycle.get("ended"):
+        lifecycle["ended"] = True
+        lifecycle["end_source"] = "robot"
+        lifecycle["end_reason"] = "items_failed"
+        lifecycle["ended_at"] = lifecycle.get("ended_at") or now_iso
 
     # Order timer: first 开始处理 → first *active* human-gate speak
     # (needs_confirm). Do not freeze on historical human_seen from old logs,
@@ -1268,7 +1283,7 @@ def _apply_order_lifecycle(
                 task["active"] = False
                 task["needs_confirm"] = False
                 task["status_label"] = order_model._STATUS_LABELS.get(status, status)
-    else:
+    elif not lifecycle["ended"] and not stopped_on_failure:
         # Revive items wrongly marked skipped while the order is still running.
         for task in tasks:
             if str(task.get("status") or "") == "skipped" and not task.get("end_line"):
@@ -1280,8 +1295,18 @@ def _apply_order_lifecycle(
     # Broker only owns the order lifecycle. A matching robot log prompt remains
     # actionable even after Broker changes state (manual transfer/terminal included).
     if broker_ended:
-        for task in tasks:
-            task["active"] = False
+        if broker_status == "manual_transferred" and not needs_confirm:
+            # 人工转单后机器人不会继续执行剩余 SKU；日志缓存里的 processing
+            # 只是最后一次轮询留下的状态，不能继续显示为处理中。
+            for task in tasks:
+                if str(task.get("status") or "") in {"started", "processing"}:
+                    task["status"] = "skipped"
+                    task["status_label"] = order_model._STATUS_LABELS["skipped"]
+                    task["needs_confirm"] = False
+                task["active"] = False
+        else:
+            for task in tasks:
+                task["active"] = False
 
     if order is not None:
         order = deepcopy(order)
@@ -1356,6 +1381,11 @@ def _merge_order_items(
     if order is not None and isinstance(order.get("items"), list):
         order_items = [raw for raw in order["items"] if isinstance(raw, dict)]  # type: ignore[index]
 
+    # 日志可能用 item_id/sku_id 上报同一商品，而订单卡片按 barcode 建行。
+    # 先建立订单标识到卡片 code 的映射，避免别名尚未持久化时追加影子行。
+    order_identity_to_code: Dict[str, str] = {}
+    rows_by_code: Dict[str, Dict[str, object]] = {}
+
     # Start from registered/expanded order items, then include same-task log SKUs.
     if order_items:
         for raw in order_items:
@@ -1386,9 +1416,29 @@ def _merge_order_items(
             if order_task_id and not row.get("parent_task_id"):
                 row["parent_task_id"] = order_task_id
             merged.append(row)
+            rows_by_code[code] = row
+            for key in ("item_id", "sku_id", "barcode", "code"):
+                value = str(raw.get(key) or row.get(key) or "").strip()
+                if value:
+                    order_identity_to_code.setdefault(value, code)
 
     for code, state in states.items():
         if code in seen:
+            continue
+        canonical_code = order_identity_to_code.get(str(code).strip())
+        canonical_row = rows_by_code.get(canonical_code or "")
+        if canonical_row is not None:
+            # 同一商品的日志状态合并到已注册订单行，保留订单行的名称、69码和库位。
+            combined = _merge_item_state(canonical_row, state)
+            for key in (
+                "seq_id", "parent_task_id", "location_code", "status",
+                "status_label", "started_at", "await_at", "ended_at",
+                "elapsed_to_await_seconds", "elapsed_seconds", "duration_seconds",
+                "await_kind", "await_line", "start_line", "end_line",
+                "events", "active", "needs_confirm",
+            ):
+                if key in combined:
+                    canonical_row[key] = combined[key]
             continue
         parent = str(state.get("parent_task_id") or "").strip()
         if allowed_parents and parent and parent not in allowed_parents:
@@ -1554,7 +1604,9 @@ def _build_dashboard_snapshot(tail: int) -> Dict[str, object]:
             "log_tail": tail,
             "error": "",
         }
-    order = active_orders.get_active_order()
+    order = _promote_latest_broker_order(
+        active_orders.get_active_order(), mode, settings.get("feishu") or {},
+    )
     if mode == "prod":
         order, etm_status = _sync_order_from_etm(order, settings)
     payload: Dict[str, object] = {
@@ -1567,6 +1619,7 @@ def _build_dashboard_snapshot(tail: int) -> Dict[str, object]:
         "order_queue": active_orders.order_queue_status(),
         "dashboard_mode": mode,
         "auto_confirm": auto_confirm,
+        "keyboard": {"needs_confirm": False, "confirm_closed": False},
         "etm": etm_status,
         "broker_configured": broker_configured,
     }
@@ -1630,9 +1683,9 @@ def _build_dashboard_snapshot(tail: int) -> Dict[str, object]:
         LOGGER.warning("仪表盘读取机器人日志失败，仅展示 Broker 侧信息：%s", error)
     payload["log_available"] = log_available
     payload["log_error"] = log_error
+    payload["keyboard"] = log_parser.parse_keyboard_wait(raw_logs)
     order = _resolve_active_order(order, raw_logs)
     order = _reconcile_broker_task_id(order, mode)
-    order = _promote_latest_broker_order(order, mode)
     if mode == "prod":
         # After log discovery, try cloud enrich again for order_no / names.
         order, etm_status = _sync_order_from_etm(order, settings)
@@ -1661,7 +1714,6 @@ def _build_dashboard_snapshot(tail: int) -> Dict[str, object]:
         _persist_code_aliases(order, code_aliases)
     if order is None and focus_task_id:
         order = _resolve_active_order(None, raw_logs)
-    _persist_feishu_log_cache(order, raw_logs)
     tasks = _merge_order_items(order, parsed, focus_task_id=focus_task_id)
     # Broker still keyed by registered order task_id when present.
     parent_task_id = ""
@@ -1717,6 +1769,9 @@ def _build_dashboard_snapshot(tail: int) -> Dict[str, object]:
         if corrected_parent and corrected_parent != parent_task_id:
             parent_task_id = corrected_parent
             broker = order_api._fetch_broker_order(parent_task_id, mode)
+    if broker.get("ok") and broker.get("status") == "pending":
+        parsed = log_parser.parse_robot_log_text("")
+        tasks = _merge_order_items(order, parsed)
     # Broker 状态原值直出，不做本地覆盖。
     # 子任务的名称/库位以 Broker 带回的下单信息为准，必须在生命周期与计时
     # 处理之前回填，后续的 focus（大字区）从 tasks 里选，就能自动同源。
@@ -1724,12 +1779,16 @@ def _build_dashboard_snapshot(tail: int) -> Dict[str, object]:
     lifecycle, tasks, aggregate = _apply_order_lifecycle(
         order, parsed, broker, tasks
     )
+    # Timestamp elapsed values after upstream reads, not before network latency.
+    payload["polled_at"] = order_model._ts_to_iso(datetime.now(timezone.utc))
     polled_at_early = str(payload.get("polled_at") or "")
     if not lifecycle.get("ended"):
         log_parser._refresh_live_elapsed(tasks, polled_at_early)
     _persist_item_states(order, tasks)
     if order is not None:
-        order = deepcopy(active_orders.get_active_order() or order)
+        refreshed = active_orders.get_active_order()
+        if refreshed and refreshed.get("task_id") == order.get("task_id"):
+            order = deepcopy(refreshed)
         order["lifecycle"] = lifecycle
         if broker.get("ok") and broker.get("order_no") and not order.get("order_no"):
             order["order_no"] = broker.get("order_no")
@@ -1772,7 +1831,10 @@ def _build_dashboard_snapshot(tail: int) -> Dict[str, object]:
                 str(task.get(key) or "").strip()
                 for key in _ITEM_MATCH_FIELDS
             }
-            if focus_code in identities:
+            status = str(task.get("status") or "")
+            if focus_code in identities and (
+                task.get("active") or status not in {"started", "processing"}
+            ):
                 focus = task
                 break
     if focus is None:
@@ -1927,34 +1989,7 @@ def _build_dashboard_snapshot(tail: int) -> Dict[str, object]:
             "log_tail": tail,
         }
     )
-    # Submit on first human-gate speak (pack/confirm/error/cancel…), not on key.
-    feishu_result: Optional[Dict[str, object]] = None
-    if isinstance(order, dict) and should_submit_on_human_prompt(
-        needs_confirm,
-        bool(parsed.get("human_confirm_seen")),
-        await_kind,
-        order,
-    ):
-        working_order = deepcopy(order)
-        working_order["await_kind"] = await_kind
-        working_order["await_line"] = await_line
-        if isinstance(lifecycle, dict) and lifecycle.get("broker_status"):
-            working_order["broker_status"] = lifecycle.get("broker_status")
-        feishu_result = maybe_submit_feishu_form(
-            working_order,
-            tasks,
-            mode,
-            settings,
-            "human_prompt",
-            _persist_feishu_submit_state,
-            active_orders.get_active_order,
-        )
-        refreshed = active_orders.get_active_order()
-        if isinstance(refreshed, dict):
-            order = refreshed
     payload["order"] = _public_order(order)
-    if feishu_result is not None:
-        payload["feishu"] = feishu_result
     return payload
 
 
@@ -1975,114 +2010,53 @@ def _confirmation_fingerprint(snapshot: Mapping[str, object]) -> str:
     )
 
 
-def _reconcile_pending_confirmation(
-    snapshot: Dict[str, object],
-) -> Dict[str, object]:
-    """Persist a prompt until logs explicitly show that robot execution resumed."""
+def _reconcile_pending_confirmation(snapshot: Dict[str, object]) -> Dict[str, object]:
+    """Persist robot key waits without overwriting order/card state."""
+    state = snapshot.setdefault("keyboard", {"needs_confirm": False, "confirm_closed": False})
+    state["service_running"] = bool(snapshot.get("service_running"))
     with order_store._ACTIVE_ORDER_LOCK:
         order_store._ensure_active_order_loaded()
-        if order_store._ACTIVE_ORDER is None:
+        active = order_store._ACTIVE_ORDER
+        if active is None:
             return snapshot
-        active_task_id = str(order_store._ACTIVE_ORDER.get("task_id") or "").strip()
-        snapshot_order = snapshot.get("order")
-        snapshot_task_id = str(
-            (
-                snapshot_order.get("task_id")
-                if isinstance(snapshot_order, dict)
-                else ""
-            )
-            or snapshot.get("task_id")
-            or ""
-        ).strip()
-        # A concurrent create invalidates this whole refresh. Do not copy an old
-        # prompt onto the newly-created order while the cache generation retries.
-        if active_task_id and snapshot_task_id and active_task_id != snapshot_task_id:
-            return snapshot
-
-        raw_pending = order_store._ACTIVE_ORDER.get("pending_confirm")
-        pending = deepcopy(raw_pending) if isinstance(raw_pending, dict) else None
-        if pending is not None and str(pending.get("task_id") or "").strip() not in {
-            "",
-            active_task_id,
+        if str((snapshot.get("order") or {}).get("task_id") or snapshot.get("task_id") or "") not in {
+            "", str(active.get("task_id") or "")
         }:
-            order_store._ACTIVE_ORDER.pop("pending_confirm", None)
-            order_store._save_active_order_unlocked()
-            pending = None
-
-        if snapshot.get("confirm_closed"):
-            if pending is not None:
-                order_store._ACTIVE_ORDER.pop("pending_confirm", None)
-                order_store._save_active_order_unlocked()
-            snapshot["needs_confirm"] = False
-            snapshot.pop("confirm_fingerprint", None)
             return snapshot
-
-        if snapshot.get("needs_confirm"):
-            current = snapshot.get("current_item")
-            current = current if isinstance(current, dict) else {}
-            status = str(snapshot.get("status") or "await_confirm")
-            if status not in {"await_confirm", "await_error"}:
-                status = (
-                    "await_error"
-                    if str(snapshot.get("await_kind") or "") == "error"
-                    else "await_confirm"
-                )
+        pending = active.get("pending_confirm")
+        pending = pending if isinstance(pending, dict) else None
+        event_at = order_model._parse_ts(str(state.get("event_at") or ""))
+        pending_at = order_model._parse_ts(str((pending or {}).get("at") or ""))
+        stale_event = bool(event_at and pending_at and event_at < pending_at)
+        if state.get("confirm_closed") and not stale_event:
+            if pending:
+                active.pop("pending_confirm", None)
+                order_store._save_active_order_unlocked()
+            return snapshot
+        if state.get("needs_confirm") and not stale_event:
             detected = {
-                "task_id": active_task_id or snapshot_task_id,
-                "status": status,
-                "kind": str(snapshot.get("await_kind") or current.get("await_kind") or ""),
-                "code": str(
-                    snapshot.get("active_code")
-                    or current.get("code")
-                    or snapshot.get("object_hint")
-                    or ""
-                ),
-                "at": snapshot.get("await_at") or current.get("await_at"),
-                "line": str(snapshot.get("await_line") or current.get("await_line") or ""),
-                "fingerprint": _confirmation_fingerprint(snapshot),
+                "task_id": state.get("task_id") or "",
+                "status": state.get("status") or "await_confirm",
+                "kind": state.get("await_kind") or "",
+                "code": state.get("active_code") or "",
+                "at": state.get("await_at"), "line": state.get("await_line") or "",
+                "fingerprint": _confirmation_fingerprint(state),
             }
-            logical_keys = ("task_id", "status", "kind", "code", "line")
-            if isinstance(raw_pending, dict) and all(
-                raw_pending.get(key) == detected.get(key) for key in logical_keys
-            ):
-                pending = deepcopy(raw_pending)
-            else:
-                pending = detected
-            if raw_pending != pending:
-                order_store._ACTIVE_ORDER["pending_confirm"] = deepcopy(pending)
+            if pending != detected:
+                active["pending_confirm"] = detected
                 order_store._save_active_order_unlocked()
-
-        if pending is None:
-            return snapshot
-        active_order = deepcopy(order_store._ACTIVE_ORDER)
-
-    # A log line may temporarily disappear while Docker reconnects or the tail
-    # rolls. Restore only the confirmation-facing fields; keep current service,
-    # Broker, progress, and timing data from this fresh snapshot.
-    snapshot["needs_confirm"] = True
-    snapshot["confirm_closed"] = False
-    snapshot["status"] = str(pending.get("status") or "await_confirm")
-    snapshot["status_label"] = order_model._STATUS_LABELS.get(
-        str(snapshot["status"]), str(snapshot["status"])
-    )
-    snapshot["await_kind"] = str(pending.get("kind") or "")
-    snapshot["task_id"] = str(pending.get("task_id") or active_task_id)
-    snapshot["active_code"] = str(pending.get("code") or "")
-    snapshot["object_hint"] = str(pending.get("code") or "")
-    snapshot["await_at"] = pending.get("at")
-    snapshot["await_line"] = str(pending.get("line") or "")
-    snapshot["confirm_fingerprint"] = str(pending.get("fingerprint") or "")
-    snapshot["dismissed_fingerprint"] = _dismissed_fingerprint_from_order(active_order)
-    if snapshot.get("order") is None:
-        snapshot["order"] = _public_order(active_order)
-    current = snapshot.get("current_item")
-    if not isinstance(current, dict):
-        current = {"code": snapshot["active_code"]}
-        snapshot["current_item"] = current
-    current["await_kind"] = snapshot["await_kind"]
-    current["await_at"] = snapshot["await_at"]
-    current["await_line"] = snapshot["await_line"]
-    current["needs_confirm"] = True
+            pending = detected
+        if pending:
+            state.update(
+                needs_confirm=True, confirm_closed=False,
+                status=pending.get("status") or "await_confirm",
+                task_id=pending.get("task_id") or "",
+                active_code=pending.get("code") or "",
+                await_kind=pending.get("kind") or "",
+                await_at=pending.get("at"), await_line=pending.get("line") or "",
+                confirm_fingerprint=pending.get("fingerprint") or "",
+            )
+        state["dismissed_fingerprint"] = _dismissed_fingerprint_from_order(active)
     return snapshot
 
 
@@ -2095,8 +2069,7 @@ def _refresh_dashboard_snapshot(tail: int) -> Dict[str, object]:
             snapshot = _reconcile_pending_confirmation(
                 _build_dashboard_snapshot(tail)
             )
-            if active_orders.promote_queued_order_if_ready():
-                continue
+            snapshot["feishu"] = feishu_forms.form_status()
             with dashboard_cache._DASHBOARD_CACHE_LOCK:
                 if generation != dashboard_cache._DASHBOARD_CACHE_GENERATION:
                     continue
@@ -2132,7 +2105,7 @@ def get_dashboard_monitor_snapshot(
 
 
 def _dashboard_monitor_delay(snapshot: Optional[Mapping[str, object]]) -> float:
-    if not snapshot or snapshot.get("needs_confirm"):
+    if not snapshot or snapshot.get("needs_confirm") or (snapshot.get("keyboard") or {}).get("needs_confirm"):
         return _DASHBOARD_MONITOR_ACTIVE_SECONDS
     broker = snapshot.get("broker_order")
     broker_status = (
@@ -2258,79 +2231,14 @@ def save_dashboard_settings(
     }
 
 
-def _persist_feishu_submit_state(order: Dict[str, object]) -> None:
-    task_id = str(order.get("task_id") or "").strip()
-    state = order.get("feishu_submit")
-    with order_store._ACTIVE_ORDER_LOCK:
-        order_store._ensure_active_order_loaded()
-        if order_store._ACTIVE_ORDER is None:
-            return
-        if task_id and str(order_store._ACTIVE_ORDER.get("task_id") or "") != task_id:
-            return
-        order_store._ACTIVE_ORDER["feishu_submit"] = deepcopy(state) if isinstance(state, dict) else state
-        order_store._save_active_order_unlocked()
-
-
 def preview_feishu_submission() -> Dict[str, object]:
-    settings = dashboard_settings.load_dashboard_settings()
-    order = active_orders.get_active_order()
-    return preview_feishu_form(
-        order,
-        [],
-        str(settings.get("mode") or dashboard_settings._DEFAULT_DASHBOARD_MODE),
-        settings,
-    )
+    return {"ok": True, **feishu_forms.form_status()}
 
 
 def submit_feishu_manual() -> Dict[str, object]:
-    settings = dashboard_settings.load_dashboard_settings()
-    order = active_orders.get_active_order()
-    if order is None:
-        raise ValueError("当前没有工单，无法提交飞书表单。")
-    working = deepcopy(order)
-    working.pop("feishu_submit", None)
-    with order_store._ACTIVE_ORDER_LOCK:
-        order_store._ensure_active_order_loaded()
-        if order_store._ACTIVE_ORDER is not None and str(order_store._ACTIVE_ORDER.get("task_id") or "") == str(
-            working.get("task_id") or ""
-        ):
-            order_store._ACTIVE_ORDER.pop("feishu_submit", None)
-            order_store._save_active_order_unlocked()
-    from ksq.feishu.submit import clear_feishu_dedupe_key
-
-    clear_feishu_dedupe_key(working)
-    return maybe_submit_feishu_form(
-        working,
-        [],
-        str(settings.get("mode") or dashboard_settings._DEFAULT_DASHBOARD_MODE),
-        settings,
-        "manual",
-        _persist_feishu_submit_state,
-        active_orders.get_active_order,
-    )
+    raise ValueError("请在飞书原表单窗口中填写并提交。")
 
 
-def confirm_and_maybe_submit_feishu() -> Dict[str, object]:
-    """Inject confirm key. Feishu is normally submitted on speak; this is fallback."""
-    settings = dashboard_settings.load_dashboard_settings()
-    pre_order = active_orders.get_active_order()
-    result = keyboard.inject_confirm_key()
-    working_order = deepcopy(pre_order) if isinstance(pre_order, dict) else None
-    if should_submit_on_confirm(working_order, ""):
-        feishu_result = maybe_submit_feishu_form(
-            working_order,
-            [],
-            str(settings.get("mode") or dashboard_settings._DEFAULT_DASHBOARD_MODE),
-            settings,
-            "confirm_fallback",
-            _persist_feishu_submit_state,
-            active_orders.get_active_order,
-        )
-    else:
-        feishu_result = {
-            "ok": False,
-            "skipped": True,
-            "reason": "already_handled_or_no_prompt",
-        }
-    result["feishu"] = feishu_result
-    return result
+def confirm_keyboard() -> Dict[str, object]:
+    """Send the robot key without changing order or Feishu state."""
+    return keyboard.inject_confirm_key()

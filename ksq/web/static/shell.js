@@ -62,8 +62,7 @@
     });
     updateTopbar(name);
     if (name === "arm") {
-      const frame = document.getElementById("arm-frame");
-      if (frame && !frame.getAttribute("src")) frame.src = "/arm/";
+      if (armFrame && !armFrame.getAttribute("src")) loadArm();
     }
     document.querySelectorAll(".sidebar-nav .nav-item").forEach((button) => {
       const active =
@@ -113,10 +112,21 @@
     });
   });
 
-  const armRefresh = document.getElementById("arm-refresh");
-  if (armRefresh) armRefresh.addEventListener("click", () => {
-    document.getElementById("arm-frame").src = "/arm/";
+  const armFrame = document.getElementById("arm-frame");
+  const armLoading = document.getElementById("arm-loading");
+  function loadArm() {
+    if (!armFrame) return;
+    if (armLoading) armLoading.hidden = false;
+    armFrame.setAttribute("aria-busy", "true");
+    armFrame.src = "/arm/";
+  }
+  if (armFrame) armFrame.addEventListener("load", () => {
+    if (!armFrame.getAttribute("src") || armFrame.contentDocument?.URL === "about:blank") return;
+    if (armLoading) armLoading.hidden = true;
+    armFrame.setAttribute("aria-busy", "false");
   });
+  const armRefresh = document.getElementById("arm-refresh");
+  if (armRefresh) armRefresh.addEventListener("click", loadArm);
 
   // 侧边栏折叠：展开为图标+文字，折叠为纯图标窄栏，状态本地持久化
   const SIDEBAR_COLLAPSE_KEY = "ksq-sidebar-collapsed";

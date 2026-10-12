@@ -8,11 +8,15 @@ dashboard to the previous order's page forever).
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 from ksq.dashboard import parsing as log_parser
 from ksq.order import model as order_model
+from ksq.order import store as order_store
 
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from ksq.dashboard import service as dashboard_api
 
@@ -41,6 +45,18 @@ LOG_B_START = "\n".join(
     [
         f"2026-08-17T10:16:35.000Z MedicinePickUpTaskItem(code={CODE_1}, task_id={TASK_B}, seq_id=1-{TASK_B}-{CODE_1}-1)",
         f"2026-08-17T10:16:36.000Z start process object{{'code': '{CODE_1}', 'location_code': '6065'}}",
+    ]
+)
+
+
+LOG_TASK_SCOPE = "\n".join(
+    [
+        f"2026-08-17T10:16:35.000Z Locked task {TASK_A} successfully, business_mode_code: MODE_PICK, start processing.",
+        f"2026-08-17T10:16:35.100Z task id: {TASK_A}, task item: [SubTaskDetail(barcode='{CODE_1}', item_id='1')]",
+        "2026-08-17T10:16:35.150Z start process object {'code': 'P000070037', 'barcode': '"
+        + CODE_1
+        + "', 'location_code': '00280603'}",
+        f"2026-08-17T10:16:35.200Z item P000070037 process start time: 1786961795.2",
     ]
 )
 
@@ -131,8 +147,41 @@ class MatchLogTaskTests(unittest.TestCase):
         self.assertEqual(resolved["task_id"], TASK_B)
         self.assertEqual(resolved["order_no"], "TEST20260817101628822FJ")
 
+    def test_robot_logs_do_not_change_the_selected_broker_order(self) -> None:
+        current = _order_b()
+        current["task_id"] = TASK_A
+        current["registered_at"] = "2026-08-17T10:00:00Z"
+        queued = _order_b()
+        queued["task_id"] = TASK_B
+        queued["registered_at"] = "2026-08-17T10:16:00Z"
+        current["queued_orders"] = [queued]
+        logs = LOG_B_START
+        with (
+            patch.object(order_store, "_ACTIVE_ORDER", deepcopy(current)),
+            patch.object(order_store, "_save_active_order_unlocked"),
+        ):
+            resolved = dashboard_api._resolve_active_order(current, logs)
+
+        self.assertEqual(resolved["task_id"], TASK_A)
+        self.assertEqual(resolved["queued_orders"], [queued])
+
 
 class ParseWithStaleTasksTests(unittest.TestCase):
+    def test_task_scope_blocks_unscoped_new_log_lines(self) -> None:
+        order = _order_b()
+        latest, codes_by_task, last_seen = log_parser._discover_log_tasks(LOG_TASK_SCOPE)
+        stale = log_parser._stale_log_tasks(order, last_seen)
+        parsed = log_parser.parse_robot_log_text(
+            LOG_TASK_SCOPE,
+            focus_task_id=TASK_B,
+            extra_allowed_codes={CODE_1},
+            stale_task_ids=stale,
+        )
+        self.assertEqual(latest, TASK_A)
+        self.assertIn(CODE_1, codes_by_task[TASK_A])
+        self.assertIn(TASK_A, stale)
+        self.assertEqual(parsed.get("item_states"), {})
+
     def test_stale_execution_does_not_poison_new_order(self) -> None:
         parsed = log_parser.parse_robot_log_text(
             LOG_A,
@@ -172,6 +221,22 @@ class ParseWithStaleTasksTests(unittest.TestCase):
 
 
 class MergeItemStateTests(unittest.TestCase):
+    def test_reassigned_processing_state_is_pruned(self) -> None:
+        order = _order_b()
+        order["registered_at"] = "2026-08-17T10:20:00Z"
+        order["item_states"] = {
+            CODE_1: {
+                "code": CODE_1,
+                "status": "processing",
+                "parent_task_id": TASK_B,
+                "started_at": "2026-08-17T10:16:00Z",
+            }
+        }
+        with patch.object(order_store, "_ACTIVE_ORDER", deepcopy(order)):
+            with patch.object(order_store, "_save_active_order_unlocked"):
+                dashboard_api._prune_stale_item_states(order, frozenset({TASK_A}))
+        self.assertEqual(order["item_states"], {})
+
     def test_new_execution_overrides_remembered_terminal(self) -> None:
         remembered = {
             "code": CODE_1,
@@ -219,6 +284,24 @@ class MergeItemStateTests(unittest.TestCase):
         }
         merged = dashboard_api._merge_item_state(remembered, fresh)
         self.assertEqual(merged["status"], "success")
+
+
+class ItemTimingTests(unittest.TestCase):
+    def test_error_wait_timer_freezes_at_prompt(self) -> None:
+        start = datetime(2026, 8, 17, 10, 0, tzinfo=timezone.utc)
+        await_at = datetime(2026, 8, 17, 10, 0, 10, tzinfo=timezone.utc)
+        item = {
+            "code": CODE_1,
+            "status": "await_error",
+            "_started_dt": start,
+            "_await_dt": await_at,
+        }
+        log_parser._finalize_item_timing(
+            item, datetime(2026, 8, 17, 10, 1, tzinfo=timezone.utc)
+        )
+        self.assertEqual(item["elapsed_seconds"], 10.0)
+        log_parser._refresh_live_elapsed([item], "2026-08-17T10:02:00Z")
+        self.assertEqual(item["elapsed_seconds"], 10.0)
 
 
 # 新版机器人日志格式：code 是 sku_id、task_id 是 ETM 侧 id，
@@ -283,6 +366,23 @@ class NewLogFormatTests(unittest.TestCase):
 
 
 class KeyboardPromptCompatibilityTests(unittest.TestCase):
+    def test_error_voice_prompts_trigger_item_and_order_confirmation(self) -> None:
+        for prefix in ("", LOG_B_START + "\n"):
+            for prompt in ("报错，请求人工处理", "料框异常，请求人工处理"):
+                with self.subTest(active_item=bool(prefix), prompt=prompt):
+                    line = "2026-08-17T10:16:40.000Z [INFO] 正在播放: " + prompt
+                    logs = prefix + line
+                    for parse in (log_parser.parse_robot_log_text, log_parser.parse_keyboard_wait):
+                        result = parse(logs)
+                        self.assertTrue(result["needs_confirm"])
+                        self.assertEqual(result["status"], "await_error")
+                        self.assertEqual(result["await_kind"], "error")
+                        self.assertEqual(result["await_line"], line.split("Z ", 1)[1])
+                        waiting = parse(logs + "\n2026-08-17T10:16:41.000Z 等待按下目标按键 1")
+                        self.assertEqual(waiting["await_kind"], "error")
+                        resumed = parse(logs + "\n2026-08-17T10:17:00.000Z 确认成功，继续操作")
+                        self.assertFalse(resumed["needs_confirm"])
+
     def test_target_key_prompt_variants_are_detected(self) -> None:
         for prompt in (
             "程序暂停，请按下指定按键 1 后继续",

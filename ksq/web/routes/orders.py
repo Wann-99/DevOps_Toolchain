@@ -9,7 +9,11 @@ from ksq.order import active as active_orders
 from ksq.order import service as order_api
 from ksq.order.broker import OrderBrokerError
 from ksq.web import auth
-from ksq.web.request_utils import _drain_request_body, read_json_body
+from ksq.web.request_utils import (
+    _drain_request_body,
+    _request_content_length,
+    read_json_body,
+)
 
 
 def handle_get(handler, session) -> bool:
@@ -178,13 +182,40 @@ def handle_post(handler, session) -> bool:
     parsed = urlparse(handler.path)
     path = parsed.path
     if path == "/api/order/preflight":
-        _drain_request_body(handler)
-        try:
-            order_api.ensure_order_creation_allowed()
-        except order_api.OrderQueueConflict as error:
-            handler._send_json(HTTPStatus.CONFLICT, error.payload())
+        # 兼容旧客户端只用这个接口检查队列的空请求。
+        if _request_content_length(handler) == 0:
+            try:
+                order_api.ensure_order_creation_allowed()
+            except order_api.OrderQueueConflict as error:
+                handler._send_json(HTTPStatus.CONFLICT, error.payload())
+                return True
+            handler._send_json(HTTPStatus.OK, {"ok": True})
             return True
-        handler._send_json(HTTPStatus.OK, {"ok": True})
+        payload = read_json_body(handler)
+        unavailable_items = order_api.unavailable_order_items(payload.get("items"))
+        try:
+            result = order_api.preflight_order(payload)
+        except order_api.ProductionOrderWriteForbidden as error:
+            handler._send_json(HTTPStatus.FORBIDDEN, {"error": str(error)})
+            return True
+        except order_api.OrderQueueConflict as error:
+            handler._send_json(HTTPStatus.CONFLICT, {
+                **error.payload(), "unavailable_items": unavailable_items,
+            })
+            return True
+        except order_api.OrderPayloadError as error:
+            handler._send_json(HTTPStatus.BAD_REQUEST, {
+                "error": str(error),
+                "missing_fields": error.missing_fields,
+                "unavailable_items": unavailable_items,
+            })
+            return True
+        except ValueError as error:
+            handler._send_json(HTTPStatus.BAD_REQUEST, {
+                "error": str(error), "unavailable_items": unavailable_items,
+            })
+            return True
+        handler._send_json(HTTPStatus.OK, result)
         return True
     if path == "/api/order/token":
         payload = {}
@@ -214,6 +245,9 @@ def handle_post(handler, session) -> bool:
             status, data, body, order_session = (
                 order_api.create_registered_order(payload, "order")
             )
+        except order_api.ProductionOrderWriteForbidden as error:
+            handler._send_json(HTTPStatus.FORBIDDEN, {"error": str(error)})
+            return True
         except order_api.OrderQueueConflict as error:
             handler._send_json(HTTPStatus.CONFLICT, {
                 **error.payload(), "unavailable_items": unavailable_items,
@@ -224,6 +258,13 @@ def handle_post(handler, session) -> bool:
                 HTTPStatus.BAD_GATEWAY,
                 {**order_api.broker_error_payload(error), "unavailable_items": unavailable_items},
             )
+            return True
+        except order_api.OrderPayloadError as error:
+            handler._send_json(HTTPStatus.BAD_REQUEST, {
+                "error": str(error),
+                "missing_fields": error.missing_fields,
+                "unavailable_items": unavailable_items,
+            })
             return True
         except ValueError as error:
             handler._send_json(HTTPStatus.BAD_REQUEST, {

@@ -26,6 +26,8 @@ class ShelfEntry:
     out_item_id: str
     sku_code: str = ""
     customer_location_code: str = ""
+    manufacturer: str = ""
+    specifications: str = ""
 
 
 class ShelfParseResult(NamedTuple):

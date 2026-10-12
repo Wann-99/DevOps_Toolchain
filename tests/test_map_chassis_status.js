@@ -237,11 +237,11 @@ async function check() {
   assert.equal(rows.children.length, 0);
   assert(reasons.hidden);
 
-  c.renderChassisPose({ x: 1.23456, y: -2.98765, yaw: Math.PI / 2 }, "snapshot");
-  assert.deepEqual(["x", "y", "yaw"].map((key) => p.get("map-chassis-pose-" + key).textContent), ["1.235", "-2.988", "90.000"]);
-  c.reply = async () => ({ x: 0, y: 0, yaw: 0 });
+  c.renderChassisPose({ x: 1.23456, y: -2.98765, z: 0.45678, yaw: Math.PI / 2 }, "snapshot");
+  assert.deepEqual(["x", "y", "z", "yaw"].map((key) => p.get("map-chassis-pose-" + key).textContent), ["1.235", "-2.988", "0.457", "90.000"]);
+  c.reply = async () => ({ x: 0, y: 0, z: -0.12, yaw: 0 });
   await p.get("map-btn-get-pose").onclick();
-  assert.deepEqual(["x", "y", "yaw"].map((key) => p.get("map-chassis-pose-" + key).textContent), ["0.000", "0.000", "0.000"]);
+  assert.deepEqual(["x", "y", "z", "yaw"].map((key) => p.get("map-chassis-pose-" + key).textContent), ["0.000", "0.000", "-0.120", "0.000"]);
   assert.match(p.get("map-chassis-pose-status").textContent, /获取时间/);
   assert.deepEqual(c.robot, { x: 99, y: 98, yaw: 1, hasFix: true }, "Reading pose must not overwrite or teleport the robot");
   for (const key of ["x", "y", "yaw"]) {

@@ -25,15 +25,11 @@ def set_active_order(
 
     with order_store._ACTIVE_ORDER_LOCK:
         order_store._ensure_active_order_loaded()
-        queued = _queued_orders_unlocked()
-        for waiting in queued:
-            if waiting.get("task_id") == order.get("task_id"):
-                # ETM may identify the waiting task as current before the next poll.
-                order = deepcopy(waiting)
-                break
-        remaining = [item for item in queued if item.get("task_id") != order.get("task_id")]
-        if remaining:
-            order["queued_orders"] = remaining
+        # Keyboard waits belong to the robot, not to the selected display order.
+        previous = order_store._ACTIVE_ORDER or {}
+        if previous.get("pending_confirm"):
+            order["pending_confirm"] = deepcopy(previous["pending_confirm"])
+        order["ui"] = deepcopy(previous.get("ui") or order["ui"])
         order_store._ACTIVE_ORDER_LOADED = True
         order_store._ACTIVE_ORDER = order
         order_store._save_active_order_unlocked()
@@ -58,6 +54,9 @@ def _promote_queued_order_unlocked() -> bool:
     ):
         return False
     promoted = deepcopy(queued[0])
+    previous_ui = order_store._ACTIVE_ORDER.get("ui") or {}
+    if "feishu_forms" in previous_ui:
+        promoted.setdefault("ui", {})["feishu_forms"] = deepcopy(previous_ui["feishu_forms"])
     if len(queued) > 1:
         promoted["queued_orders"] = deepcopy(queued[1:])
     else:

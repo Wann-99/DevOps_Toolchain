@@ -237,6 +237,8 @@ def _order_lines(item_id: str, entries: tuple[ShelfEntry, ...]) -> List[Dict[str
                 "sku_id": sku_id,
                 "location_code": entry.location,
                 "customer_location_code": entry.customer_location_code,
+                "manufacturer": entry.manufacturer,
+                "specifications": entry.specifications,
                 "name": entry.name if entry.name != "未命名" else "",
                 "shelf_attribute": entry.shelf_attribute or "",
                 "baffle_height": entry.baffle_height or "",

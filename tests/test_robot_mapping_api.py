@@ -39,6 +39,7 @@ class MappingTests(unittest.TestCase):
         self.mapping_enabled = False
         self.loop_enabled = True
         self.floors = [{"floor": "1F"}]
+        self.current_floor = {"building": "药房", "floor": "1F"}
         self.calls = []
         self.raw_calls = []
         self.raw = b"example-stcm-from-firmware"
@@ -72,6 +73,8 @@ class MappingTests(unittest.TestCase):
             return 200, {"state": {"status": 4}}
         if path == "/api/multi-floor/map/v1/floors":
             return 200, self.floors
+        if path == "/api/multi-floor/map/v1/floors/:current":
+            return 200, self.current_floor
         if path == "/api/core/motion/v1/action-factories":
             return 200, self.factories
         if path.startswith("/api/core/system/v1/parameter?param="):
@@ -98,6 +101,44 @@ class MappingTests(unittest.TestCase):
         self.factories = [{"action_name": mapping._MOVE_ACTION}]
         mapping._TELEOP_CAPABILITIES.clear()
         return self.execute("drive-start", linear_speed=0.2, angular_speed=0.3)["drive_token"]
+
+    def test_default_and_legacy_map_names_use_current_chassis_floor(self):
+        for persisted in (False, True):
+            with self.subTest(persisted=persisted):
+                if persisted:
+                    mapping._save_state(self.base, mapping._load_state(self.base))
+                self.current_floor = {"building": "药房", "floor": "1F"}
+                self.assertEqual(mapping.get_status(self.base)["name"], "药房 / 1F")
+                self.current_floor = {"floor": "2F"}
+                self.assertEqual(mapping.get_status(self.base)["name"], "2F")
+        self.assertTrue(all(method == "GET" for method, *_ in self.calls))
+        self.assertEqual(self.raw_calls, [])
+
+    def test_saved_map_name_takes_precedence_over_chassis_floor(self):
+        self.assertEqual(self.execute("rename", name="实际地图")["name"], "实际地图")
+        self.assertEqual(mapping.get_status(self.base)["name"], "实际地图")
+        self.assertFalse(any(path.endswith("/floors/:current") for _, path, *_ in self.calls))
+
+    def test_unavailable_map_name_does_not_hide_mapping_status(self):
+        for body in (None, {}, [], {"floor": 1}, {"floor": "  "}, {"building": "药房"}):
+            with self.subTest(body=body):
+                self.current_floor = body
+                status = mapping.get_status(self.base)
+                self.assertEqual(status["name"], "")
+                self.assertFalse(status["mapping_enabled"])
+                self.assertEqual(status["phase"], "idle")
+        original = self.request
+
+        def unavailable(method, path, payload=None, **kwargs):
+            if path.endswith("/floors/:current"):
+                raise robot.RobotApiError("not supported", 404)
+            return original(method, path, payload, **kwargs)
+
+        with patch.object(robot, "_request", side_effect=unavailable):
+            status = mapping.get_status(self.base)
+        self.assertEqual(status["name"], "")
+        self.assertFalse(status["mapping_enabled"])
+        self.assertEqual(status["phase"], "idle")
 
     def test_drive_prepares_limits_without_moving_and_pulses_without_local_reads(self):
         token = self.prepare_drive()
@@ -519,9 +560,24 @@ class MappingTests(unittest.TestCase):
         imported = b"stcm-import-data"
         state = self.execute("import", filename="map.stcm", content_base64=base64.b64encode(imported).decode(), confirm=True)
         self.assertEqual(self.raw, imported)
+        self.assertEqual(state["name"], "map")
+        self.assertEqual(mapping.get_status(self.base)["name"], "map")
         self.assertTrue(state["dirty"])
         self.assertEqual([call[0] for call in self.raw_calls], ["GET", "PUT"])
         self.assertFalse(any(path.endswith("stcm/:save") for _, path, *_ in self.calls))
+
+    def test_import_name_preserves_explicit_names_and_accepts_long_filenames(self):
+        for filename, values, expected in (
+            ("药房.STCM", {}, "药房"),
+            ("a" * 100 + ".stcm", {}, "a" * 64),
+            ("药房.stcm", {"name": "手动命名"}, "手动命名"),
+        ):
+            with self.subTest(filename=filename, values=values):
+                status = self.execute(
+                    "import", filename=filename, content_base64="c3RjbQ==",
+                    confirm=True, backup=False, **values,
+                )
+                self.assertEqual(status["name"], expected)
 
     def test_upload_requires_exactly_one_known_floor_before_persistence(self):
         for floors in ([], {}, [{"floor": "1F"}, {"floor": "2F"}], [{}], [{"floor": ""}]):

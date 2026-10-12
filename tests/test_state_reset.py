@@ -7,7 +7,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ksq import state_reset
-from ksq.order.config import DEFAULT_ORDER_CONFIG
 
 
 # ---------------------------------------------------------------------------
@@ -58,246 +57,36 @@ class GetAppVersionTests(unittest.TestCase):
         self.assertEqual(state_reset.get_app_version(), "dev")
 
 
-# ---------------------------------------------------------------------------
-# reset_state_if_version_changed
-# ---------------------------------------------------------------------------
+class UpgradePreservesStateTests(unittest.TestCase):
+    def test_version_changes_and_first_start_preserve_existing_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "dashboard_settings.json"
+            files = [root / name for name in ("test_order_state.json", "dashboard_active_order.json",
+                                              "order_config.json", "order_config.prod.json", "users.json")]
+            for path in files:
+                path.write_bytes(b'{"configured": true, "value": "keep-me"}\n')
+            original = {path: path.read_bytes() for path in files}
+            for marker in (None, "v1.0.0", "v2.0.0"):
+                payload = {"mode": "prod", "feishu": {"enabled": True}}
+                if marker:
+                    payload["_app_version_marker"] = marker
+                settings.write_text(json.dumps(payload))
+                with patch.object(state_reset, "DASHBOARD_SETTINGS_FILE", settings), patch.object(state_reset, "get_app_version", return_value="v2.0.0"):
+                    changed = state_reset.reset_state_if_version_changed()
+                self.assertEqual(changed, marker != "v2.0.0")
+                self.assertEqual({path: path.read_bytes() for path in files}, original)
+                self.assertEqual(json.loads(settings.read_text()), {**payload, "_app_version_marker": "v2.0.0"})
+            self.assertFalse((root / ".backup").exists())
 
-
-class ResetStateIfVersionChangedTests(unittest.TestCase):
-    """Tests for :func:`ksq.state_reset.reset_state_if_version_changed`."""
-
-    def setUp(self) -> None:
-        self._tmpdir = tempfile.TemporaryDirectory()
-        self.tmp = Path(self._tmpdir.name)
-
-        self.settings_file = self.tmp / "dashboard_settings.json"
-        self.test_order_file = self.tmp / "test_order_state.json"
-        self.active_order_file = self.tmp / "dashboard_active_order.json"
-        self.order_config_file = self.tmp / "order_config.json"
-        self.order_config_prod_file = self.tmp / "order_config.prod.json"
-        self.build_dir = self.tmp / "build"
-        self.build_dir.mkdir()
-
-        self.reset_files = (
-            self.test_order_file,
-            self.active_order_file,
-            self.order_config_file,
-            self.order_config_prod_file,
-        )
-
-        self.patches = [
-            patch("ksq.state_reset.DASHBOARD_SETTINGS_FILE", self.settings_file),
-            patch("ksq.state_reset.TEST_ORDER_STATE_FILE", self.test_order_file),
-            patch(
-                "ksq.state_reset.DASHBOARD_ACTIVE_ORDER_FILE",
-                self.active_order_file,
-            ),
-            patch("ksq.state_reset.ORDER_CONFIG_FILE", self.order_config_file),
-            patch(
-                "ksq.state_reset.ORDER_CONFIG_PROD_FILE",
-                self.order_config_prod_file,
-            ),
-            patch("ksq.state_reset._RESET_FILES", self.reset_files),
-            patch("ksq.state_reset.SOURCE_APP_DIRECTORY", self.build_dir),
-            patch("ksq.state_reset.APP_VERSION", "dev"),
-        ]
-        for p in self.patches:
-            p.start()
-
-    def tearDown(self) -> None:
-        for p in self.patches:
-            p.stop()
-        self._tmpdir.cleanup()
-
-    # -- helpers --
-
-    def _write_json(self, path: Path, data: dict) -> None:
-        path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-
-    def _read_json(self, path: Path) -> dict:
-        return json.loads(path.read_text(encoding="utf-8"))
-
-    def _seed_stale_state(self) -> None:
-        """Populate the four reset-target files with recognisable stale data."""
-        self._write_json(self.test_order_file, {"stale": "test_order"})
-        self._write_json(self.active_order_file, {"stale": "active_order"})
-        self._write_json(
-            self.order_config_file,
-            {"server": "https://old.example.com", "client_id": "old"},
-        )
-        self._write_json(
-            self.order_config_prod_file,
-            {"server": "https://old.prod.example.com"},
-        )
-
-    def _seed_settings(self, marker: str | None = None) -> None:
-        data: dict[str, object] = {
-            "keyboard_device": "/dev/input/event3",
-            "mode": "prod",
-            "etm_base_url": "http://10.0.0.1:12005",
-            "auto_confirm": True,
-            "feishu": {"enabled": True, "site": "test_site"},
-        }
-        if marker is not None:
-            data["_app_version_marker"] = marker
-        self._write_json(self.settings_file, data)
-
-    # -- required test cases --
-
-    def test_version_change_triggers_reset(self) -> None:
-        """Version change → reset 4 files, preserve settings, backup, marker."""
-        self._seed_stale_state()
-        self._seed_settings(marker="v1.0.0")
-
-        with patch("ksq.state_reset.get_app_version", return_value="v2.0.0"):
-            result = state_reset.reset_state_if_version_changed()
-
-        self.assertTrue(result)
-
-        # Four files reset to clean defaults.
-        self.assertEqual(self._read_json(self.test_order_file), {})
-        self.assertEqual(self._read_json(self.active_order_file), {})
-        self.assertEqual(
-            self._read_json(self.order_config_file), DEFAULT_ORDER_CONFIG
-        )
-        self.assertEqual(
-            self._read_json(self.order_config_prod_file), DEFAULT_ORDER_CONFIG
-        )
-
-        # dashboard_settings preserved; marker updated.
-        settings = self._read_json(self.settings_file)
-        self.assertEqual(settings["keyboard_device"], "/dev/input/event3")
-        self.assertEqual(settings["mode"], "prod")
-        self.assertEqual(settings["feishu"]["enabled"], True)
-        self.assertEqual(settings["_app_version_marker"], "v2.0.0")
-
-        # Backup directory created with copies of the 4 original files.
-        backup_dirs = list((self.tmp / ".backup").iterdir())
-        self.assertEqual(len(backup_dirs), 1)
-        backup_names = {f.name for f in backup_dirs[0].iterdir()}
-        self.assertEqual(
-            backup_names,
-            {
-                "test_order_state.json",
-                "dashboard_active_order.json",
-                "order_config.json",
-                "order_config.prod.json",
-            },
-        )
-        # Backup content matches the stale data.
-        backed_up = json.loads(
-            (backup_dirs[0] / "test_order_state.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual(backed_up, {"stale": "test_order"})
-
-    def test_version_same_skips_reset(self) -> None:
-        """Version unchanged → no reset, no backup."""
-        self._seed_stale_state()
-        self._seed_settings(marker="v2.0.0")
-
-        with patch("ksq.state_reset.get_app_version", return_value="v2.0.0"):
-            result = state_reset.reset_state_if_version_changed()
-
-        self.assertFalse(result)
-        # Files unchanged.
-        self.assertEqual(
-            self._read_json(self.test_order_file), {"stale": "test_order"}
-        )
-        self.assertEqual(
-            self._read_json(self.active_order_file), {"stale": "active_order"}
-        )
-        # No backup created.
-        self.assertFalse((self.tmp / ".backup").exists())
-
-    def test_new_deployment_no_marker_triggers_reset(self) -> None:
-        """Missing marker (new deployment) → reset and set marker."""
-        self._seed_stale_state()
-        self._seed_settings(marker=None)
-
-        with patch("ksq.state_reset.get_app_version", return_value="v1.0.0"):
-            result = state_reset.reset_state_if_version_changed()
-
-        self.assertTrue(result)
-        # Four files reset.
-        self.assertEqual(self._read_json(self.test_order_file), {})
-        self.assertEqual(self._read_json(self.active_order_file), {})
-        # Marker set; other settings preserved.
-        settings = self._read_json(self.settings_file)
-        self.assertEqual(settings["_app_version_marker"], "v1.0.0")
-        self.assertEqual(settings["keyboard_device"], "/dev/input/event3")
-
-    def test_dashboard_settings_content_preserved_except_marker(self) -> None:
-        """All dashboard_settings fields (except marker) remain untouched."""
-        self._seed_stale_state()
-        original: dict[str, object] = {
-            "keyboard_device": "/dev/input/event5",
-            "mode": "test",
-            "etm_base_url": "http://192.168.1.1:12005",
-            "auto_confirm": True,
-            "feishu": {"enabled": False, "site": "abc"},
-            "_app_version_marker": "v1.0.0",
-        }
-        self._write_json(self.settings_file, original)
-
-        with patch("ksq.state_reset.get_app_version", return_value="v2.0.0"):
-            state_reset.reset_state_if_version_changed()
-
-        settings = self._read_json(self.settings_file)
-        for key in (
-            "keyboard_device",
-            "mode",
-            "etm_base_url",
-            "auto_confirm",
-            "feishu",
-        ):
-            self.assertEqual(settings[key], original[key])
-        self.assertEqual(settings["_app_version_marker"], "v2.0.0")
-
-    def test_exception_does_not_block_startup(self) -> None:
-        """Any exception is swallowed; startup is never blocked."""
-        with patch(
-            "ksq.state_reset.get_app_version",
-            side_effect=RuntimeError("simulated failure"),
-        ):
-            result = state_reset.reset_state_if_version_changed()
-
-        self.assertFalse(result)
-
-    def test_reset_then_restart_does_not_reset_again(self) -> None:
-        """After a reset, a second call with the same version skips."""
-        self._seed_stale_state()
-        self._seed_settings(marker="v1.0.0")
-
-        with patch("ksq.state_reset.get_app_version", return_value="v2.0.0"):
-            result1 = state_reset.reset_state_if_version_changed()
-        self.assertTrue(result1)
-
-        # Re-introduce stale data to prove it is NOT reset on the second call.
-        self._seed_stale_state()
-
-        with patch("ksq.state_reset.get_app_version", return_value="v2.0.0"):
-            result2 = state_reset.reset_state_if_version_changed()
-        self.assertFalse(result2)
-
-        # Stale data remains (not reset).
-        self.assertEqual(
-            self._read_json(self.test_order_file), {"stale": "test_order"}
-        )
-
-    def test_missing_settings_file_treated_as_new_deployment(self) -> None:
-        """No dashboard_settings.json → reset and create file with marker."""
-        self._seed_stale_state()
-        # Deliberately do NOT create the settings file.
-
-        with patch("ksq.state_reset.get_app_version", return_value="v1.2.3"):
-            result = state_reset.reset_state_if_version_changed()
-
-        self.assertTrue(result)
-        settings = self._read_json(self.settings_file)
-        self.assertEqual(settings.get("_app_version_marker"), "v1.2.3")
+    def test_invalid_settings_are_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = Path(temporary) / "dashboard_settings.json"
+            for original in (b'{broken', b'[]'):
+                settings.write_bytes(original)
+                with patch.object(state_reset, "DASHBOARD_SETTINGS_FILE", settings), patch.object(state_reset, "get_app_version", return_value="v2.0.0"), patch.object(state_reset.LOGGER, "exception"):
+                    self.assertFalse(state_reset.reset_state_if_version_changed())
+                self.assertEqual(settings.read_bytes(), original)
 
 
 # ---------------------------------------------------------------------------

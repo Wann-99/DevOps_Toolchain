@@ -4,13 +4,32 @@ from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, FastAPI
 from starlette.concurrency import run_in_threadpool
+from starlette.responses import JSONResponse
 
+from ksq import upgrade
 from ksq.dashboard import service as dashboard
 from ksq.data import storage
 from ksq.robot import logs as robot_logs
 from ksq.web import files_api
 from ksq.web.asgi import dispatch
-from ksq.web.routes import data, dashboard as dashboard_routes, logs, map as map_routes, mapping, orders, test_orders
+from ksq.web.routes import data, dashboard as dashboard_routes, logs, map as map_routes, mapping, orders, test_orders, upgrade as upgrade_routes
+
+
+class UpgradeGuard:
+    """Keep streaming writes counted until their entire ASGI response completes."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (scope["type"] == "http" and scope["method"] in {"POST", "PUT", "PATCH", "DELETE"}
+                and not scope["path"].startswith(("/api/auth/", "/api/upgrade/"))):
+            try:
+                with upgrade.writing():
+                    await self.app(scope, receive, send)
+            except upgrade.UpgradeBusy as error:
+                await JSONResponse({"error": str(error)}, status_code=503)(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
 
 
 @asynccontextmanager
@@ -35,11 +54,13 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
+    app.add_middleware(UpgradeGuard)
     from ksq.web.routes.arm import router as arm_router
     app.include_router(arm_router)
     for name, module in (
         ("orders", orders), ("dashboard", dashboard_routes), ("data", data),
         ("logs", logs), ("test-orders", test_orders), ("mapping", mapping), ("map", map_routes),
+        ("upgrade", upgrade_routes),
     ):
         router = APIRouter(tags=[name])
         for method, paths in module.ROUTES.items():

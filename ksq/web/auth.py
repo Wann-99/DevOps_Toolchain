@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from http.cookiejar import CookieJar
 import json
 import secrets
 import threading
@@ -202,6 +203,32 @@ def token_from_cookie(header: str) -> str:
 
 def session_from_cookie(header: str) -> Optional[Dict[str, object]]:
     return get_session(token_from_cookie(header))
+
+
+def arm_session_token(token: str) -> str:
+    if get_session(token) is None:
+        return ""
+    with _LOCK:
+        session = _SESSIONS.get(token)
+        if session is None:
+            return ""
+        if "arm_token" not in session:
+            session.update(arm_token=secrets.token_urlsafe(32), arm_cookies=CookieJar(), arm_storage={})
+        return str(session["arm_token"])
+
+
+def session_from_arm_token(token: str) -> Optional[Dict[str, object]]:
+    if len(token) != 43 or not token.isascii():
+        return None
+    # ponytail: scan active sessions; add an index only if session volume warrants it.
+    with _LOCK:
+        now = time.time()
+        for key, session in list(_SESSIONS.items()):
+            if float(session["expires"]) < now:
+                _SESSIONS.pop(key)
+        owner = next((key for key, session in _SESSIONS.items()
+                      if hmac.compare_digest(str(session.get("arm_token", "")), token)), "")
+    return get_session(owner)
 
 
 def session_cookie_header(token: str) -> str:

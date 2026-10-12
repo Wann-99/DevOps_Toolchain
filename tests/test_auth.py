@@ -221,6 +221,35 @@ class AuthRouteTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(data["ok"])
 
+    def test_viewer_can_open_and_dismiss_native_form_without_receiving_secrets(self) -> None:
+        from ksq.feishu import forms
+        from ksq.order import store
+        form = {"id": "form", "name": "原表单", "url": "https://example.feishu.cn/share/base/form/shrExample"}
+        pending = {"id": "test:task", "task_id": "task", "order_no": "ORDER", "form": form}
+        order = {"ui": {"feishu_forms": {"mode": "test", "pending": [pending]}}}
+        with (
+            patch.object(store, "_ACTIVE_ORDER", order),
+            patch.object(store, "_ACTIVE_ORDER_LOADED", True),
+            patch.object(store, "_save_active_order_unlocked") as save,
+            patch.object(forms.settings, "load_dashboard_settings", return_value={
+                "mode": "test", "feishu": {"enabled": True, "forms": [form], "selected_form": "form",
+                                           "app_secret": "secret-placeholder", "ai": {"api_key": "key-placeholder"}},
+            }),
+        ):
+            status, data = self._request("GET", "/api/dashboard/feishu/preview", auth.ROLE_VIEWER)
+            self.assertEqual(status, 200)
+            self.assertEqual(set(data), {"ok", "enabled", "form", "pending"})
+            self.assertEqual(data["form"], form)
+            self.assertNotIn("placeholder", json.dumps(data))
+            status, _ = self._request("POST", "/api/dashboard/feishu/dismiss", None, {"id": "test:task"})
+            self.assertEqual(status, 401)
+            save.assert_not_called()
+            status, data = self._request("POST", "/api/dashboard/feishu/dismiss", auth.ROLE_VIEWER, {"id": "test:task"})
+            self.assertEqual(status, 200)
+            self.assertTrue(data["ok"])
+            self.assertEqual(forms.form_status()["pending"], [])
+            save.assert_called_once()
+
     def test_admin_passes_role_gate(self) -> None:
         with patch.object(
             active_orders, "set_active_order", return_value={"task_id": "t"}

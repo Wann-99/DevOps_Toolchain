@@ -17,6 +17,8 @@ MERGE_CONFLICT_FIELDS = (
     ("customer_location_code", "客户库位"),
     ("shelf_attribute", "货架属性"),
     ("baffle_height", "挡板高度"),
+    ("manufacturer", "生产厂家"),
+    ("specifications", "规格"),
 )
 
 
@@ -75,6 +77,8 @@ def merge_shelf_entry(existing: ShelfEntry, incoming: ShelfEntry) -> ShelfEntry:
         customer_location_code=(
             existing.customer_location_code or incoming.customer_location_code
         ),
+        manufacturer=existing.manufacturer or incoming.manufacturer,
+        specifications=existing.specifications or incoming.specifications,
     )
 
 
@@ -144,6 +148,8 @@ def parse_shelf_locations(file_object: TextIOWrapper) -> ShelfParseResult:
             out_item_id=out_item_id,
             sku_code=sku_code,
             customer_location_code=(row.get("customer_location_code") or "").strip(),
+            manufacturer=(row.get("manufacturer") or "").strip(),
+            specifications=(row.get("specifications") or "").strip(),
         )
         entries = shelf_entries.setdefault(item_id, [])
         existing_index = next(

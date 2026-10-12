@@ -474,8 +474,24 @@ def _status(base_url: str) -> dict:
     phase = state["phase"] if flags["mapping"] is not None else "unavailable"
     teleop = _teleop_capability(base_url)
     restore_pending = "drive_speed_restore" in state
+    name = state["name"]
+    if name in {"", "当前地图"}:
+        name = ""
+        try:
+            _, floor = robot._request(
+                "GET", "/api/multi-floor/map/v1/floors/:current", base_url=base_url,
+                timeout=robot._TELEMETRY_REQUEST_TIMEOUT_SECONDS,
+            )
+            # ponytail: firmware exposes building/floor; use map metadata if filenames become available.
+            if isinstance(floor, dict) and isinstance(floor.get("floor"), str) and floor["floor"].strip():
+                name = " / ".join(
+                    part.strip() for part in (floor.get("building"), floor["floor"])
+                    if isinstance(part, str) and part.strip()
+                )
+        except robot.RobotApiError:
+            pass
     return {
-        **state, "robot_base_url": base_url, "phase": phase,
+        **state, "name": name, "robot_base_url": base_url, "phase": phase,
         "mapping_enabled": flags["mapping"],
         "loop_closure_enabled": flags["loop_closure"],
         "capability_errors": errors,
@@ -673,11 +689,13 @@ def _execute(payload: dict) -> dict:
         else:
             _require_idle(base_url, state)
             if command in {"new", "clear", "import", "restore"}:
-                name = _name(payload.get("name", state["name"]))
                 raw = None
                 if command == "import":
                     raw = _import_bytes(payload)
-                elif command == "restore":
+                    name = _name(payload.get("name", Path(payload["filename"]).stem[:64]))
+                else:
+                    name = _name(payload.get("name", state["name"]))
+                if command == "restore":
                     raw, entry = _read_backup(base_url, payload.get("backup_id"))
                     name = entry["name"]
                 backup = payload.get("backup", True)

@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from threading import Lock
 from typing import Dict, Optional
 import json
 
 from ksq.constants import DASHBOARD_ACTIVE_ORDER_FILE
-from ksq.order import model as order_model
 from ksq.runtime_logging import get_logger
 from ksq.safe_io import safe_write_text
 
@@ -81,31 +79,6 @@ def _ensure_active_order_loaded() -> None:
     current = payload if (
         payload.get("task_id") or payload.get("items") or payload.get("lifecycle")
     ) else None
-    # Keep the existing queued_orders format, including legacy log-only state.
-    legacy_queue = payload.get("queued_orders")
-    queued = (
-        [item for item in legacy_queue if isinstance(item, dict)]
-        if isinstance(legacy_queue, list)
-        else []
-    )
-    current_lifecycle = current.get("lifecycle") if isinstance(current, dict) else None
-    current_closed = order_model._order_is_queue_terminal(current) or bool(
-        isinstance(current_lifecycle, dict)
-        and current_lifecycle.get("closed")
-        and current.get("source") == "log"
-        and not current_lifecycle.get("broker_status")
-    )
-    if (
-        queued
-        and (current is None or current_closed)
-        and not order_model._order_has_pending_confirmation(current)
-    ):
-        _ACTIVE_ORDER = deepcopy(queued[0])
-        if len(queued) > 1:
-            _ACTIVE_ORDER["queued_orders"] = deepcopy(queued[1:])
-        else:
-            _ACTIVE_ORDER.pop("queued_orders", None)
-        _save_active_order_unlocked()
-        return
+    # Loading display state must never schedule or promote a queued order.
     if current is not None:
         _ACTIVE_ORDER = current
