@@ -68,6 +68,8 @@ PY
 "${HOST_PYTHON}" - "${SCRIPT_DIR}" "${UPGRADE_DIR}" "${HOST_USER}" > "${UNIT}" <<'PY'
 import pwd, subprocess, sys
 deployment, directory, user = sys.argv[1:]
+if any(character in deployment for character in '\n\r'):
+    raise SystemExit('部署目录不能包含换行符。')
 configured = subprocess.check_output(['systemctl', 'show', '-p', 'User', '--value', 'ksq-host-files.service'], timeout=10).decode().strip()
 if configured:
     user = (pwd.getpwuid(int(configured)) if configured.isdigit() else pwd.getpwnam(configured)).pw_name
@@ -79,8 +81,9 @@ arguments = [sys.executable, '-c', bootstrap, directory + '/agent.bin', '--direc
              '--deployment', deployment, '--host-user', user]
 print('[Unit]\nDescription=KSQ online application upgrade\nAfter=network-online.target docker.service\nWants=network-online.target')
 print('\n[Service]\nType=simple\nUser=root\nUMask=0077\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=15')
-print('WorkingDirectory=' + quote(deployment))
-print('EnvironmentFile=' + quote(directory + '/service.env'))
+# Scalar path settings keep quotation marks as part of the path.
+print('WorkingDirectory=' + deployment.replace('%', '%%'))
+print('EnvironmentFile=' + (directory + '/service.env').replace('%', '%%'))
 print('ExecStart=' + ' '.join(quote(arg).replace('$', '$$') for arg in arguments))
 print('\n[Install]\nWantedBy=multi-user.target')
 PY

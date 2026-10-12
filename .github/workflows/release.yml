@@ -24,15 +24,12 @@ jobs:
       - name: Build and validate application
         run: |
           python3 - <<'PY'
-          import json, os
+          import json, os, subprocess
           from pathlib import Path
-          from deploy.build_app_bin import main
           from ksq.upgrade import validate_package, version_tuple
-          import sys
           version = os.environ["GITHUB_REF_NAME"]
           version_tuple(version)
-          sys.argv = ["build_app_bin.py", version]
-          main()
+          subprocess.run(["bash", "deploy/make_package.sh", version], check=True)
           directory = Path("deploy/dist")
           release = json.loads((directory / "ksq_release.json").read_text())
           validate_package(directory / release["filename"], release)
@@ -52,5 +49,6 @@ jobs:
               --verify-tag --draft --title "$GITHUB_REF_NAME" --generate-notes
           fi
           gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "deploy/dist/ksq_deploy_${GITHUB_REF_NAME}.tar.gz" \
             "deploy/dist/knowledge_shelf_query_${GITHUB_REF_NAME}.bin" deploy/dist/ksq_release.json
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest

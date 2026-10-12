@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 
@@ -31,6 +32,8 @@ class ReleaseWorkflow(unittest.TestCase):
             shutil.copytree(ROOT / "ksq", root / "ksq", ignore=shutil.ignore_patterns("__pycache__"))
             (root / "deploy").mkdir()
             shutil.copy2(ROOT / "deploy/build_app_bin.py", root / "deploy/build_app_bin.py")
+            shutil.copy2(ROOT / "deploy/make_package.sh", root / "deploy/make_package.sh")
+            shutil.copytree(ROOT / "deploy/standalone", root / "deploy/standalone")
             shutil.copy2(ROOT / "requirements.txt", root / "requirements.txt")
             fakebin = root / "fakebin"
             fakebin.mkdir()
@@ -58,12 +61,14 @@ if operation == "upload":
     metadata = json.loads(Path(arguments[-1]).read_text())
     binary = Path(arguments[-2])
     assert binary.name == metadata["filename"] and binary.is_file()
-    state["assets"] = [binary.name, "ksq_release.json"]
+    deployment = Path(arguments[-3])
+    assert deployment.name == "ksq_deploy_" + metadata["version"] + ".tar.gz" and deployment.is_file()
+    state["assets"] = [deployment.name, binary.name, "ksq_release.json"]
     if os.environ.get("KSQ_SIMULATE_UPLOAD_FAILURE"):
         state_file.write_text(json.dumps(state))
         raise SystemExit(1)
 if operation == "edit":
-    assert state["draft"] and len(state["assets"]) == 2
+    assert state["draft"] and len(state["assets"]) == 3
     assert "--draft=false" in arguments and "--latest" in arguments
     state["draft"] = False
 state_file.write_text(json.dumps(state))
@@ -79,6 +84,12 @@ state_file.write_text(json.dumps(state))
             release = json.loads((root / "deploy/dist/ksq_release.json").read_text())
             self.assertEqual(release["version"], "v88.77.66")
             self.assertTrue(release["preserve_state"])
+            prefix = "ksq_deploy_" + release["version"]
+            with tarfile.open(root / "deploy/dist" / (prefix + ".tar.gz")) as package:
+                self.assertEqual(package.extractfile(prefix + "/upgrade.sh").read(),
+                                 (ROOT / "deploy/standalone/upgrade.sh").read_bytes())
+                self.assertEqual(package.extractfile(prefix + "/bin/knowledge_shelf_query.bin").read(),
+                                 (root / "deploy/dist" / release["filename"]).read_bytes())
             failed = run(publish, KSQ_SIMULATE_UPLOAD_FAILURE="1")
             self.assertNotEqual(failed.returncode, 0)
             state_file = root / "release-fixture.json"

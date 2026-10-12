@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import pwd
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -99,6 +100,14 @@ Path(sys.argv[-1]).chmod(0o700)
             self.assertEqual(command[-1], username)
             self.assertEqual(command[command.index("--deployment") + 1], str(deployment))
             self.assertNotIn("restart ksq-host-files.service", (root / "systemctl.calls").read_text())
+            self.assertIn('WorkingDirectory=' + str(deployment).replace('%', '%%') + '\n', contents)
+            self.assertIn('EnvironmentFile=' + str(environment_file).replace('%', '%%') + '\n', contents)
+            verifier = shutil.which("systemd-analyze")
+            if verifier:
+                verified = subprocess.run([verifier, "verify", str(unit)], env=environment,
+                                          capture_output=True, text=True, timeout=15)
+                self.assertEqual(verified.returncode, 0, verified.stderr)
+                self.assertNotIn("EnvironmentFile= path is not absolute", verified.stderr)
 
     def test_unattended_host_files_restart_keeps_original_service_environment(self):
         with tempfile.TemporaryDirectory(prefix="ksq-host-restart-") as temporary:
