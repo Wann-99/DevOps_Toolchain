@@ -350,9 +350,6 @@ case "${ACTION}" in
     host-files)
         bash "${SCRIPT_DIR}/host-files.sh" "${2:-status}" "${APP_BIN}" "${SCRIPT_DIR}/host-files"
         ;;
-    upgrade)
-        bash "${SCRIPT_DIR}/upgrade.sh" "${2:-status}" "${SCRIPT_DIR}/${APP_BIN}"
-        ;;
     desktop)
         [[ "${2:-}" == install ]] || die "用法: bash start.sh desktop install"
         bash "${SCRIPT_DIR}/host-files.sh" install-desktop
@@ -374,6 +371,6 @@ case "${ACTION}" in
         docker pull "${RUNTIME_IMAGE}"
         ;;
     *)
-        die "用法: bash start.sh {start|restart|update <应用包.bin>|rollback|version|stop|host-files [start|stop|status|serve]|upgrade [install|status|stop]|desktop install|logs|runtime-logs|pull-runtime|reset-state}"
+        die "用法: bash start.sh {start|restart|update <应用包.bin>|rollback|version|stop|host-files [start|stop|status|serve]|desktop install|logs|runtime-logs|pull-runtime|reset-state}"
         ;;
 esac

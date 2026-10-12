@@ -564,9 +564,6 @@ table.data-table { width:max-content; min-width:100%; border-collapse:collapse; 
 .feishu-form-row.is-valid .feishu-link-status { color:#15803d; }
 .feishu-form-row.is-invalid .feishu-link-status { color:var(--danger); }
 .feishu-form-actions { margin-bottom:12px; }
-.upgrade-notes { white-space:pre-wrap; overflow-wrap:anywhere; max-height:240px; overflow:auto; background:var(--bg); padding:12px; border-radius:8px; }
-#settings-upgrade-progress { display:block; width:100%; margin-top:12px; accent-color:var(--accent); }
-#settings-upgrade-progress[hidden] { display:none; }
 .feishu-optional-group > summary { cursor:pointer; color:var(--ink); font-weight:700; user-select:none; }
 .feishu-optional-group[open] > summary { margin-bottom:10px; }
 .feishu-ai-toggle { display:inline-flex; align-items:center; gap:8px; margin:0 0 12px; color:var(--ink); font-weight:600; cursor:pointer; }

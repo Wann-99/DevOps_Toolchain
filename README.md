@@ -16,7 +16,6 @@ DevOps Toolchain 是面向药房自动化现场的数据查询与运维工具，
 - 机械臂：登录用户通过工具页面访问 `192.168.11.18` 的示教器，支持刷新。浏览器只需能访问工具服务；工具主机仍须能访问机械臂的 80、8090、8060 端口。网页、接口和实时连接均由工具转发。
 - 文件管理：左右卡片分别展示独立操作的宿主机文件目录与交互终端；目录互不跟随，断开后清空终端。Docker 部署通过本机连接进程访问宿主机，使用启动部署脚本的系统账号。登录用户可预览文本与图片、上传文件/目录、下载文件/目录 ZIP；可连接已部署的浏览器远程桌面。
 - 设置：维护工作模式、下单接口、虚拟键盘和飞书表单配置。
-- 在线升级：所有登录用户可在「设置 → 系统升级」检查 GitHub Releases 并安装；失败自动恢复升级前版本，保留配置和数据。
 
 当前功能、权限与使用边界见 [项目功能清单](docs/项目功能清单.md)；具体操作见 [软件使用说明](docs/manual/使用手册.md)。
 
@@ -116,7 +115,6 @@ python3 deploy/build_app_bin.py v1.3.1
 
 ```text
 deploy/dist/knowledge_shelf_query_v1.3.1.bin
-deploy/dist/ksq_release.json
 ```
 
 应用启动时会读取 `.bin` 内的构建元数据，侧栏显示的版本号与构建参数自动保持一致。
@@ -166,26 +164,7 @@ bash start.sh rollback
 bash start.sh reset-state
 ```
 
-启用网页在线升级，首次必须同步新版完整部署包中的 `.bin`、`start.sh`、`host-files.sh`、`upgrade.sh` 和 `docker-compose.yml`，保留原部署的 `config/`、`data/`、`logs/`、`.env` 与 `robot_keyboard.env`，在设备当前部署目录执行：
-
-```bash
-bash start.sh restart
-bash start.sh upgrade install
-```
-
-在线升级需要宿主机运行 systemd，安装一次需要 sudo 权限。之后管理员与普通用户均可在「设置 → 系统升级」操作；独立宿主机升级服务会在网页服务重启期间继续运行，设备重启后自动启动。默认发布源为 [Wann-99/DevOps_Toolchain](https://github.com/Wann-99/DevOps_Toolchain)。每个正式 Release 的标签必须与构建版本一致，同时上传 `.bin` 和本次构建的 `ksq_release.json`；仅推送源码不构成可安装版本。升级不提供网页回滚入口。
-
-仓库包含 [自动发布工作流](.github/workflows/release.yml)。将项目源码与工作流提交到 GitHub 后，推送正式版本标签会自动构建、校验并上传两个升级附件，附件齐全后发布 Release。无需手工上传附件或配置发布用的个人 Token，使用 GitHub 自带的 `GITHUB_TOKEN`；仓库须允许 Actions 运行及该工作流的 Contents 写权限。失败后可重新运行以继续发布草稿，已正式发布的版本不会被覆盖。
-
-```bash
-# 先将本次源码和工作流提交并推送到仓库，再创建新的版本标签
-git tag v1.3.3
-git push origin v1.3.3
-```
-
-标签只支持 `v主版本.次版本.修订号`，例如 `v1.3.3`；结果在仓库 Actions 和 Releases 查看。工作流同时发布完整部署包和应用增量包；首次启用及部署脚本变化时同步完整部署包中的相关文件，运行镜像仍需单独交付。
-
-完整的在线、离线部署说明见 [部署与更新操作文档](docs/manual/部署操作文档.md)。
+完整部署与更新说明见 [部署与更新操作文档](docs/manual/部署操作文档.md)。
 
 ## 配置文件
 

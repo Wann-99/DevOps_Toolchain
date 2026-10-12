@@ -166,10 +166,6 @@ def build(output: Path, version: str) -> tuple[int, str]:
         "format": 1,
         "name": "knowledge_shelf_query",
         "version": version,
-        "runtime_image": "hub.noematrix.cn/pharmacy/knowledge_shelf_query_runtime:v1.2.0",
-        "requirements_sha256": hashlib.sha256((PROJECT_DIRECTORY / "requirements.txt").read_bytes()).hexdigest(),
-        "upgrade_protocol": 1,
-        "preserve_state": True,
         "built_at": datetime.now(timezone.utc).isoformat(),
         "builder_python": f"{sys.version_info.major}.{sys.version_info.minor}",
         "source_file_count": len(files),
@@ -236,18 +232,11 @@ def main() -> int:
     )
     output = output.expanduser().resolve()
     count, digest = build(output, version)
-    with zipfile.ZipFile(output) as archive:
-        metadata = json.loads(archive.read("KSQ_BUILD.json"))
-    release = {key: metadata[key] for key in ("format", "version", "runtime_image", "requirements_sha256", "upgrade_protocol", "preserve_state")}
-    release.update(filename=output.name, size=output.stat().st_size, sha256=digest)
-    release_file = output.parent / "ksq_release.json"
-    release_file.write_text(json.dumps(release, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"应用包：{output}")
     print(f"版本：  {version}")
     print(f"文件数：{count}")
     print(f"大小：  {output.stat().st_size / 1024:.1f} KiB")
     print(f"SHA256：{digest}")
-    print(f"发布说明：{release_file}")
     return 0
 
 

@@ -57,6 +57,20 @@ class ASGIContracts(unittest.TestCase):
             self.assertEqual(self.client.post("/api/auth/logout").status_code, 200)
         self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
 
+    def test_removed_update_controls_are_unavailable(self):
+        for token in (self.admin, self.viewer):
+            headers = self.headers(token)
+            for method, action in (("GET", "status"), ("GET", "readiness"),
+                                   ("POST", "check"), ("POST", "start")):
+                response = self.client.request(method, "/api/upgrade/" + action,
+                                               headers=headers, json={} if method == "POST" else None)
+                self.assertEqual(response.status_code, 404)
+            page = self.client.get("/?view=settings", headers=headers)
+            self.assertEqual(page.status_code, 200)
+            self.assertNotIn("settings-fold-upgrade", page.text)
+            self.assertNotIn("/static/upgrade.js", page.text)
+        self.assertEqual(self.client.get("/static/upgrade.js", headers=self.headers()).status_code, 404)
+
     def test_order_routing_permissions_and_errors(self):
         with patch.object(settings, "resolve_dashboard_mode", return_value="prod"), patch.object(orders, "list_tasks", return_value={"tasks": []}) as query:
             response = self.client.get("/api/order/tasks?mode=test&page=2", headers=self.headers(self.viewer))

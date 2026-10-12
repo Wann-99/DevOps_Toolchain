@@ -13,7 +13,6 @@
     }
     return rawFetch(resource, options).then((response) => {
       if (response.status === 401) {
-        if (global.KsqUpgrade && global.KsqUpgrade.pending()) return response;
         global.location.href = "/login";
         // 页面即将跳转，不再 resolve，避免后续逻辑继续执行。
         return new Promise(() => {});
@@ -45,7 +44,7 @@
     "#view-settings select",
     "#view-settings textarea",
     "#view-settings button:not([data-fold-toggle], #settings-order-token, #settings-order-stores, " +
-      "#settings-keyboard-refresh, #settings-cfg-secret-toggle, #settings-feishu-submit, #settings-upgrade-check, #settings-upgrade-start)",
+      "#settings-keyboard-refresh, #settings-cfg-secret-toggle, #settings-feishu-submit)",
   ];
 
   function addViewerBanner(container, text) {
@@ -78,7 +77,7 @@
     });
     addViewerBanner(
       document.getElementById("view-settings"),
-      "当前为普通用户：可查看配置和执行系统升级，编辑和工作模式切换需管理员权限。"
+      "当前为普通用户：可查看配置，编辑和工作模式切换需管理员权限。"
     );
     const importForm = document.getElementById("import-form");
     addViewerBanner(

@@ -55,11 +55,10 @@ mkdir -p "${STAGE}/config" "${STAGE}/bin" "${STAGE}/data"
 # 1. 启动脚本与 compose
 cp "${SCRIPT_DIR}/standalone/start.sh" "${STAGE}/start.sh"
 cp "${SCRIPT_DIR}/standalone/host-files.sh" "${STAGE}/host-files.sh"
-cp "${SCRIPT_DIR}/standalone/upgrade.sh" "${STAGE}/upgrade.sh"
 cp "${SCRIPT_DIR}/standalone/docker-compose.yml" "${STAGE}/docker-compose.yml"
 chmod +x "${STAGE}/start.sh"
 
-# 2. 构建应用包和 GitHub Release 说明文件
+# 2. 构建应用包
 APP_BIN_DIST="${DIST_DIR}/knowledge_shelf_query_${TAG}.bin"
 python3 "${SCRIPT_DIR}/build_app_bin.py" "${TAG}" --output "${APP_BIN_DIST}"
 cp "${APP_BIN_DIST}" "${STAGE}/bin/knowledge_shelf_query.bin"
@@ -88,7 +87,6 @@ echo ""
 echo "════════ 完成 ════════"
 echo "部署包: ${DIST_DIR}/${PKG_NAME}.tar.gz"
 echo "增量包: ${APP_BIN_DIST}"
-echo "发布说明: ${DIST_DIR}/ksq_release.json（与增量包一同上传 GitHub Release）"
 du -h "${PKG_NAME}.tar.gz" | awk '{print "大小:   " $1}'
 echo ""
 echo "目标设备使用:"

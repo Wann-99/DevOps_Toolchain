@@ -651,7 +651,6 @@
     setFoldOpen(el("settings-fold-mode"), false);
     setFoldOpen(el("settings-fold-keyboard"), false);
     setFoldOpen(el("settings-fold-feishu"), false);
-    if (global.KsqUpgrade) global.KsqUpgrade.activate();
     await loadRuntimeSettings();
     await loadOrderConfig();
   }

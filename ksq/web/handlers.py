@@ -20,7 +20,7 @@ from ksq.runtime_logging import get_logger
 from ksq.web import auth, files_api
 from ksq.web.pages import login_page_html, resolve_static_file
 from ksq.web.request_utils import _drain_request_body, read_json_body
-from ksq.web.routes import data as data_routes, logs as logs_routes, dashboard as dashboard_routes, test_orders as test_orders_routes, mapping as mapping_routes, map as map_routes, orders as orders_routes, upgrade as upgrade_routes
+from ksq.web.routes import data as data_routes, logs as logs_routes, dashboard as dashboard_routes, test_orders as test_orders_routes, mapping as mapping_routes, map as map_routes, orders as orders_routes
 
 
 LOGGER = get_logger("http")
@@ -58,7 +58,7 @@ class RequestDispatcher:
     def _write_allowed(self, session, path) -> bool:
         if path.startswith("/api/map/") or path == "/api/order/config" or path in auth.VIEWER_FORBIDDEN_POST_PATHS:
             return self._require_admin(session)
-        if path.startswith(("/api/files/", "/api/terminal/", "/desktop/", "/api/upgrade/")):
+        if path.startswith(("/api/files/", "/api/terminal/", "/desktop/")):
             try:
                 return files_api.authorize_request(self, session)
             except (OSError, ValueError) as error:
@@ -144,7 +144,7 @@ class RequestDispatcher:
             return
         if files_api.handle_request(self, session):
             return
-        for route in (orders_routes, data_routes, logs_routes, dashboard_routes, test_orders_routes, mapping_routes, map_routes, upgrade_routes):
+        for route in (orders_routes, data_routes, logs_routes, dashboard_routes, test_orders_routes, mapping_routes, map_routes):
             if route.handle_get(self, session):
                 return
         self._send_not_found(
@@ -222,7 +222,7 @@ class RequestDispatcher:
             _drain_request_body(self)
             return
         try:
-            for route in (orders_routes, data_routes, test_orders_routes, dashboard_routes, logs_routes, map_routes, mapping_routes, upgrade_routes):
+            for route in (orders_routes, data_routes, test_orders_routes, dashboard_routes, logs_routes, map_routes, mapping_routes):
                 if route.handle_post(self, session):
                     return
             _drain_request_body(self)
